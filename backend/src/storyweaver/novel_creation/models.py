@@ -505,6 +505,8 @@ class ContextTrace:
     protected_source_ids: tuple[str, ...]
     budget: int
     notes: tuple[str, ...]
+    # 旧已提交章节的 JSON 未含此字段，默认 0 以保证可反序列化。
+    estimated_tokens: int = 0
 
     def __post_init__(self) -> None:
         if self.chapter_number <= 0:
@@ -518,6 +520,8 @@ class ContextTrace:
             _require_string_tuple(getattr(self, field_name), field_name)
         if self.budget <= 0:
             raise ValueError("budget 必须大于 0")
+        if self.estimated_tokens < 0:
+            raise ValueError("estimated_tokens 不能小于 0")
         _require_unique(self.selected_source_ids, "selected_source_ids")
         _require_unique(self.excluded_source_ids, "excluded_source_ids")
         _require_unique(self.protected_source_ids, "protected_source_ids")

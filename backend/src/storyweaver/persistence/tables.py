@@ -216,6 +216,27 @@ class LongTermMemoryRow(Base):
     __table_args__ = (UniqueConstraint("scope_type", "scope_id", "fingerprint", "status", name="uq_memory_scope_fingerprint_status"),)
 
 
+class ContextSnapshotRow(Base):
+    """一次 Agent 运行实际消费的冻结上下文与证据轨迹。"""
+
+    __tablename__ = "context_snapshots"
+
+    snapshot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("jobs.job_id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    book_id: Mapped[str | None] = mapped_column(
+        ForeignKey("books.book_id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    agent_role: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    book_version: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    renderer_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    rendered_context: Mapped[str] = mapped_column(Text, nullable=False)
+    trace_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    created_at: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
 class ChatSessionRow(Base):
     __tablename__ = "chat_sessions"
 

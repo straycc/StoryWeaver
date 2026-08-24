@@ -567,7 +567,10 @@ def build_sdk_read_tools(
                     evidence.append({
                         "tool_name": name,
                         "arguments": validated.model_dump(),
+                        "raw_arguments": arguments,
                         "result": result,
+                        "succeeded": True,
+                        "truncated": bool(result.get("truncated", False)) if isinstance(result, Mapping) else False,
                     })
                 serialized = json.dumps(result, ensure_ascii=False, default=str)
                 if cache_key is not None:
@@ -581,6 +584,15 @@ def build_sdk_read_tools(
                 return serialized
             except Exception as exc:
                 detail = f"{type(exc).__name__}: {exc}"
+                if evidence is not None:
+                    evidence.append({
+                        "tool_name": name,
+                        "arguments": raw_arguments if isinstance(raw_arguments, dict) else {},
+                        "raw_arguments": arguments,
+                        "result": {"error": detail},
+                        "succeeded": False,
+                        "truncated": False,
+                    })
                 if cache_key is not None:
                     async with lock:
                         in_flight.pop(cache_key, None)

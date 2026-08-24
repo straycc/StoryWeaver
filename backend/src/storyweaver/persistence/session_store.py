@@ -128,7 +128,9 @@ class PostgresChatSessionStore:
                 session.delete(row)
 
     def _append(self, session: Any, session_id: str, event_type: str, payload: Mapping[str, Any], *, created_at: str | None = None) -> TranscriptEvent:
-        row = session.get(ChatSessionRow, session_id)
+        # 同一会话可能同时收到浏览器请求与后台摘要/记忆事件；先锁住会话行，
+        # 再读取最大 sequence，避免两个事务分配到同一个事件序号。
+        row = session.get(ChatSessionRow, session_id, with_for_update=True)
         if row is None:
             raise KeyError(f"会话不存在：{session_id}")
         sequence = int(session.scalar(select(func.coalesce(func.max(ChatSessionEventRow.sequence), 0)).where(ChatSessionEventRow.session_id == session_id)) or 0) + 1

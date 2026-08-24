@@ -8,6 +8,7 @@ from .events import LlmEvent, LlmEventSink, LlmEventType
 from .retry import RetryContext, WorkerRetryPolicy, run_with_retry
 from .sdk import (
     OpenAICompatibleProviderSettings,
+    StructuredOutputError,
     WorkerExecutionError,
     WorkerSettings,
     run_text_worker,
@@ -27,6 +28,7 @@ __all__ = [
     "WorkerRetryPolicy",
     "run_with_retry",
     "OpenAICompatibleProviderSettings",
+    "StructuredOutputError",
     "WorkerExecutionError",
     "WorkerSettings",
     "NOVEL_OUTPUT_TYPES",

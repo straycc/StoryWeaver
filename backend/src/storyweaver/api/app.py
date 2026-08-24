@@ -17,12 +17,13 @@ from ..novel_creation.exceptions import BookBusyError, NovelCreationError
 from ..novel_creation.observability import NovelRunObserver
 from ..novel_creation.pipeline import CreateNovelPipeline
 from ..novel_creation.serialization import to_data
-from ..persistence import ActionProposalRepository, CreativeControlRepository, Database, DatabaseSettings, JobRepository, PostgresChatSessionStore, PostgresLongTermMemoryStore, PostgresNovelProjectStore
+from ..persistence import ActionProposalRepository, ContextSnapshotRepository, CreativeControlRepository, Database, DatabaseSettings, JobRepository, PostgresChatSessionStore, PostgresLongTermMemoryStore, PostgresNovelProjectStore
 from ..application.workspace import ChatWorkspaceApplication, build_chat_workspace
 from ..application.run_progress import RunProgressStore, progress_event_data
 from .jobs import JobSupervisor
 from .action_surface import ActionDispatcher, MainAgentActionSurface
 from .main_agent import MainAgent
+from .main_agent_context import MainAgentContextBuilder, WorkflowContextReader
 from ..skills import load_configured_skills
 
 
@@ -83,6 +84,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     store = PostgresNovelProjectStore(database)
     jobs = JobRepository(database)
     action_proposals = ActionProposalRepository(database)
+    context_snapshots = ContextSnapshotRepository(database)
     skills = load_configured_skills(PROJECT_ROOT)
     creative_controls = CreativeControlRepository(database)
     sessions = PostgresChatSessionStore(database)
@@ -111,6 +113,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         memory_store=memories,
         observer=observer,
         creative_control_provider=creative_controls.get,
+        context_snapshot_sink=context_snapshots,
     )
     workspace = build_chat_workspace(
         settings,
@@ -127,8 +130,15 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         proposals=action_proposals, jobs=jobs, workspace=workspace, submit_job=supervisor.submit,
     )
     dispatcher.configure_skills(skills)
+    workflow_reader = WorkflowContextReader(
+        jobs=jobs, proposals=action_proposals, workspace=workspace,
+    )
     action_surface = MainAgentActionSurface(
         agent=MainAgent(settings), proposals=action_proposals, dispatcher=dispatcher, workspace=workspace,
+        context_builder=MainAgentContextBuilder(
+            workspace=workspace, creative_controls=creative_controls, workflow=workflow_reader,
+        ),
+        context_snapshots=context_snapshots,
     )
     supervisor.configure_action_surface(action_surface, action_proposals)
 
@@ -148,6 +158,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     app.state.memories = memories
     app.state.workspace = workspace
     app.state.action_proposals = action_proposals
+    app.state.context_snapshots = context_snapshots
     app.state.creative_controls = creative_controls
     app.state.action_dispatcher = dispatcher
     app.state.skills = skills
@@ -443,6 +454,30 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
             "plan": to_data(store.load_plan(book_id, chapter_number)),
             "review": to_data(store.load_review(book_id, chapter_number, final=True)),
             "delta": to_data(store.load_delta(book_id, chapter_number)),
+        }
+
+    @app.get("/api/v1/books/{book_id}/context-snapshots")
+    async def list_context_snapshots(book_id: str, limit: int = 30) -> dict[str, Any]:
+        """查询已冻结的 Agent Context，供 Trace 抽屉和离线评测复盘。"""
+
+        store.load_metadata(book_id)
+        bounded_limit = min(max(limit, 1), 100)
+        return {
+            "snapshots": [
+                {
+                    "snapshot_id": item.snapshot_id,
+                    "job_id": item.job_id,
+                    "book_id": item.book_id,
+                    "agent_role": item.agent_role,
+                    "book_version": item.book_version,
+                    "policy_version": item.policy_version,
+                    "renderer_version": item.renderer_version,
+                    "rendered_context": item.rendered_context,
+                    "trace": dict(item.trace),
+                    "created_at": item.created_at,
+                }
+                for item in context_snapshots.list_for_book(book_id, limit=bounded_limit)
+            ]
         }
 
     @app.post("/api/v1/books/{book_id}/plans", status_code=202)

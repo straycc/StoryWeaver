@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from ..llm import OpenAICompatibleProviderSettings, WorkerSettings, run_structured_worker
 from ..novel_creation.application import NovelApplicationSettings
+from ..observability import ModelFailureDiagnosticWriter
 
 
 class ConversationDecision(BaseModel):
@@ -31,17 +32,10 @@ class MainAgent:
             base_url=settings.base_url, model_name=settings.model, api_key=settings.api_key,
         ).create_provider().get_model(settings.model)
 
-    async def decide(
-        self, *, content: str, book_summary: str | None, recent_messages: list[Mapping[str, Any]],
-        pending_actions: list[Mapping[str, Any]],
-    ) -> ConversationDecision:
-        prompt = (
-            "用户消息：\n" + content + "\n\n"
-            "当前作品摘要：\n" + (book_summary or "未绑定作品") + "\n\n"
-            "最近对话：\n" + "\n".join(
-                f"{item.get('role', 'user')}：{item.get('content', '')}" for item in recent_messages[-12:]
-            ) + "\n\n待确认操作：\n" + repr(pending_actions[-3:])
-        )
+    async def decide(self, *, context: str) -> ConversationDecision:
+        """基于已由 Context Builder 审计过的上下文做意图判断。"""
+
+        prompt = "以下是已选择的当前工作台上下文：\n\n" + context
         return await run_structured_worker(
             settings=WorkerSettings(
                 worker_id="main-agent", name="StoryWeaver 主编辑",
@@ -56,10 +50,17 @@ action 的 action 只能是 prepare_chapter_plan、revise_chapter_plan、confirm
 prepare_chapter_plan 参数使用 instruction；revise_chapter_plan 使用 feedback 和可选 proposal_id；
 confirm_and_write_chapter 使用可选 proposal_id；rewrite_chapter 使用 chapter_number 和可选 instruction。
 suggestions 最多给出 3 个可点击后续动作，每项必须有 label、action、parameters；不确定时返回空数组。
+只有用户明确要求“生成计划/规划下一章/改计划”时，才使用 prepare_chapter_plan 或 revise_chapter_plan。
+只有用户明确要求“确认计划并写/按计划写/开始写正文”时，才使用 confirm_and_write_chapter。
+“我希望”“保持”“不要揭穿”“偏向某种风格”等表达是创作讨论或偏好，必须使用 reply，
+不能擅自生成计划、更不能确认写作。若没有 pending 章节计划，绝不能选择 confirm_and_write_chapter。
 如果未绑定作品却需要作品操作，返回 clarify。普通讨论使用 reply，给出简洁、有帮助的中文答复。""",
                 model=self._model,
                 model_settings=ModelSettings(temperature=0.2),
                 timeout_seconds=min(45.0, self._settings.timeout_seconds),
+                diagnostic_writer=ModelFailureDiagnosticWriter(
+                    self._settings.model_diagnostics_directory
+                ),
             ),
             prompt=prompt,
             output_type=ConversationDecision,

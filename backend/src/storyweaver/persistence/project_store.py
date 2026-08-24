@@ -118,6 +118,19 @@ class PostgresNovelProjectStore:
             state=decode_story_state(row.state_json),
         )
 
+    def load_project_with_version(self, book_id: str) -> tuple[NovelProject, int]:
+        """读取作品与数据库事务版本，供 Context Snapshot 固定基线。"""
+
+        row = self._book(book_id)
+        return (
+            NovelProject(
+                metadata=decode_book_metadata(row.metadata_json),
+                foundation=decode_novel_foundation(row.foundation_json),
+                state=decode_story_state(row.state_json),
+            ),
+            int(row.version),
+        )
+
     def list_projects(self) -> tuple[BookMetadata, ...]:
         with self.database.session() as session:
             rows = session.scalars(select(BookRow).order_by(BookRow.book_id)).all()

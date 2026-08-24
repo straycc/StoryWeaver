@@ -20,6 +20,18 @@ class PostgresLongTermMemoryStore:
     def __init__(self, database: Database) -> None:
         self.database = database
 
+    @staticmethod
+    def timestamp() -> str:
+        """与 LongTermMemoryStore 协议保持一致。"""
+
+        return JsonLongTermMemoryStore.timestamp()
+
+    @staticmethod
+    def fingerprint(content: str) -> str:
+        """与文件实现保持同一去重算法。"""
+
+        return JsonLongTermMemoryStore.fingerprint(content)
+
     def save(self, record: LongTermMemoryRecord) -> bool:
         with self.database.session() as session:
             try:

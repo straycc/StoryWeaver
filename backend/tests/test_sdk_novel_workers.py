@@ -70,11 +70,13 @@ class SdkArchitectWorkerTests(unittest.IsolatedAsyncioTestCase):
                 max_repairs=1,
                 initial_delay_seconds=0,
             ),
+            event_sinks=(sink := _Sink(),),
         )
 
         result = await architect.create(create_novel_request())
 
         self.assertEqual(result, foundation)
+        self.assertIn("model_repairing", sink.types)
         model.assert_complete()
 
 

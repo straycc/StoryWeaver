@@ -16,6 +16,7 @@ from agents.run import RunConfig
 from pydantic import BaseModel
 
 from .events import LlmEvent, LlmEventSink, LlmEventType
+from ..observability import ModelFailureDiagnosticWriter
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,10 +47,19 @@ class WorkerSettings:
     model_settings: ModelSettings
     timeout_seconds: float
     max_turns: int = 1
+    diagnostic_writer: ModelFailureDiagnosticWriter | None = None
 
 
 class WorkerExecutionError(RuntimeError):
     """SDK 调用未返回可用的结构化结果。"""
+
+
+class StructuredOutputError(WorkerExecutionError):
+    """保留无法解析的原始输出，供一次无工具修复与诊断使用。"""
+
+    def __init__(self, message: str, *, raw_output: str) -> None:
+        super().__init__(message)
+        self.raw_output = raw_output
 
 
 async def run_structured_worker(
@@ -100,6 +110,13 @@ async def run_structured_worker(
             "error": "模型调用已取消",
         })
         raise
+    except StructuredOutputError as exc:
+        _write_structured_diagnostic(settings, error=exc, raw_output=exc.raw_output)
+        await _emit(event_sinks, LlmEventType.RUN_FAILED, settings.worker_id, {
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+        # 保留 raw_output，供 BaseNovelAgent 的下一次无工具修复调用使用。
+        raise
     except Exception as exc:
         await _emit(event_sinks, LlmEventType.RUN_FAILED, settings.worker_id, {
             "error": f"{type(exc).__name__}: {exc}",
@@ -115,12 +132,40 @@ def _parse_structured_output(raw: Any, output_type: type[BaseModel]) -> BaseMode
     if isinstance(raw, BaseModel):
         return output_type.model_validate(raw.model_dump())
     if not isinstance(raw, str):
-        raise WorkerExecutionError("模型没有返回 JSON 文本")
-    value = _extract_json_object(raw)
+        raise StructuredOutputError("模型没有返回 JSON 文本", raw_output=repr(raw))
+    try:
+        value = _extract_json_object(raw)
+    except WorkerExecutionError as exc:
+        raise StructuredOutputError(str(exc), raw_output=raw) from exc
     try:
         return output_type.model_validate(value)
     except Exception as exc:
-        raise WorkerExecutionError(f"结构化输出校验失败：{exc}") from exc
+        raise StructuredOutputError(
+            f"结构化输出校验失败：{exc}", raw_output=raw
+        ) from exc
+
+
+def _write_structured_diagnostic(
+    settings: WorkerSettings,
+    *,
+    error: StructuredOutputError,
+    raw_output: str,
+) -> None:
+    """解析失败时落盘原始输出；写诊断失败不得遮蔽模型错误。"""
+
+    writer = settings.diagnostic_writer
+    if writer is None:
+        return
+    try:
+        writer.write(
+            model=settings.worker_id,
+            error=error,
+            raw_response={
+                "choices": [{"message": {"content": raw_output}, "finish_reason": "stop"}],
+            },
+        )
+    except Exception:
+        return
 
 
 def _extract_json_object(raw: str) -> object:

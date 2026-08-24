@@ -7,6 +7,8 @@ from dataclasses import replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
+from ...context_management import ContextCandidate, source_ref, trace_from_candidates, with_tool_results
+from ...observability import get_log_context
 from ...llm import LlmEvent, LlmEventSink, LlmEventType, NOVEL_OUTPUT_TYPES, WorkerRetryPolicy, WorkerSettings, run_research_then_submit, run_with_retry
 from ..context_renderer import ChapterContextRenderer
 from ..exceptions import SerializationError
@@ -144,6 +146,7 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
         store: NovelProjectStore | None = None,
         sdk_settings: WorkerSettings | None = None,
         event_sinks: tuple[LlmEventSink, ...] = (),
+        context_snapshot_sink: object | None = None,
     ) -> None:
         super().__init__(
             agent_id="novel-reviewer",
@@ -156,6 +159,7 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
         )
         self._renderer = renderer or ChapterContextRenderer()
         self._store = store
+        self._context_snapshot_sink = context_snapshot_sink
 
     async def review(
         self,
@@ -255,7 +259,76 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
                 tracing_enabled=True,
             )
             return decode_review_report(self._normalize_score(output.model_dump()))
-        return await run_with_retry(worker_name=active_settings.worker_id, operation=operation, policy=self._sdk_retry_policy)
+        try:
+            return await run_with_retry(
+                worker_name=active_settings.worker_id,
+                operation=operation,
+                policy=self._sdk_retry_policy,
+            )
+        finally:
+            self._record_context_snapshot(
+                agent_role=active_settings.worker_id.removeprefix("novel-"),
+                prompt=prompt,
+                snapshot=snapshot,
+                evidence=evidence,
+            )
+
+    def _record_context_snapshot(
+        self,
+        *,
+        agent_role: str,
+        prompt: str,
+        snapshot: ReviewSnapshot,
+        evidence: list[dict[str, object]],
+    ) -> None:
+        """保存审查初始上下文与只读检索证据，不干扰质量门禁。"""
+
+        sink = self._context_snapshot_sink
+        if sink is None:
+            return
+        try:
+            book_version = self._book_version(snapshot.project)
+            candidate = ContextCandidate(
+                source=source_ref(
+                    source_id=f"{agent_role}:initial-prompt",
+                    source_type="reviewer_initial_context",
+                    content=prompt,
+                    book_version=book_version,
+                ),
+                content=prompt,
+                reason="审查员初始上下文：计划、正文及最小正史索引",
+                protected=True,
+                priority=100,
+            )
+            _, trace = trace_from_candidates(
+                agent_role=agent_role,
+                policy_version="reviewer-context-v2.1",
+                book_version=book_version,
+                token_budget=max(1, len(prompt) // 2 + 16),
+                candidates=(candidate,),
+                notes=("工具证据由 research 阶段追加",),
+            )
+            trace = with_tool_results(trace, evidence=evidence)
+            sink.save(
+                agent_role=agent_role,
+                book_id=snapshot.project.metadata.book_id,
+                book_version=book_version,
+                policy_version=trace.policy_version,
+                renderer_version=trace.renderer_version,
+                rendered_context=prompt,
+                trace=trace.to_data(),
+                job_id=get_log_context().get("run_id"),
+            )
+        except Exception:
+            return
+
+    def _book_version(self, project: object) -> int:
+        loader = getattr(self._store, "load_project_with_version", None)
+        metadata = getattr(project, "metadata")
+        state = getattr(project, "state")
+        if callable(loader):
+            return int(loader(metadata.book_id)[1])
+        return int(state.last_committed_chapter)
 
     def _load_snapshot(self, context: ChapterContext) -> ReviewSnapshot:
         """在审查开始前读取一次权威状态，后续工具只使用这份快照。"""

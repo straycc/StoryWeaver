@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
+import asyncio
+from dataclasses import asdict
 import re
 from typing import Any
 
-from ..persistence import ActionProposal, ActionProposalRepository, JobRepository
+from ..persistence import (
+    ActionProposal,
+    ActionProposalRepository,
+    ContextSnapshotRepository,
+    JobRepository,
+)
 from ..application.workspace import ChatWorkspaceApplication
 from .main_agent import ConversationDecision, MainAgent
+from .main_agent_context import MainAgentContextBuilder
 from .action_schemas import validate_action_parameters
 from ..skills import SkillRegistry
 
@@ -171,29 +179,37 @@ class MainAgentActionSurface:
     """把自然语言转换为查询回复、候选 Job 或待确认动作。"""
 
     def __init__(self, *, agent: MainAgent, proposals: ActionProposalRepository,
-                 dispatcher: ActionDispatcher, workspace: ChatWorkspaceApplication) -> None:
+                 dispatcher: ActionDispatcher, workspace: ChatWorkspaceApplication,
+                 context_builder: MainAgentContextBuilder,
+                 context_snapshots: ContextSnapshotRepository | None = None) -> None:
         self._agent = agent
         self._proposals = proposals
         self._dispatcher = dispatcher
         self._workspace = workspace
+        self._context_builder = context_builder
+        self._context_snapshots = context_snapshots
 
-    async def handle(self, *, session_id: str, content: str) -> dict[str, Any]:
+    async def handle(self, *, session_id: str, content: str,
+                     current_job_id: str | None = None) -> dict[str, Any]:
         session = self._workspace.sessions.load_session(session_id)
         # 用户输入先持久化；即使意图模型暂时失败，也不会丢失这次会话事实。
-        self._workspace.sessions.append_message(session_id, role="user", content=content, action="chat")
+        session = self._workspace.sessions.append_message(
+            session_id, role="user", content=content, action="chat",
+        )
+        user_message = session.messages[-1]
         slash = self._slash_skill_command(content)
         if slash == "list":
             skills = self._dispatcher.available_skills()
             reply = "当前没有可用 Skill。" if not skills else "可用 Skill：\n" + "\n".join(
                 f"- `{item.skill_id}`：{item.description}" for item in skills
             ) + "\n\n使用：`/skill <skill-id> <创作要求>`"
-            self._reply(session_id, reply, suggestions=[])
+            self._reply(session_id, reply, suggestions=[], user_message=user_message)
             return {"kind": "reply", "reply": reply}
         if isinstance(slash, tuple):
             skill_id, instruction = slash
             if not session.book_id:
                 reply = "请先在当前会话绑定一部作品，再使用 Skill 生成章节计划。"
-                self._reply(session_id, reply, suggestions=[])
+                self._reply(session_id, reply, suggestions=[], user_message=user_message)
                 return {"kind": "clarify", "reply": reply}
             try:
                 job = await self._dispatcher.dispatch(
@@ -202,54 +218,85 @@ class MainAgentActionSurface:
                 )
             except ValueError as exc:
                 reply = f"Skill 命令无效：{exc}"
-                self._reply(session_id, reply, suggestions=[])
+                self._reply(session_id, reply, suggestions=[], user_message=user_message)
                 return {"kind": "clarify", "reply": reply}
             reply = f"已启用 Skill `{skill_id}`，正在生成候选章节计划。"
-            self._reply(session_id, reply, suggestions=[])
+            self._reply(session_id, reply, suggestions=[], user_message=user_message)
             return {"kind": "job", "job_id": job.job_id, "reply": reply}
-        book_summary = self._book_summary(session.book_id)
         # 明确的中文查询命令不值得交给模型猜参数；先确定性解析，模糊表达再交 Main Agent。
-        decision = self._explicit_query_decision(content) or await self._agent.decide(
-            content=content, book_summary=book_summary,
-            recent_messages=[{"role": item.role, "content": item.content} for item in session.messages],
-            pending_actions=[self._dispatcher.data(item) for item in self._proposals.list_pending(session_id=session_id)],
-        )
+        explicit = self._explicit_query_decision(content)
+        context_trace: dict[str, Any] | None = None
+        if explicit is not None:
+            decision = explicit
+        else:
+            package = self._context_builder.build(
+                session=session,
+                current_request=content,
+                current_sequence=user_message.sequence,
+                current_job_id=current_job_id,
+            )
+            context_trace = package.trace_data()
+            context_trace["v2"] = package.trace_v2_data()
+            if self._context_snapshots is not None:
+                self._context_snapshots.save(
+                    agent_role="main_agent",
+                    book_id=session.book_id,
+                    book_version=package.trace_v2.book_version,
+                    policy_version=package.trace_v2.policy_version,
+                    renderer_version=package.trace_v2.renderer_version,
+                    rendered_context=package.rendered_context,
+                    trace=package.trace_v2_data(),
+                    job_id=current_job_id,
+                )
+            decision = await self._agent.decide(context=package.rendered_context)
         if decision.action:
             try:
                 decision.parameters = validate_action_parameters(decision.action, decision.parameters)
             except ValueError as exc:
                 reply = f"我理解了你的意图，但参数还不完整：{exc}"
-                self._reply(session_id, reply, suggestions=self._suggestions(book_id=session.book_id))
+                self._reply(session_id, reply, suggestions=self._suggestions(book_id=session.book_id),
+                            user_message=user_message, context_trace=context_trace)
                 return {"kind": "clarify", "reply": reply}
         if decision.kind == "query":
             reply = self._query(session.session_id, session.book_id, decision)
-            self._reply(session_id, reply, suggestions=self._suggestions(book_id=session.book_id, action=decision.action))
+            self._reply(session_id, reply, suggestions=self._suggestions(book_id=session.book_id, action=decision.action),
+                        user_message=user_message, context_trace=context_trace)
             return {"kind": "query", "reply": reply}
         if decision.kind == "action":
             if not session.book_id:
-                self._reply(session_id, "请先在当前会话绑定一部作品，再进行章节规划或写作。", suggestions=[])
+                self._reply(session_id, "请先在当前会话绑定一部作品，再进行章节规划或写作。", suggestions=[],
+                            user_message=user_message, context_trace=context_trace)
                 return {"kind": "clarify"}
             if decision.action in {"prepare_chapter_plan", "revise_chapter_plan"}:
                 job = await self._dispatcher.dispatch(action=str(decision.action), session_id=session_id,
                                                       book_id=session.book_id, parameters=decision.parameters)
                 reply = "已开始生成候选章节计划。完成后请检查计划卡片，再确认是否写入正文。"
-                self._reply(session_id, reply, suggestions=self._suggestions(book_id=session.book_id, action="prepare_chapter_plan"))
+                self._reply(session_id, reply, suggestions=self._suggestions(book_id=session.book_id, action="prepare_chapter_plan"),
+                            user_message=user_message, context_trace=context_trace)
                 return {"kind": "job", "job_id": job.job_id, "reply": reply}
             if decision.action in {"confirm_and_write_chapter", "rewrite_chapter"}:
                 frozen_parameters = dict(decision.parameters)
                 if decision.action == "confirm_and_write_chapter":
                     # 创建时即解析并冻结候选计划，确认时还会再次检查其仍为 pending。
-                    frozen_parameters["proposal_id"] = self._dispatcher.resolve_plan_id(
-                        session.book_id, frozen_parameters.get("proposal_id"), session_id,
-                    )
+                    try:
+                        frozen_parameters["proposal_id"] = self._dispatcher.resolve_plan_id(
+                            session.book_id, frozen_parameters.get("proposal_id"), session_id,
+                        )
+                    except ValueError:
+                        reply = "当前没有可确认的候选章节计划。你可以先说“生成下一章计划”，或继续讨论创作方向。"
+                        self._reply(session_id, reply, suggestions=self._suggestions(book_id=session.book_id),
+                                    user_message=user_message, context_trace=context_trace)
+                        return {"kind": "clarify", "reply": reply}
                 proposal = self._proposals.create(session_id=session_id, book_id=session.book_id,
                     action_type=str(decision.action), payload=frozen_parameters,
                     summary=self._action_summary(decision, session.book_id))
                 self._workspace.sessions.append_event(session_id, event_type="action_proposal_pending", payload=self._dispatcher.data(proposal))
-                self._reply(session_id, f"我已准备好执行：{proposal.summary}\n请在下方确认后再开始。", suggestions=[])
+                self._reply(session_id, f"我已准备好执行：{proposal.summary}\n请在下方确认后再开始。", suggestions=[],
+                            user_message=user_message, context_trace=context_trace)
                 return {"kind": "proposal", "proposal": self._dispatcher.data(proposal)}
         reply = decision.reply.strip() or "我理解了。你可以继续说明希望推进的人物、冲突或章节目标。"
-        self._reply(session_id, reply, suggestions=decision.suggestions or self._suggestions(book_id=session.book_id))
+        self._reply(session_id, reply, suggestions=decision.suggestions or self._suggestions(book_id=session.book_id),
+                    user_message=user_message, context_trace=context_trace)
         return {"kind": decision.kind, "reply": reply}
 
     def _query(self, session_id: str, book_id: str | None, decision: ConversationDecision) -> str:
@@ -424,11 +471,24 @@ class MainAgentActionSurface:
         project = self._workspace.novels.store.load_project(book_id)
         return f"《{project.metadata.title}》；当前第 {project.state.last_committed_chapter} 章；地点：{project.state.current_location}；时间：{project.state.current_time}"
 
-    def _reply(self, session_id: str, content: str, *, suggestions: list[dict[str, Any]]) -> None:
-        self._workspace.sessions.append_message(
+    def _reply(self, session_id: str, content: str, *, suggestions: list[dict[str, Any]],
+               user_message: Any | None = None, context_trace: dict[str, Any] | None = None) -> None:
+        metadata: dict[str, Any] = {"main_agent": True, "suggested_actions": suggestions}
+        if context_trace is not None:
+            metadata["context_trace"] = context_trace
+        session = self._workspace.sessions.append_message(
             session_id, role="assistant", content=content, action="chat",
-            metadata={"main_agent": True, "suggested_actions": suggestions},
+            metadata=metadata,
         )
+        # 只有真正经过 Main Agent 的自然语言回合才做后处理；明确查询、按钮和
+        # Slash Command 不应为“记忆提取”额外消耗一次模型调用。
+        if user_message is not None and context_trace is not None:
+            assistant_message = session.messages[-1]
+            asyncio.create_task(self._workspace.post_main_agent_turn(
+                session_id=session_id,
+                user_message_id=user_message.message_id,
+                assistant_message_id=assistant_message.message_id,
+            ))
 
     @staticmethod
     def _suggestions(*, book_id: str | None, action: str | None = None) -> list[dict[str, Any]]:

@@ -1253,6 +1253,44 @@ class ChatWorkspaceApplication:
                 scope_id=scope_id,
             )
 
+    async def post_main_agent_turn(
+        self,
+        *,
+        session_id: str,
+        user_message_id: str,
+        assistant_message_id: str,
+    ) -> None:
+        """主 Agent 回复后的低优先级摘要与记忆维护。
+
+        调用者应在后台执行；任何失败都不能影响已经交付给用户的回复。
+        """
+
+        session = self.sessions.load_session(session_id)
+        messages = {item.message_id: item for item in session.messages}
+        user_message = messages.get(user_message_id)
+        assistant_message = messages.get(assistant_message_id)
+        if user_message is None or assistant_message is None:
+            return
+        if self.context_manager is not None:
+            try:
+                await self.context_manager.refresh_summary(
+                    session=session,
+                    system_prompt=CHAT_SYSTEM_PROMPT,
+                    book_context=self._book_chat_context(session.book_id),
+                )
+            except Exception:
+                # 摘要只是上下文优化，不能因辅助任务破坏已完成对话。
+                pass
+        try:
+            await self._extract_long_term_memory(
+                session=session,
+                user_message=user_message,
+                assistant_message=assistant_message,
+            )
+        except Exception:
+            # 记忆提取同样是最佳努力，不影响主回复与会话事件。
+            pass
+
     @staticmethod
     def _compact_action_summary(content: str) -> str:
         normalized = " ".join(content.split())

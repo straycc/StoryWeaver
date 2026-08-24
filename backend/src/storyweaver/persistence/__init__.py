@@ -10,6 +10,7 @@ from .project_store import PostgresNovelProjectStore
 from .session_store import PostgresChatSessionStore
 from .action_proposals import ActionProposal, ActionProposalRepository
 from .creative_control import CreativeControl, CreativeControlRepository
+from .context_snapshots import ContextSnapshot, ContextSnapshotRepository
 
 __all__ = [
     "Database",
@@ -24,4 +25,6 @@ __all__ = [
     "ActionProposalRepository",
     "CreativeControl",
     "CreativeControlRepository",
+    "ContextSnapshot",
+    "ContextSnapshotRepository",
 ]

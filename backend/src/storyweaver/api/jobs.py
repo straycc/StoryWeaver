@@ -114,6 +114,7 @@ class JobSupervisor:
             if str(payload.get("action") or "chat") == "chat" and self._action_surface is not None:
                 return await self._action_surface.handle(
                     session_id=str(payload["session_id"]), content=str(payload.get("content") or ""),
+                    current_job_id=job.job_id,
                 )
             workspace = self._require_workspace()
             result = await workspace.send_message(

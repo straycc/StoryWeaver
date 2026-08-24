@@ -487,10 +487,12 @@ def build_novel_service(
     creative_control_provider: object | None = None,
     store: object | None = None,
     memory_store: object | None = None,
+    context_snapshot_sink: object | None = None,
 ) -> NovelService:
     """使用一个共享 Runtime 组装真实模型小说创作服务。"""
 
     configure_local_sdk_tracing(settings.agent_trace_directory)
+    diagnostic_writer = ModelFailureDiagnosticWriter(settings.model_diagnostics_directory)
     hooks = (observer,) if observer is not None else ()
     # 生产小说 Worker 全部直接使用 SDK。旧 Runtime 仅暂留给既有离线替身，
     # 下一阶段会由 ScriptedModel 测试替换后删除。
@@ -528,6 +530,7 @@ def build_novel_service(
                 extra_body=extra_body or None,
             ),
             timeout_seconds=timeout_seconds or settings.timeout_seconds,
+            diagnostic_writer=diagnostic_writer,
         )
     # CLI 仍可显式使用文件仓储；FastAPI 传入 PostgreSQL 仓储后，小说正史
     # 完全不再读取 data/books。这里保留鸭子类型，避免领域层反向依赖 ORM。
@@ -560,6 +563,7 @@ def build_novel_service(
     )
     planner = PlannerAgent(
         store=resolved_store,
+        context_snapshot_sink=context_snapshot_sink,
         sdk_settings=sdk_worker_settings(
             worker_id="novel-planner", name="章节规划师",
             instructions=PLANNER_SYSTEM_PROMPT, temperature=settings.planner_temperature,
@@ -577,6 +581,7 @@ def build_novel_service(
     )
     reviewer = ReviewerAgent(
         store=resolved_store,
+        context_snapshot_sink=context_snapshot_sink,
         sdk_settings=sdk_worker_settings(
             worker_id="novel-reviewer", name="章节审查员",
             instructions=REVIEWER_SYSTEM_PROMPT, temperature=settings.reviewer_temperature,
@@ -622,6 +627,7 @@ def build_novel_service(
             analyzer=analyzer,
             memory_retriever=memory_retriever,
             creative_control_provider=creative_control_provider if callable(creative_control_provider) else None,
+            context_snapshot_sink=context_snapshot_sink,
             review_policy=settings.review_policy,
             quality_gate=ReviewQualityGate(
                 ReviewQualityGatePolicy(

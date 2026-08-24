@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import unittest
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from agents import ModelSettings
 from agents.testing import ScriptedModel, assistant_message
@@ -14,6 +17,7 @@ from storyweaver.llm import (
     WorkerSettings,
     run_structured_worker,
 )
+from storyweaver.observability import ModelFailureDiagnosticWriter
 
 
 class _Output(BaseModel):
@@ -70,6 +74,28 @@ class SdkWorkerTests(unittest.IsolatedAsyncioTestCase):
                 prompt="开始",
                 output_type=_Output,
             )
+
+    async def test_invalid_json_writes_diagnostic_with_raw_content(self) -> None:
+        model = ScriptedModel([[assistant_message('{"value": }')]])
+        with TemporaryDirectory() as directory:
+            with self.assertRaises(WorkerExecutionError):
+                await run_structured_worker(
+                    settings=WorkerSettings(
+                        worker_id="test-worker",
+                        name="测试 Worker",
+                        instructions="只返回 JSON。",
+                        model=model,
+                        model_settings=ModelSettings(),
+                        timeout_seconds=5,
+                        diagnostic_writer=ModelFailureDiagnosticWriter(Path(directory)),
+                    ),
+                    prompt="开始",
+                    output_type=_Output,
+                )
+            diagnostic_files = list(Path(directory).glob("*.json"))
+            self.assertEqual(len(diagnostic_files), 1)
+            payload = json.loads(diagnostic_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(payload["response"]["content"], '{"value": }')
 
     async def test_extracts_final_json_after_model_explanation(self) -> None:
         model = ScriptedModel([[assistant_message('分析完成。\n```json\n{"value":"ok"}\n```')]])

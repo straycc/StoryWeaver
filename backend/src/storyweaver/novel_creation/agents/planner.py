@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...context_management import ContextCandidate, source_ref, trace_from_candidates, with_tool_results
+from ...observability import get_log_context
 from ...llm import (
     LlmEvent,
     LlmEventSink,
@@ -74,6 +76,7 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
         store: NovelProjectStore | None = None,
         sdk_settings: WorkerSettings | None = None,
         event_sinks: tuple[LlmEventSink, ...] = (),
+        context_snapshot_sink: object | None = None,
     ) -> None:
         super().__init__(
             agent_id="novel-planner",
@@ -87,6 +90,7 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
         self._validator = validator or ChapterPlanValidator()
         self._hook_manager = hook_manager or HookManager()
         self._store = store
+        self._context_snapshot_sink = context_snapshot_sink
 
     async def plan(
         self,
@@ -151,7 +155,69 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
             )
             return convert(output.model_dump())
 
-        return await run_with_retry(worker_name="novel-planner", operation=operation, policy=self._sdk_retry_policy)
+        try:
+            return await run_with_retry(
+                worker_name="novel-planner",
+                operation=operation,
+                policy=self._sdk_retry_policy,
+            )
+        finally:
+            self._record_context_snapshot(prompt=prompt, snapshot=snapshot, evidence=evidence)
+
+    def _record_context_snapshot(
+        self,
+        *,
+        prompt: str,
+        snapshot: ReviewSnapshot,
+        evidence: list[dict[str, object]],
+    ) -> None:
+        """保存 Planner 初始索引与检索证据；失败审计不影响规划结果。"""
+
+        sink = self._context_snapshot_sink
+        if sink is None:
+            return
+        try:
+            book_version = self._book_version(snapshot.project)
+            candidate = ContextCandidate(
+                source=source_ref(
+                    source_id="planner:initial-prompt",
+                    source_type="planner_initial_context",
+                    content=prompt,
+                    book_version=book_version,
+                ),
+                content=prompt,
+                reason="规划师可见的初始索引与用户指令",
+                protected=True,
+                priority=100,
+            )
+            _, trace = trace_from_candidates(
+                agent_role="planner",
+                policy_version="planner-context-v2.1",
+                book_version=book_version,
+                token_budget=max(1, len(prompt) // 2 + 16),
+                candidates=(candidate,),
+                notes=("工具证据由 research 阶段追加",),
+            )
+            trace = with_tool_results(trace, evidence=evidence)
+            sink.save(
+                agent_role="planner",
+                book_id=snapshot.project.metadata.book_id,
+                book_version=book_version,
+                policy_version=trace.policy_version,
+                renderer_version=trace.renderer_version,
+                rendered_context=prompt,
+                trace=trace.to_data(),
+                job_id=get_log_context().get("run_id"),
+            )
+        except Exception:
+            # Snapshot 是观测能力，不得改变 Planner 的恢复语义。
+            return
+
+    def _book_version(self, project: NovelProject) -> int:
+        loader = getattr(self._store, "load_project_with_version", None)
+        if callable(loader):
+            return int(loader(project.metadata.book_id)[1])
+        return project.state.last_committed_chapter
 
     def _load_snapshot(self, project: NovelProject) -> ReviewSnapshot:
         """把本次规划固定在同一份已提交正史上。"""

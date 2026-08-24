@@ -88,6 +88,16 @@ class JobRepository:
             raise KeyError(f"Job 不存在：{job_id}")
         return self._decode(row)
 
+    def list_active(self, *, book_id: str | None = None) -> tuple[Job, ...]:
+        """返回仍在排队或执行的 Job，供只读工作流摘要使用。"""
+
+        statement = select(JobRow).where(JobRow.status.in_(ACTIVE_JOB_STATUSES))
+        if book_id is not None:
+            statement = statement.where(JobRow.book_id == book_id)
+        with self.database.session() as session:
+            rows = session.scalars(statement.order_by(JobRow.created_at)).all()
+        return tuple(self._decode(row) for row in rows)
+
     def start(self, job_id: str) -> Job:
         return self._transition(job_id, "running", event_type="job_started")
 

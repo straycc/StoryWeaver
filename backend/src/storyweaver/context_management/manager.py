@@ -224,6 +224,27 @@ class SessionContextManager:
         )
         return ContextPackage(final_messages, final_items, trace)
 
+    async def refresh_summary(
+        self,
+        *,
+        session: ChatSession,
+        system_prompt: str,
+        book_context: str | None = None,
+    ) -> TranscriptEvent | None:
+        """在主回复完成后按阈值更新摘要。
+
+        这个方法属于后处理服务入口；Context Builder 绝不能调用它，避免
+        一次意图判断隐含额外模型调用和持久化副作用。
+        """
+
+        return await self._ensure_summary(
+            session=session,
+            system_prompt=system_prompt,
+            book_context=book_context,
+            memories_text="",
+            binding_sequence=self.sessions.current_binding_sequence(session.session_id),
+        )
+
     async def _ensure_summary(
         self,
         *,

@@ -13,9 +13,11 @@ from typing import Protocol
 from uuid import uuid4
 
 from ..memory.services import LongTermMemoryRetriever
-from ..observability import logging_context
+from ..observability import get_log_context, logging_context
+from ..context_management import trace_from_selected_entries
 
 from .context_builder import ChapterContextBuilder
+from .context_renderer import ChapterContextRenderer
 from .exceptions import ChapterPipelineError
 from .models import (
     BatchPlanningContext,
@@ -226,6 +228,7 @@ class WriteNextChapterPipeline:
         state_reducer: NovelStateReducer | None = None,
         memory_retriever: LongTermMemoryRetriever | None = None,
         creative_control_provider: Callable[[str], object] | None = None,
+        context_snapshot_sink: object | None = None,
         review_policy: str = "strict",
         quality_gate: ReviewQualityGate | None = None,
     ) -> None:
@@ -242,6 +245,8 @@ class WriteNextChapterPipeline:
         self._state_reducer = state_reducer or NovelStateReducer()
         self._memory_retriever = memory_retriever
         self._creative_control_provider = creative_control_provider
+        # 采用鸭子类型，领域 Pipeline 不反向依赖 PostgreSQL ORM。
+        self._context_snapshot_sink = context_snapshot_sink
         self._review_policy = review_policy
         self._quality_gate = quality_gate or ReviewQualityGate()
 
@@ -397,6 +402,11 @@ class WriteNextChapterPipeline:
             len(context.entries),
             f"{context.estimated_tokens:,}",
             len(long_term_memories),
+        )
+        self._record_writer_context_snapshot(
+            project=project,
+            context=context,
+            context_trace=context_trace,
         )
 
         draft = await self._writer.write(context)
@@ -645,6 +655,49 @@ class WriteNextChapterPipeline:
             query=memory_query,
             book_id=book_id,
         )
+
+    def _record_writer_context_snapshot(
+        self,
+        *,
+        project: NovelProject,
+        context: ChapterContext,
+        context_trace: object,
+    ) -> None:
+        """冻结 Writer 实际看到的上下文；审计失败不应中断写作。"""
+
+        sink = self._context_snapshot_sink
+        if sink is None:
+            return
+        try:
+            loader = getattr(self._store, "load_project_with_version", None)
+            book_version = (
+                loader(project.metadata.book_id)[1]
+                if callable(loader)
+                else project.state.last_committed_chapter
+            )
+            trace = trace_from_selected_entries(
+                agent_role="writer",
+                policy_version="writer-context-v2.1",
+                book_version=book_version,
+                token_budget=getattr(context_trace, "budget", context.estimated_tokens),
+                entries=context.entries,
+                excluded_source_ids=tuple(
+                    getattr(context_trace, "excluded_source_ids", ())
+                ),
+                notes=tuple(getattr(context_trace, "notes", ())),
+            )
+            sink.save(
+                agent_role="writer",
+                book_id=project.metadata.book_id,
+                book_version=book_version,
+                policy_version=trace.policy_version,
+                renderer_version=trace.renderer_version,
+                rendered_context=ChapterContextRenderer().render(context),
+                trace=trace.to_data(),
+                job_id=get_log_context().get("run_id"),
+            )
+        except Exception:
+            _LOGGER.warning("Writer Context Snapshot 写入失败", exc_info=True)
 
     @staticmethod
     def _log_stage_summary(agent_id: str, message: str, *args: object) -> None:

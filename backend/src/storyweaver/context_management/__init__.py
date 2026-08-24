@@ -7,6 +7,20 @@ from .models import (
     ContextPackage,
     ContextPolicy,
 )
+from .v2 import (
+    Budgeter,
+    ContextBudgetExceededError,
+    ContextCandidate,
+    ContextSelectionRecord,
+    ContextSourceRef,
+    ContextTraceV2,
+    TokenEstimator,
+    source_ref,
+    tool_result_record,
+    trace_from_candidates,
+    trace_from_selected_entries,
+    with_tool_results,
+)
 
 __all__ = [
     "ContextAssemblyTrace",
@@ -14,5 +28,16 @@ __all__ = [
     "ContextPackage",
     "ContextPolicy",
     "SessionContextManager",
+    "Budgeter",
+    "ContextBudgetExceededError",
+    "ContextCandidate",
+    "ContextSelectionRecord",
+    "ContextSourceRef",
+    "ContextTraceV2",
+    "TokenEstimator",
+    "source_ref",
+    "tool_result_record",
+    "trace_from_candidates",
+    "trace_from_selected_entries",
+    "with_tool_results",
 ]
-

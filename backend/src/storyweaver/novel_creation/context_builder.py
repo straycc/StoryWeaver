@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable
 
+from ..context_management import ContextBudgetExceededError
 from ..memory.long_term import LongTermMemoryRecord, LongTermMemoryType
 
 from .models import (
@@ -86,9 +87,10 @@ class ChapterContextBuilder:
         excluded_ids = list(pre_excluded)
         notes: list[str] = []
         if used_tokens > self.token_budget:
-            notes.append(
-                "受保护上下文估算 Token 已超过预算；为保证计划和连续性约束，"
-                "本次未删除受保护条目。"
+            raise ContextBudgetExceededError(
+                "Writer 受保护上下文估算 "
+                f"{used_tokens} Token，超过预算 {self.token_budget}；"
+                "拒绝静默删除章节计划、用户约束或正史状态"
             )
 
         for entry in sorted(
@@ -130,6 +132,7 @@ class ChapterContextBuilder:
             protected_source_ids=protected_ids,
             budget=self.token_budget,
             notes=tuple(notes),
+            estimated_tokens=used_tokens,
         )
         return context, trace
 
