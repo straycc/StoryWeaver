@@ -1,0 +1,28 @@
+/*
+ * React 页面直接采用旧工作台的视觉规格。业务实现迁移到 React/FastAPI，
+ * 但字号、间距、布局和响应式规则不再另起一套设计。
+ */
+@import "./workspace.css";
+
+/* React 的受控组件不需要旧页面的 .hidden DOM 辅助逻辑。 */
+.react-hidden { display: none !important; }
+
+/* 门户层的小型增量控件沿用旧 UI 的灰阶与圆角。 */
+.suggestion-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.suggestion-row button { border: 1px solid var(--border, #dedede); background: #fff; color: var(--text, #161616); border-radius: 999px; padding: 7px 11px; font: inherit; font-size: 12px; cursor: pointer; }
+.suggestion-row button:hover { background: #f5f5f5; }
+.control-fields { display: grid; gap: 16px; margin: 20px 0; }
+.control-fields label { display: grid; gap: 8px; font-size: 13px; font-weight: 600; }
+.control-fields textarea { min-height: 124px; resize: vertical; }
+
+/* 斜杠命令面板：沿用旧工作台的白底、细边框与低干扰层级。 */
+.composer-command-wrap { position: relative; }
+.skill-command-menu { position: absolute; z-index: 20; left: 0; right: 0; bottom: calc(100% + 8px); overflow: hidden; border: 1px solid var(--border, #dedede); border-radius: 14px; background: #fff; box-shadow: 0 10px 28px rgba(0, 0, 0, .10); padding: 6px; }
+.skill-command-menu button { display: grid; width: 100%; gap: 4px; border: 0; border-radius: 9px; background: transparent; padding: 10px 12px; text-align: left; color: var(--text, #161616); cursor: pointer; }
+.skill-command-menu button:hover, .skill-command-menu button.active { background: #f3f3f3; }
+.skill-command-menu strong { font-size: 13px; }
+.skill-command-menu span, .skill-command-empty { color: var(--muted, #777); font-size: 12px; line-height: 1.45; }
+.skill-command-empty { padding: 12px; }
+
+.plan-skill-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.plan-skill-row span { border: 1px solid #d9d9d9; border-radius: 999px; padding: 3px 8px; color: #5d5d5d; font-size: 11px; font-weight: 400; }

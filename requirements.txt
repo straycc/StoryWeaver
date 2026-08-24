@@ -1,0 +1,13 @@
+openai-agents>=0.14,<1
+pydantic>=2,<3
+tenacity>=9,<10
+# OpenAI SDK 3.x 在异步导入路径中依赖 aiohttp 的 SocketTimeoutError。
+aiohttp>=3.10,<4
+# OpenAI SDK 会遵循环境中的 SOCKS 代理配置。
+socksio>=1.0,<2
+# 单实例 FastAPI + PostgreSQL 持久任务服务。
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+SQLAlchemy>=2.0,<3
+alembic>=1.13,<2
+psycopg[binary]>=3.2,<4

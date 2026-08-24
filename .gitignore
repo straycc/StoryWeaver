@@ -1,0 +1,31 @@
+# 本地密钥与环境配置
+.env
+.env.*
+!.env.example
+.claude/
+
+# Python 缓存和构建产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.egg-info/
+
+# CLI / 本地 UI 默认生成的项目与会话数据
+data/
+
+# FastAPI / SDK 当前运行产物；保留目录说明文件以展示结构。
+runtime/*
+!runtime/README.md
+
+# 本地归档内容不进入源码仓库
+archive/
+
+# 本地虚拟环境
+.venv/
+venv/
