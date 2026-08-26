@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Awaitable, Callable
-from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -18,7 +17,7 @@ from .long_term import (
     MemoryExtractionResult,
     MemoryScopeType,
 )
-from .long_term_store import JsonLongTermMemoryStore
+from .long_term_store import LongTermMemoryStore
 
 
 def _response_text(response: object) -> str:
@@ -52,7 +51,7 @@ TextGenerator = Callable[[str], Awaitable[str]]
 class LongTermMemoryExtractor:
     """从已完成的普通聊天回合中自动提取稳定信息。"""
 
-    def __init__(self, *, generate_text: TextGenerator, store: JsonLongTermMemoryStore) -> None:
+    def __init__(self, *, generate_text: TextGenerator, store: LongTermMemoryStore) -> None:
         self.generate_text = generate_text
         self.store = store
 
@@ -210,7 +209,7 @@ class LongTermMemoryRetriever:
         self,
         *,
         generate_text: TextGenerator,
-        store: JsonLongTermMemoryStore,
+        store: LongTermMemoryStore,
         max_catalog_items: int = 200,
         limit: int = 5,
     ) -> None:
@@ -328,7 +327,7 @@ class LongTermMemoryRetriever:
 class LongTermMemoryConsolidator:
     """每个作用域累计十条活跃记忆后，低频合并明显重复项。"""
 
-    def __init__(self, *, generate_text: TextGenerator, store: JsonLongTermMemoryStore) -> None:
+    def __init__(self, *, generate_text: TextGenerator, store: LongTermMemoryStore) -> None:
         self.generate_text = generate_text
         self.store = store
 
@@ -345,13 +344,6 @@ class LongTermMemoryConsolidator:
         )
         if len(records) < 10:
             return 0
-        marker = self._marker_path(scope_type, scope_id)
-        signature = "|".join(sorted(item.memory_id for item in records))
-        try:
-            if marker.is_file() and marker.read_text(encoding="utf-8") == signature:
-                return 0
-        except OSError:
-            pass
         catalog = "\n\n".join(
             f"ID: {item.memory_id}\n名称: {item.name}\n摘要: {item.description}\n内容: {item.content}"
             for item in records
@@ -381,13 +373,6 @@ class LongTermMemoryConsolidator:
                             supersedes_id=None,
                         )
                         changed += 1
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(signature, encoding="utf-8")
         except Exception:
             return 0
         return changed
-
-    def _marker_path(self, scope_type: MemoryScopeType, scope_id: str) -> Path:
-        if scope_type == MemoryScopeType.GLOBAL:
-            return self.store.root / "global" / "_consolidation"
-        return self.store.root / "books" / scope_id / "_consolidation"

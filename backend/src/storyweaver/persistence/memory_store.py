@@ -9,7 +9,12 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from ..memory.long_term import LongTermMemoryRecord, LongTermMemoryStatus, LongTermMemoryType, MemoryScopeType
-from ..memory.long_term_store import JsonLongTermMemoryStore
+from ..memory.long_term_store import (
+    decode_long_term_memory,
+    encode_long_term_memory,
+    memory_fingerprint,
+    memory_timestamp,
+)
 from .database import Database
 from .tables import LongTermMemoryRow
 
@@ -24,13 +29,13 @@ class PostgresLongTermMemoryStore:
     def timestamp() -> str:
         """与 LongTermMemoryStore 协议保持一致。"""
 
-        return JsonLongTermMemoryStore.timestamp()
+        return memory_timestamp()
 
     @staticmethod
     def fingerprint(content: str) -> str:
         """与文件实现保持同一去重算法。"""
 
-        return JsonLongTermMemoryStore.fingerprint(content)
+        return memory_fingerprint(content)
 
     def save(self, record: LongTermMemoryRecord) -> bool:
         with self.database.session() as session:
@@ -49,7 +54,7 @@ class PostgresLongTermMemoryStore:
                         if previous.scope_type != record.scope_type.value or previous.scope_id != record.scope_id:
                             raise ValueError("替代记忆必须位于同一作用域")
                         previous.status = LongTermMemoryStatus.SUPERSEDED.value
-                        previous.record_json = self._encode(replace(self._decode(previous.record_json), status=LongTermMemoryStatus.SUPERSEDED, updated_at=JsonLongTermMemoryStore.timestamp()))
+                        previous.record_json = self._encode(replace(self._decode(previous.record_json), status=LongTermMemoryStatus.SUPERSEDED, updated_at=memory_timestamp()))
                     session.add(LongTermMemoryRow(
                         memory_id=record.memory_id, scope_type=record.scope_type.value,
                         scope_id=record.scope_id, status=record.status.value,
@@ -91,8 +96,8 @@ class PostgresLongTermMemoryStore:
                 if isinstance(normalized.get("status"), str):
                     normalized["status"] = LongTermMemoryStatus(str(normalized["status"]))
                 if "content" in normalized:
-                    normalized["fingerprint"] = JsonLongTermMemoryStore.fingerprint(str(normalized["content"]))
-                normalized["updated_at"] = JsonLongTermMemoryStore.timestamp()
+                    normalized["fingerprint"] = memory_fingerprint(str(normalized["content"]))
+                normalized["updated_at"] = memory_timestamp()
                 updated = replace(current, **normalized)
                 row.scope_type, row.scope_id, row.status, row.fingerprint = updated.scope_type.value, updated.scope_id, updated.status.value, updated.fingerprint
                 row.record_json = self._encode(updated)
@@ -100,6 +105,18 @@ class PostgresLongTermMemoryStore:
 
     def disable(self, memory_id: str) -> LongTermMemoryRecord:
         return self.update(memory_id, status=LongTermMemoryStatus.DISABLED)
+
+    def delete(self, memory_id: str) -> None:
+        """永久移除一条明显错误或不再需要的会话记忆。
+
+        日常场景应优先使用 ``disable``；此方法不会试图修复其他记忆
+        的 ``supersedes_id`` 历史引用，避免为了删除一条记录而改写审计链。
+        """
+
+        with self.database.session() as session:
+            with session.begin():
+                row = self._require(session, memory_id)
+                session.delete(row)
 
     def restore(self, memory_id: str) -> LongTermMemoryRecord:
         current = self.get(memory_id)
@@ -121,8 +138,8 @@ class PostgresLongTermMemoryStore:
 
     @staticmethod
     def _encode(record: LongTermMemoryRecord) -> dict[str, Any]:
-        return JsonLongTermMemoryStore._encode(record)
+        return encode_long_term_memory(record)
 
     @staticmethod
     def _decode(data: object) -> LongTermMemoryRecord:
-        return JsonLongTermMemoryStore._decode(data)
+        return decode_long_term_memory(data)

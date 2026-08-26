@@ -10,7 +10,7 @@ from ..llm import LlmMessage, LlmMessageRole
 from ..memory.long_term import LongTermMemoryType
 from ..memory.services import LongTermMemoryRetriever, _json_value, _response_text
 from ..application.models import ChatMessage, ChatSession, TranscriptEvent
-from ..application.session_store import ChatSessionStore
+from ..application.ports import ChatSessionRepository
 from .models import ContextAssemblyTrace, ContextItem, ContextPackage, ContextPolicy
 
 
@@ -30,7 +30,7 @@ class SessionContextManager:
     def __init__(
         self,
         *,
-        sessions: ChatSessionStore,
+        sessions: ChatSessionRepository,
         generate_text: Callable[[str], Awaitable[str]],
         memory_retriever: LongTermMemoryRetriever,
         policy: ContextPolicy | None = None,
@@ -113,7 +113,7 @@ class SessionContextManager:
                 selected_messages,
                 source_id=f"memory:{memory.memory_id}",
                 source_type=memory.memory_type.value,
-                content=f"长期记忆：{memory.description}\n{memory.content}",
+                content=f"会话记忆：{memory.description}\n{memory.content}",
                 role=LlmMessageRole.SYSTEM,
                 protected=protected,
                 priority=95 if protected else 65,

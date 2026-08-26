@@ -62,7 +62,16 @@ class _CreativeControls:
         return CreativeControl(book_id, "保持江湖悬疑感", "下一章先不揭穿师父", "persistent", None, "now")
 
 
-class MainAgentContextTests(unittest.TestCase):
+class _MemoryRetriever:
+    def __init__(self, memories=()) -> None:
+        self._memories = memories
+
+    async def retrieve(self, *, query: str, book_id: str | None):
+        del query, book_id
+        return self._memories
+
+
+class MainAgentContextTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.workspace = _Workspace()
         self.workflow = WorkflowContextReader(
@@ -72,9 +81,10 @@ class MainAgentContextTests(unittest.TestCase):
             workspace=self.workspace,  # type: ignore[arg-type]
             creative_controls=_CreativeControls(),  # type: ignore[arg-type]
             workflow=self.workflow,
+            memory_retriever=_MemoryRetriever(),  # type: ignore[arg-type]
         )
 
-    def test_current_request_only_appears_once_and_is_not_history(self) -> None:
+    async def test_current_request_only_appears_once_and_is_not_history(self) -> None:
         session = ChatSession(
             session_id="session-1", title="测试", created_at="now", updated_at="now", book_id="book-1",
             messages=(
@@ -84,7 +94,7 @@ class MainAgentContextTests(unittest.TestCase):
             ),
         )
 
-        package = self.builder.build(
+        package = await self.builder.build(
             session=session,
             current_request="按刚才那个计划写吧",
             current_sequence=4,
@@ -97,6 +107,33 @@ class MainAgentContextTests(unittest.TestCase):
         self.assertIn("作者意图：保持江湖悬疑感", package.rendered_context)
         self.assertIn("待确认操作：确认当前候选计划并写作", package.rendered_context)
         self.assertIn("request:current", package.trace.protected_source_ids)
+
+    async def test_conversation_memory_is_traceable_but_not_creative_constraint(self) -> None:
+        self.builder._memory_retriever = _MemoryRetriever((  # type: ignore[assignment]
+            SimpleNamespace(
+                memory_id="memory-1",
+                description="偏好克制悬疑",
+                content="讨论剧情时优先保留悬念，不急于揭晓真相。",
+            ),
+        ))
+        session = ChatSession(
+            session_id="session-1", title="测试", created_at="now", updated_at="now", book_id="book-1",
+            messages=(ChatMessage("current", "user", "之后保持悬疑感", "now", sequence=1),),
+        )
+
+        package = await self.builder.build(
+            session=session,
+            current_request="之后保持悬疑感",
+            current_sequence=1,
+            current_job_id="current",
+        )
+
+        self.assertIn("会话记忆：偏好克制悬疑", package.rendered_context)
+        self.assertEqual(package.trace.selected_memory_ids, ("memory-1",))
+        self.assertNotIn(
+            "conversation-memory:memory-1",
+            package.trace.protected_source_ids,
+        )
 
 
 if __name__ == "__main__":

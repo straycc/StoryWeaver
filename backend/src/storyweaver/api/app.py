@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -17,10 +17,19 @@ from ..novel_creation.exceptions import BookBusyError, NovelCreationError
 from ..novel_creation.observability import NovelRunObserver
 from ..novel_creation.pipeline import CreateNovelPipeline
 from ..novel_creation.serialization import to_data
-from ..persistence import ActionProposalRepository, ContextSnapshotRepository, CreativeControlRepository, Database, DatabaseSettings, JobRepository, PostgresChatSessionStore, PostgresLongTermMemoryStore, PostgresNovelProjectStore
+from ..persistence import ActionProposalRepository, ContextSnapshotRepository, CreativeControlRepository, Database, DatabaseSettings, JobRepository, PostgresChatSessionRepository, PostgresLongTermMemoryStore, PostgresStoryProjectRepository
+from ..persistence import SimulationRepository
+from ..story_simulation.service import RoleplayService
+from ..story_simulation.agent import (CHARACTER_SYSTEM_PROMPT, DIRECTOR_SYSTEM_PROMPT,
+                                      CharacterAgent, SceneDirectorAgent)
+from ..story_simulation.runtime import RoleplayRuntime
+from ..story_simulation.service import public_state
+from ..llm import OpenAICompatibleProviderSettings, WorkerSettings
+from agents import ModelSettings
+from ..observability import ModelFailureDiagnosticWriter
 from ..application.workspace import ChatWorkspaceApplication, build_chat_workspace
-from ..application.run_progress import RunProgressStore, progress_event_data
 from .jobs import JobSupervisor
+from .live_preview import LivePreviewHub
 from .action_surface import ActionDispatcher, MainAgentActionSurface
 from .main_agent import MainAgent
 from .main_agent_context import MainAgentContextBuilder, WorkflowContextReader
@@ -77,54 +86,121 @@ class CreativeControlBody(BaseModel):
     current_focus_mode: str | None = Field(default=None, pattern="^(single_chapter|persistent)$")
 
 
+class SimulationCharacterBody(BaseModel):
+    character_id: str | None = None
+    name: str
+    role: str
+    goal: str
+    secret: str
+    public_profile: str | None = None
+    origin: str = "sandbox_npc"
+
+
+class CreateSimulationBody(BaseModel):
+    base_chapter_number: int = Field(ge=1)
+    mode: str = Field(pattern="^(roleplay|observer)$")
+    user_character_id: str | None = None
+    canonical_character_ids: list[str] = Field(default_factory=list)
+    custom_characters: list[SimulationCharacterBody] = Field(default_factory=list)
+    # 场景设定是导演辅助信息：留空时由基准章节状态推导。
+    location: str = Field(default="", max_length=500)
+    opening_direction: str = Field(default="", max_length=2000)
+
+
+class SimulationTurnBody(BaseModel):
+    client_request_id: str = Field(min_length=1, max_length=128)
+    expected_version: int = Field(ge=1)
+    input_type: str = Field(pattern="^(speech_action|director_event)$")
+    content: str = Field(min_length=1, max_length=5000)
+    target_character_id: str | None = Field(default=None, max_length=128)
+
+
+class SimulationModeBody(BaseModel):
+    expected_version: int = Field(ge=1)
+    mode: str = Field(pattern="^(roleplay|observer)$")
+    user_character_id: str | None = None
+
+
 def create_app(*, settings: NovelApplicationSettings, database_url: str) -> FastAPI:
     """创建单实例 API；调用方必须以单 Uvicorn worker 启动。"""
 
     database = Database(DatabaseSettings(database_url))
-    store = PostgresNovelProjectStore(database)
+    store = PostgresStoryProjectRepository(database)
     jobs = JobRepository(database)
     action_proposals = ActionProposalRepository(database)
     context_snapshots = ContextSnapshotRepository(database)
+    simulations = SimulationRepository(database)
     skills = load_configured_skills(PROJECT_ROOT)
     creative_controls = CreativeControlRepository(database)
-    sessions = PostgresChatSessionStore(database)
+    sessions = PostgresChatSessionRepository(database)
     memories = PostgresLongTermMemoryStore(database)
-    run_progress = RunProgressStore()
+    live_previews = LivePreviewHub()
 
     def emit_run_event(run_id: str, event_type: str, payload: Mapping[str, Any]) -> None:
-        """同一模型事件同时投影到 Job 与旧 UI 兼容的运行进度流。"""
+        """模型事件只投影到持久 JobEvent。"""
 
         try:
             jobs.append_event(run_id, event_type, payload)
         except (KeyError, ValueError):
             pass
-        try:
-            run_progress.append(run_id, event_type, payload)
-        except KeyError:
-            pass
+
+    async def emit_live_preview(run_id: str, event_type: str, payload: Mapping[str, Any]) -> None:
+        """正文流式预览只驻留在当前 FastAPI 进程内。"""
+
+        agent_id = str(payload.get("agent_id") or "unknown")
+        field = str(payload.get("field") or "text")
+        if event_type == "preview_started":
+            await live_previews.start(run_id, agent_id=agent_id, field=field)
+        elif event_type == "preview_delta":
+            await live_previews.append(run_id, agent_id=agent_id, field=field, delta=str(payload.get("delta") or ""))
+        elif event_type == "preview_completed":
+            await live_previews.complete(run_id, agent_id=agent_id, field=field)
+        elif event_type == "preview_reset":
+            await live_previews.reset(run_id, agent_id=agent_id, field=field)
 
     observer = NovelRunObserver(
         output=None,
         event_sink=emit_run_event,
+        live_preview_sink=emit_live_preview,
     )
     service = build_novel_service(
         settings,
         store=store,
-        memory_store=memories,
         observer=observer,
         creative_control_provider=creative_controls.get,
         context_snapshot_sink=context_snapshots,
+    )
+    provider = OpenAICompatibleProviderSettings(base_url=settings.base_url, model_name=settings.model, api_key=settings.api_key).create_provider()
+    extra_body: dict[str, object] = {}
+    if settings.thinking is not None:
+        extra_body["thinking"] = {"type": settings.thinking}
+    if settings.reasoning_effort is not None:
+        extra_body["reasoning_effort"] = settings.reasoning_effort
+    roleplay = RoleplayService(
+        projects=store, simulations=simulations, snapshots=context_snapshots,
+        runtime=RoleplayRuntime(
+            director=SceneDirectorAgent(WorkerSettings(
+                worker_id="roleplay-director", name="角色剧场导演", instructions=DIRECTOR_SYSTEM_PROMPT,
+                model=provider.get_model(settings.model), model_settings=ModelSettings(temperature=0.45, timeout=settings.timeout_seconds, extra_body=extra_body or None),
+                timeout_seconds=settings.timeout_seconds, diagnostic_writer=ModelFailureDiagnosticWriter(settings.model_diagnostics_directory),
+            )),
+            character=CharacterAgent(WorkerSettings(
+                worker_id="roleplay-character", name="角色剧场角色演员", instructions=CHARACTER_SYSTEM_PROMPT,
+                model=provider.get_model(settings.model), model_settings=ModelSettings(temperature=0.7, timeout=settings.timeout_seconds, extra_body=extra_body or None),
+                timeout_seconds=settings.timeout_seconds, diagnostic_writer=ModelFailureDiagnosticWriter(settings.model_diagnostics_directory),
+            )),
+            snapshots=context_snapshots,
+        ),
     )
     workspace = build_chat_workspace(
         settings,
         sessions=sessions,
         memory_store=memories,
         novels=service,
-        run_progress=run_progress,
     )
     supervisor = JobSupervisor(
         service=service, jobs=jobs, workspace=workspace,
-        creative_controls=creative_controls,
+        creative_controls=creative_controls, roleplay=roleplay, live_previews=live_previews,
     )
     dispatcher = ActionDispatcher(
         proposals=action_proposals, jobs=jobs, workspace=workspace, submit_job=supervisor.submit,
@@ -136,7 +212,12 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     action_surface = MainAgentActionSurface(
         agent=MainAgent(settings), proposals=action_proposals, dispatcher=dispatcher, workspace=workspace,
         context_builder=MainAgentContextBuilder(
-            workspace=workspace, creative_controls=creative_controls, workflow=workflow_reader,
+            workspace=workspace,
+            creative_controls=creative_controls,
+            workflow=workflow_reader,
+            # 会话记忆只在 Main Agent 的对话理解阶段按需检索；创作 Pipeline
+            # 不会读取它，正文约束仅来自创作控制和正史状态。
+            memory_retriever=workspace.context_manager.memory_retriever,
         ),
         context_snapshots=context_snapshots,
     )
@@ -162,7 +243,9 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     app.state.creative_controls = creative_controls
     app.state.action_dispatcher = dispatcher
     app.state.skills = skills
-    app.state.run_progress = run_progress
+    app.state.live_previews = live_previews
+    app.state.simulations = simulations
+    app.state.roleplay = roleplay
 
     @app.exception_handler(BookBusyError)
     async def book_busy(_request: Request, exc: BookBusyError) -> JSONResponse:
@@ -319,24 +402,6 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         )
         return _accepted(job)
 
-    @app.get("/api/v1/runs/{run_id}")
-    async def get_run(run_id: str) -> dict[str, Any]:
-        try:
-            return {
-                **run_progress.run_metadata(run_id),
-                "events": [progress_event_data(item) for item in run_progress.snapshot(run_id)],
-            }
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/v1/runs/{run_id}/events")
-    async def stream_run_events(run_id: str, after: int = 0) -> StreamingResponse:
-        return StreamingResponse(
-            _run_sse(run_progress, run_id, after),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-
     @app.get("/api/v1/sessions/{session_id}/trace")
     async def latest_context_trace(session_id: str) -> dict[str, Any]:
         """返回当前会话最近一条助手消息的上下文轨迹。"""
@@ -358,10 +423,6 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
             )
         ]}
 
-    @app.patch("/api/v1/memories/{memory_id}")
-    async def update_memory(memory_id: str, body: dict[str, Any]) -> dict[str, Any]:
-        return {"memory": PostgresLongTermMemoryStore._encode(memories.update(memory_id, **body))}
-
     @app.delete("/api/v1/memories/{memory_id}")
     async def disable_memory(memory_id: str) -> dict[str, Any]:
         return {"memory": PostgresLongTermMemoryStore._encode(memories.disable(memory_id))}
@@ -369,6 +430,57 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     @app.post("/api/v1/memories/{memory_id}/restore")
     async def restore_memory(memory_id: str) -> dict[str, Any]:
         return {"memory": PostgresLongTermMemoryStore._encode(memories.restore(memory_id))}
+
+    @app.delete("/api/v1/memories/{memory_id}/permanent", status_code=204)
+    async def delete_memory_permanently(memory_id: str) -> None:
+        """永久删除一条会话记忆；普通停用仍使用上方接口。"""
+
+        memories.delete(memory_id)
+
+    @app.post("/api/v1/memories/{memory_id}/corrections")
+    async def correct_memory(memory_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """创建更正记录并替代原记录，避免直接篡改自动提取的历史。"""
+
+        from uuid import uuid4
+
+        from ..memory.long_term import LongTermMemoryRecord, LongTermMemoryStatus
+
+        previous = memories.get(memory_id)
+        content = str(body.get("content", "")).strip()
+        if not content:
+            raise HTTPException(status_code=422, detail="更正内容不能为空")
+        description = str(body.get("description") or content).strip()
+        name = str(body.get("name") or previous.name).strip()
+        if not name or not description:
+            raise HTTPException(status_code=422, detail="记忆名称和摘要不能为空")
+        importance = body.get("importance", previous.importance)
+        try:
+            importance = max(1, min(5, int(importance)))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="重要性必须是 1 到 5") from exc
+        now = memories.timestamp()
+        corrected = LongTermMemoryRecord(
+            memory_id=str(uuid4()),
+            memory_type=previous.memory_type,
+            scope_type=previous.scope_type,
+            scope_id=previous.scope_id,
+            name=name,
+            description=description,
+            content=content,
+            importance=importance,
+            source_refs=(*previous.source_refs, f"correction:{previous.memory_id}"),
+            fingerprint=memories.fingerprint(content),
+            status=LongTermMemoryStatus.ACTIVE,
+            created_at=now,
+            updated_at=now,
+            supersedes_id=previous.memory_id,
+        )
+        if not memories.save(corrected):
+            raise HTTPException(status_code=409, detail="相同内容的生效会话记忆已存在")
+        return {
+            "memory": PostgresLongTermMemoryStore._encode(corrected),
+            "replaced_memory_id": previous.memory_id,
+        }
 
     @app.post("/api/v1/books", status_code=202)
     async def create_book(body: CreateBookBody) -> dict[str, Any]:
@@ -379,14 +491,124 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         job = await supervisor.submit(job_type="create_book", book_id=book_id, payload={"request": request_data})
         return _accepted(job)
 
-    @app.get("/api/v1/books/{book_id}")
-    async def get_book(book_id: str) -> dict[str, Any]:
+    @app.get("/api/v1/books/{book_id}/metadata")
+    async def get_book_metadata(book_id: str) -> dict[str, Any]:
         project = store.load_project(book_id)
         return {
             "metadata": to_data(project.metadata), "foundation": to_data(project.foundation),
             "state": to_data(project.state), "chapters": [to_data(item) for item in store.load_chapter_index(book_id)],
             "creative_control": _creative_control_data(creative_controls.get(book_id)),
         }
+
+    @app.post("/api/v1/books/{book_id}/simulations", status_code=201)
+    async def create_simulation(book_id: str, body: CreateSimulationBody) -> dict[str, Any]:
+        try:
+            result = roleplay.create(
+                book_id=book_id, base_chapter_number=body.base_chapter_number, mode=body.mode,
+                user_character_id=body.user_character_id, canonical_character_ids=tuple(body.canonical_character_ids),
+                custom_characters=tuple(item.model_dump(exclude_none=True) for item in body.custom_characters),
+                location=body.location, opening_direction=body.opening_direction,
+            )
+            return _simulation_data(result)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/v1/books/{book_id}/simulations")
+    async def list_simulations(book_id: str) -> dict[str, Any]:
+        store.load_metadata(book_id)
+        return {"simulations": [_simulation_data(item) for item in simulations.list_for_book(book_id)]}
+
+    @app.get("/api/v1/simulations/{simulation_id}")
+    async def get_simulation(simulation_id: str) -> dict[str, Any]:
+        try:
+            return _simulation_data(simulations.get(simulation_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/v1/simulations/{simulation_id}/turns")
+    async def get_simulation_turns(simulation_id: str) -> dict[str, Any]:
+        try:
+            simulations.get(simulation_id)
+            return {"turns": [
+                {**_simulation_turn_data(item), "context_snapshot_links": list(simulations.list_context_snapshot_links(item.turn_id))}
+                for item in simulations.list_turns(simulation_id)
+            ]}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/v1/simulations/{simulation_id}/turns", status_code=202)
+    async def submit_simulation_turn(simulation_id: str, body: SimulationTurnBody) -> dict[str, Any]:
+        try:
+            simulation = simulations.get(simulation_id)
+            if simulation.status != "active":
+                raise ValueError("角色剧场已暂停或结束，请先恢复或创建新的剧场")
+            existing = simulations.find_by_client_request(simulation_id=simulation_id, client_request_id=body.client_request_id)
+            if existing is not None and existing.job_id:
+                return _accepted(jobs.get(existing.job_id))
+            job = await supervisor.submit(job_type="roleplay_turn", book_id=simulation.book_id, payload={"simulation_id": simulation_id, **body.model_dump()})
+            return _accepted(job)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/simulations/{simulation_id}/continue", status_code=202)
+    async def continue_simulation(simulation_id: str, body: SimulationTurnBody) -> dict[str, Any]:
+        try:
+            simulation = simulations.get(simulation_id)
+            if simulation.status != "active":
+                raise ValueError("角色剧场已暂停或结束，无法继续推演")
+            if simulation.mode != "observer":
+                raise ValueError("只有旁观模式可以自动推演")
+            existing = simulations.find_by_client_request(simulation_id=simulation_id, client_request_id=body.client_request_id)
+            if existing is not None and existing.job_id:
+                return _accepted(jobs.get(existing.job_id))
+            job = await supervisor.submit(job_type="roleplay_turn", book_id=simulation.book_id, payload={"simulation_id": simulation_id, "client_request_id": body.client_request_id, "expected_version": body.expected_version, "input_type": "observer_continue", "content": body.content or "继续推演"})
+            return _accepted(job)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.patch("/api/v1/simulations/{simulation_id}/mode")
+    async def update_simulation_mode(simulation_id: str, body: SimulationModeBody) -> dict[str, Any]:
+        try:
+            return _simulation_data(roleplay.change_mode(simulation_id=simulation_id, **body.model_dump()))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/simulations/{simulation_id}/{operation}")
+    async def simulation_lifecycle(simulation_id: str, operation: str) -> dict[str, Any]:
+        if operation not in {"pause", "resume", "finish"}:
+            raise HTTPException(status_code=404, detail="不支持的模拟操作")
+        try:
+            simulation = simulations.get(simulation_id)
+            transitions = {
+                "pause": ({"active"}, "paused"),
+                "resume": ({"paused"}, "active"),
+                "finish": ({"active", "paused"}, "completed"),
+            }
+            allowed, target = transitions[operation]
+            if simulation.status not in allowed:
+                raise ValueError(
+                    "已结束的角色剧场不可恢复" if simulation.status == "completed"
+                    else "当前角色剧场状态不支持此操作"
+                )
+            return _simulation_data(simulations.set_status(simulation_id, target))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.delete("/api/v1/simulations/{simulation_id}")
+    async def delete_simulation(simulation_id: str) -> dict[str, bool]:
+        try:
+            simulations.delete(simulation_id)
+            return {"ok": True}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/v1/books/{book_id}/creative-control")
     async def get_creative_control(book_id: str) -> dict[str, Any]:
@@ -404,13 +626,16 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
             data["focus_target_chapter"] = project.state.last_committed_chapter + 1
         return _creative_control_data(creative_controls.update(**data, book_id=book_id))
 
-    @app.get("/api/v1/projects/{book_id}")
-    async def get_project_compat(book_id: str) -> dict[str, Any]:
+    @app.get("/api/v1/books/{book_id}")
+    async def get_book(book_id: str) -> dict[str, Any]:
         """旧工作台的作品摘要形状，供等价 React UI 直接使用。"""
 
         project = store.load_project(book_id)
         profiles = {item.character_id: item for item in project.foundation.characters}
         return {
+            "metadata": to_data(project.metadata),
+            "foundation": to_data(project.foundation),
+            "state": to_data(project.state),
             "book_id": project.metadata.book_id,
             "title": project.metadata.title,
             "genre": project.metadata.genre,
@@ -435,8 +660,8 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
             "creative_control": _creative_control_data(creative_controls.get(book_id)),
         }
 
-    @app.get("/api/v1/projects/{book_id}/chapters/{chapter_number}")
-    async def get_project_chapter_compat(book_id: str, chapter_number: int) -> dict[str, Any]:
+    @app.get("/api/v1/books/{book_id}/chapters/{chapter_number}/content")
+    async def get_chapter_content(book_id: str, chapter_number: int) -> dict[str, Any]:
         """旧阅读器所需的扁平章节数据。"""
 
         draft = store.load_chapter(book_id, chapter_number)
@@ -522,56 +747,70 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.post("/api/v1/jobs/{job_id}/cancel", status_code=202)
+    async def cancel_job(job_id: str) -> dict[str, Any]:
+        try:
+            return _accepted(await supervisor.cancel(job_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.get("/api/v1/jobs/{job_id}/events")
-    async def stream_events(job_id: str, after: int = 0) -> StreamingResponse:
+    async def stream_events(
+        job_id: str,
+        after: int = 0,
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    ) -> StreamingResponse:
         try:
             jobs.get(job_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return StreamingResponse(_sse(jobs, job_id, after), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        cursor = max(after, _event_cursor(last_event_id))
+        return StreamingResponse(_sse(jobs, live_previews, job_id, cursor), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     return app
 
 
-async def _sse(jobs: JobRepository, job_id: str, after: int) -> AsyncIterator[str]:
+async def _sse(jobs: JobRepository, previews: LivePreviewHub, job_id: str, after: int) -> AsyncIterator[str]:
     cursor = max(0, after)
-    while True:
-        for event in jobs.events_after(job_id, after_sequence=cursor):
-            cursor = event.sequence
-            payload = {"sequence": event.sequence, "job_id": event.job_id, "event_type": event.event_type, "created_at": event.created_at, "payload": dict(event.payload)}
-            yield f"id: {cursor}\nevent: {event.event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-        job = jobs.get(job_id)
-        if job.status in {"succeeded", "failed", "paused", "interrupted"}:
-            return
-        yield ": keep-alive\n\n"
-        await asyncio.sleep(0.75)
+    # 先订阅 Hub，再回放数据库事件；这样连接建立期间产生的 preview 可以由
+    # snapshot 补齐，后续增量则走内存队列。
+    async with previews.subscribe(job_id) as (preview_queue, snapshots):
+        for snapshot in snapshots:
+            yield _sse_event(snapshot)
+        while True:
+            for event in jobs.events_after(job_id, after_sequence=cursor):
+                cursor = event.sequence
+                payload = {"sequence": event.sequence, "job_id": event.job_id, "event_type": event.event_type, "created_at": event.created_at, "payload": dict(event.payload)}
+                yield _sse_event(payload, event_id=cursor)
+            # 先清空已经抵达的实时预览，再检查 Job 终态；否则 Writer 最后一小段
+            # 文本可能与成功事件竞争，尚未来得及显示就被 SSE 连接关闭。
+            while not preview_queue.empty():
+                yield _sse_event(preview_queue.get_nowait())
+            job = jobs.get(job_id)
+            if job.status in {"succeeded", "failed", "paused", "interrupted", "cancelled"}:
+                return
+            try:
+                preview = await asyncio.wait_for(preview_queue.get(), timeout=0.75)
+                yield _sse_event(preview)
+            except TimeoutError:
+                yield ": keep-alive\n\n"
 
 
-async def _run_sse(run_progress: RunProgressStore, run_id: str, after: int) -> AsyncIterator[str]:
-    """把旧 UI 进度模型映射为 FastAPI SSE，支持页面刷新后按序号继续。"""
+def _sse_event(payload: Mapping[str, Any], *, event_id: int | None = None) -> str:
+    event_type = str(payload.get("event_type") or "message")
+    identifier = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{identifier}event: {event_type}\ndata: {json.dumps(dict(payload), ensure_ascii=False)}\n\n"
 
-    # Job 在 HTTP 响应之后才会取得执行权；SSE 先连上是正常竞态，短暂等待
-    # start_run 而不是把这类请求误报为 404。
-    available = await asyncio.to_thread(run_progress.wait_for_run, run_id, timeout=3.0)
-    if not available:
-        yield "event: unavailable\ndata: {}\n\n"
-        return
-    cursor = max(0, after)
-    while True:
-        events, terminal = await asyncio.to_thread(
-            run_progress.wait_after,
-            run_id,
-            after_sequence=cursor,
-            timeout=0.75,
-        )
-        for event in events:
-            cursor = event.sequence
-            payload = progress_event_data(event)
-            yield f"id: {cursor}\nevent: progress\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-        if terminal:
-            return
-        if not events:
-            yield ": keep-alive\n\n"
+
+def _event_cursor(value: str | None) -> int:
+    """将浏览器自动回传的 Last-Event-ID 安全转换为重放游标。"""
+
+    try:
+        return max(0, int(value or 0))
+    except ValueError:
+        return 0
 
 
 def _job_data(job: Any) -> dict[str, Any]:
@@ -602,6 +841,21 @@ def _creative_control_data(control: Any) -> dict[str, Any]:
         "focus_target_chapter": control.focus_target_chapter,
         "updated_at": control.updated_at,
     }
+
+
+def _simulation_data(value: Any) -> dict[str, Any]:
+    return {**public_state(value), "book_id": value.book_id, "base_book_version": value.base_book_version,
+            "base_chapter_number": value.base_chapter_number, "scene_config": dict(value.scene_config),
+            "created_at": value.created_at, "updated_at": value.updated_at}
+
+
+def _simulation_turn_data(value: Any) -> dict[str, Any]:
+    return {"turn_id": value.turn_id, "simulation_id": value.simulation_id, "turn_number": value.turn_number,
+            "job_id": value.job_id, "client_request_id": value.client_request_id, "mode": value.mode,
+            "user_character_id": value.user_character_id, "target_character_id": value.target_character_id,
+            "input_type": value.input_type, "user_input": value.user_input,
+            "status": value.status, "output": value.output, "state_delta": value.state_delta,
+            "context_snapshot_id": value.context_snapshot_id, "created_at": value.created_at}
 
 
 def _session_data(session: Any) -> dict[str, Any]:

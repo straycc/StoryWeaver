@@ -72,7 +72,7 @@ docker compose up --build
 - FastAPI：<http://127.0.0.1:8000>
 - 健康检查：<http://127.0.0.1:8000/api/v1/health>
 
-Compose 会启动 PostgreSQL、API 与前端；API 容器启动时自动执行数据库迁移。
+Compose 会启动 PostgreSQL、API 与前端；API 容器启动时会自动执行 `database/schema.sql`，为新数据库创建当前表结构。
 
 ### 3. 本地开发启动
 
@@ -82,12 +82,12 @@ Compose 会启动 PostgreSQL、API 与前端；API 容器启动时自动执行�
 docker compose up -d postgres
 ```
 
-配置环境变量并迁移：
+配置环境变量并初始化：
 
 ```bash
 export PYTHONPATH=backend/src
 export STORYWEAVER_DATABASE_URL='postgresql+psycopg://storyweaver:storyweaver@localhost:5432/storyweaver'
-python -m alembic upgrade head
+docker compose exec -T postgres psql -U storyweaver -d storyweaver -v ON_ERROR_STOP=1 < database/schema.sql
 python -m storyweaver.api.server
 ```
 
@@ -106,26 +106,31 @@ $env:PYTHONPATH = "backend/src"
 $env:STORYWEAVER_DATABASE_URL = "postgresql+psycopg://storyweaver:storyweaver@localhost:5432/storyweaver"
 ```
 
-## 数据库迁移
+## 数据库初始化
 
-仓库只保留一份当前完整 Schema 的基线迁移：
+仓库发布一份当前完整的 PostgreSQL Schema：
 
 ```text
-alembic/versions/20260824_01_initial_schema.py
+database/schema.sql
 ```
 
-它适用于空数据库：
+它适用于空数据库，也可以重复执行：
 
 ```bash
-PYTHONPATH=backend/src python -m alembic upgrade head
+docker compose exec -T postgres psql -U storyweaver -d storyweaver -v ON_ERROR_STOP=1 < database/schema.sql
 ```
 
-早期开发版数据库不再支持按旧 Revision 增量升级。若本地数据库仍记录旧版本，请重建开发库：
+PowerShell：
+
+```powershell
+Get-Content database/schema.sql | docker compose exec -T postgres psql -U storyweaver -d storyweaver -v ON_ERROR_STOP=1
+```
+
+`schema.sql` 只负责创建缺失表和索引，不会自动将旧结构升级为新结构。开发期间如需重建空库：
 
 ```bash
 docker compose down -v
 docker compose up -d postgres
-PYTHONPATH=backend/src python -m alembic upgrade head
 ```
 
 > `docker compose down -v` 会删除本地 PostgreSQL 数据卷。
@@ -254,7 +259,7 @@ StoryWeaver/
 │   └── tests/
 ├── frontend/                 # React + TypeScript + Vite
 ├── skills/                   # 项目级创作 Skill
-├── alembic/                  # 单一数据库基线迁移
+├── database/schema.sql       # 空 PostgreSQL 的完整初始 Schema
 ├── docs/
 ├── runtime/                  # 本地运行产物（Git 忽略）
 ├── Dockerfile
@@ -263,7 +268,7 @@ StoryWeaver/
 └── README.md
 ```
 
-`data/` 是已忽略的历史文件型 CLI 数据，不属于当前 PostgreSQL 运行时。
+`data/` 是被忽略的历史本地文件保留区；服务不会读取、迁移或修改其中内容。
 
 ## 技术栈与边界
 

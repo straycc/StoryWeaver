@@ -16,7 +16,7 @@ from .tables import JobEventRow, JobRow
 
 
 ACTIVE_JOB_STATUSES = frozenset({"queued", "running"})
-TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "paused", "interrupted"})
+TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "paused", "interrupted", "cancelled"})
 LOCK_SCOPES = frozenset({"none", "book_read", "book_write"})
 
 
@@ -105,14 +105,16 @@ class JobRepository:
         return self._transition(job_id, "succeeded", result=result, event_type="job_succeeded")
 
     def fail(self, job_id: str, *, error: str, status: str = "failed") -> Job:
-        if status not in {"failed", "paused", "interrupted"}:
+        if status not in {"failed", "paused", "interrupted", "cancelled"}:
             raise ValueError("Job 失败状态不合法")
         return self._transition(job_id, status, error=error, event_type=f"job_{status}")
 
     def append_event(self, job_id: str, event_type: str, payload: Mapping[str, Any] | None = None) -> JobEvent:
         with self.database.session() as session:
             with session.begin():
-                if session.get(JobRow, job_id) is None:
+                # `_append()` 使用 max(sequence) + 1。所有公开追加入口必须先锁
+                # 同一 Job 行，才能让阶段、取消和模型事件串行分配序号。
+                if session.get(JobRow, job_id, with_for_update=True) is None:
                     raise KeyError(f"Job 不存在：{job_id}")
                 return self._append(session, job_id, event_type, dict(payload or {}))
 

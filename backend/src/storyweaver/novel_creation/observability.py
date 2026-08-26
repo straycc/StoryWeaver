@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,6 +68,8 @@ class _ActiveRun:
     output_tokens: int = 0
     model_calls: int = 0
     retry_count: int = 0
+    stream_field: str | None = None
+    stream_preview_emitted: bool = False
 
 
 class NovelRunObserver:
@@ -79,10 +81,12 @@ class NovelRunObserver:
         output: Callable[[str], None] | None = print,
         clock: Callable[[], float] = time.perf_counter,
         event_sink: Callable[[str, str, Mapping[str, Any]], None] | None = None,
+        live_preview_sink: Callable[[str, str, Mapping[str, Any]], Awaitable[None]] | None = None,
     ) -> None:
         self._output = output
         self._clock = clock
         self._event_sink = event_sink
+        self._live_preview_sink = live_preview_sink
         self._lock = threading.RLock()
         self._active: dict[tuple[str, str], _ActiveRun] = {}
         self._records: list[WorkerRunMetric] = []
@@ -93,7 +97,7 @@ class NovelRunObserver:
             return tuple(self._records)
 
     def mark(self) -> int:
-        """返回当前位置，用于统计某个 CLI 命令产生的新指标。"""
+        """返回当前位置，用于统计一次应用动作产生的新指标。"""
 
         with self._lock:
             return len(self._records)
@@ -206,6 +210,44 @@ class NovelRunObserver:
                 _LOGGER.warning("模型格式修复 %s · %s · %s", display_name, step_label, error)
             return
 
+        if event_type in {
+            LlmEventType.STREAM_STARTED.value,
+            LlmEventType.TEXT_DELTA.value,
+            LlmEventType.STREAM_COMPLETED.value,
+        }:
+            # 正文预览只进入进程内 Hub，不写入 job_events。最终产物仍必须经过
+            # Pydantic 与领域校验后才会持久化。
+            if event_type == LlmEventType.STREAM_STARTED.value:
+                await self._emit_live_preview(run_id, "preview_started", {
+                    "agent_id": worker_id, "field": event.data.get("field", "text"),
+                })
+                self._emit_progress(run_id, "stream_started", {
+                    "agent_id": worker_id, "display_name": display_name,
+                    **dict(event.data),
+                })
+                return
+            if event_type == LlmEventType.TEXT_DELTA.value:
+                delta = str(event.data.get("delta") or "")
+                if delta:
+                    with self._lock:
+                        if active is not None:
+                            active.stream_field = str(event.data.get("field") or active.stream_field or "text")
+                            active.stream_preview_emitted = True
+                    await self._emit_live_preview(run_id, "preview_delta", {
+                        "agent_id": worker_id,
+                        "field": event.data.get("field", "text"),
+                        "delta": delta,
+                    })
+                return
+            await self._emit_live_preview(run_id, "preview_completed", {
+                "agent_id": worker_id, "field": event.data.get("field", "text"),
+            })
+            self._emit_progress(run_id, "stream_completed", {
+                "agent_id": worker_id, "display_name": display_name,
+                **dict(event.data),
+            })
+            return
+
         if event_type == LlmEventType.TOOL_COMPLETED.value:
             succeeded = bool(event.data.get("succeeded"))
             budget_exhausted = bool(event.data.get("budget_exhausted"))
@@ -236,6 +278,8 @@ class NovelRunObserver:
                 "budget_exhausted": budget_exhausted,
                 "deduplicated": deduplicated,
                 "error": error or None,
+                # 面向前端的简短参数摘要；不输出工具原始结果。
+                "tool_arguments": dict(event.data.get("tool_arguments") or {}),
             }
             self._emit_progress(run_id, "tool_completed", payload)
             self._write(
@@ -266,6 +310,17 @@ class NovelRunObserver:
             active = _ActiveRun(started_at=self._clock())
         elapsed = max(0.0, self._clock() - active.started_at)
         succeeded = event_type == LlmEventType.RUN_FINISHED.value
+        if not succeeded and active.stream_preview_emitted:
+            # 结构化解析或领域校验失败时，已显示的预览不具备提交资格。
+            self._emit_progress(run_id, "stream_reset", {
+                "agent_id": worker_id,
+                "display_name": display_name,
+                "field": active.stream_field,
+            })
+            await self._emit_live_preview(run_id, "preview_reset", {
+                "agent_id": worker_id,
+                "field": active.stream_field or "text",
+            })
         error = None if succeeded else str(event.data.get("error") or "未知错误")
         metric = WorkerRunMetric(
             agent_id=worker_id,
@@ -325,3 +380,12 @@ class NovelRunObserver:
     ) -> None:
         if self._event_sink is not None and run_id:
             self._event_sink(run_id, event_type, payload)
+
+    async def _emit_live_preview(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        if self._live_preview_sink is not None and run_id:
+            await self._live_preview_sink(run_id, event_type, payload)

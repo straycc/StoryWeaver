@@ -1,7 +1,8 @@
 """Studio Chat 主 Agent 的轻量、只读上下文组装。
 
-这里刻意不调用模型、不写摘要、不写长期记忆。它只把已经持久化的
-会话、作品与工作流事实压缩为 Main Agent 可以安全消费的上下文包。
+这里不写摘要、不提取新记忆；它把已持久化的会话、作品与工作流事实
+压缩为 Main Agent 可以安全消费的上下文包。仅在明确需要延续讨论时，
+才按需检索已有会话记忆。
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from ..context_management import (
     trace_from_candidates,
 )
 from ..persistence import ActionProposalRepository, CreativeControlRepository, JobRepository
+from ..memory.services import LongTermMemoryRetriever
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,14 +133,16 @@ class MainAgentContextBuilder:
         workspace: ChatWorkspaceApplication,
         creative_controls: CreativeControlRepository,
         workflow: WorkflowContextReader,
+        memory_retriever: LongTermMemoryRetriever | None = None,
         policy: ContextPolicy | None = None,
     ) -> None:
         self._workspace = workspace
         self._creative_controls = creative_controls
         self._workflow = workflow
+        self._memory_retriever = memory_retriever
         self._policy = policy or ContextPolicy(token_budget=4000, recent_message_limit=12)
 
-    def build(
+    async def build(
         self,
         *,
         session: ChatSession,
@@ -165,6 +169,11 @@ class MainAgentContextBuilder:
         )
         self._append_workflow(items, workflow)
         self._append_creative_control(items, session.book_id)
+        retrieved_memory_ids = await self._append_conversation_memories(
+            items,
+            current_request=current_request,
+            book_id=session.book_id,
+        )
 
         # 显式排除当前消息；不能依赖“append 前读取 session”的调用顺序。
         history = [
@@ -225,6 +234,11 @@ class MainAgentContextBuilder:
             for candidate in selected_candidates
         ]
         selected_ids = {item.source_id for item in selected}
+        selected_memory_ids = tuple(
+            memory_id
+            for memory_id in retrieved_memory_ids
+            if f"conversation-memory:{memory_id}" in selected_ids
+        )
         excluded = [item.source_id for item in items if item.source_id not in selected_ids]
         compressed_ids = tuple(
             candidate.source.source_id
@@ -240,7 +254,7 @@ class MainAgentContextBuilder:
             excluded_source_ids=tuple(excluded),
             protected_source_ids=tuple(item.source_id for item in selected if item.protected),
             compressed_source_ids=compressed_ids,
-            selected_memory_ids=(),
+            selected_memory_ids=selected_memory_ids,
             summary_sequence=self._summary_sequence(session),
             notes=tuple(notes),
             source_reasons=tuple((item.source_id, item.reason) for item in selected)
@@ -250,6 +264,46 @@ class MainAgentContextBuilder:
             f"[{item.source_type}]\n{item.content}" for item in selected
         )
         return MainAgentContextPackage(current_request, rendered, trace, trace_v2)
+
+    async def _append_conversation_memories(
+        self,
+        items: list[ContextItem],
+        *,
+        current_request: str,
+        book_id: str | None,
+    ) -> tuple[str, ...]:
+        """按需补入自动会话记忆，绝不把它升级为创作硬约束。"""
+
+        retriever = self._memory_retriever
+        if retriever is None or not self._should_retrieve_memory(current_request):
+            return ()
+        memories = await retriever.retrieve(query=current_request, book_id=book_id)
+        selected: list[str] = []
+        for memory in memories:
+            self._append(
+                items,
+                f"conversation-memory:{memory.memory_id}",
+                "conversation_memory",
+                f"会话记忆：{memory.description}\n{memory.content}",
+                # 自动提取的记忆只能帮助理解对话；显式创作控制才是 Writer
+                # 的 protected 输入，避免旧偏好绕过作者本轮决定。
+                protected=False,
+                priority=72,
+                reason="与当前请求相关的自动会话记忆",
+            )
+            selected.append(memory.memory_id)
+        return tuple(selected)
+
+    @staticmethod
+    def _should_retrieve_memory(content: str) -> bool:
+        """用确定性触发词控制检索成本，不为判断本身增加模型调用。"""
+
+        markers = (
+            "之前", "刚才", "我说过", "记得", "偏好", "风格", "始终",
+            "不要", "必须", "以后", "希望", "先别", "保持", "人物",
+            "情节", "剧情", "主角", "方向", "延续", "继续",
+        )
+        return any(marker in content for marker in markers)
 
     def _append_session_summary(self, items: list[ContextItem], session: ChatSession) -> None:
         summary = self._workspace.sessions.latest_summary(session.session_id)

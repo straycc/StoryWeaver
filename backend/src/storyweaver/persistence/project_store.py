@@ -1,6 +1,6 @@
 """PostgreSQL 版小说项目仓储。
 
-它与 ``NovelProjectStore`` 保持相同的领域方法，因而 Pipeline、Reducer 和
+它实现 ``StoryProjectRepository`` 领域端口，因而 Pipeline、Reducer 和
 HookManager 无需了解数据库细节。章节与快照不可覆盖，提交时锁住作品行。
 """
 
@@ -56,12 +56,8 @@ from ..novel_creation.state_reducer import NovelStateReducer
 from .database import Database
 from .tables import (
     BookRow,
-    ChapterCandidateRow,
     ChapterRow,
-    PlanProposalRow,
-    PlanProposalVersionRow,
-    RewriteRow,
-    StorySnapshotRow,
+    ChapterRunRow,
 )
 
 
@@ -76,7 +72,7 @@ def _data_list(values: tuple[object, ...]) -> list[object]:
     return [to_data(value) for value in values]
 
 
-class PostgresNovelProjectStore:
+class PostgresStoryProjectRepository:
     """以 PostgreSQL 为唯一事实源的小说仓储。"""
 
     def __init__(self, database: Database) -> None:
@@ -98,13 +94,10 @@ class PostgresNovelProjectStore:
                         book_id=metadata.book_id,
                         metadata_json=_data(metadata),
                         foundation_json=_data(foundation),
+                        initial_state_json=_data(initial_state),
                         state_json=_data(initial_state),
+                        creative_control_json={},
                         version=0,
-                    ))
-                    session.add(StorySnapshotRow(
-                        book_id=metadata.book_id,
-                        chapter_number=0,
-                        state_json=_data(initial_state),
                     ))
             except IntegrityError as exc:
                 raise ProjectAlreadyExistsError(f"项目已存在：{metadata.book_id}") from exc
@@ -146,14 +139,16 @@ class PostgresNovelProjectStore:
         return decode_story_state(self._book(book_id).state_json)
 
     def load_snapshot(self, book_id: str, chapter_number: int) -> StoryState:
+        if chapter_number == 0:
+            return decode_story_state(self._book(book_id).initial_state_json)
         with self.database.session() as session:
-            row = session.scalar(select(StorySnapshotRow).where(
-                StorySnapshotRow.book_id == book_id,
-                StorySnapshotRow.chapter_number == chapter_number,
+            row = session.scalar(select(ChapterRow).where(
+                ChapterRow.book_id == book_id,
+                ChapterRow.chapter_number == chapter_number,
             ))
         if row is None:
             raise ProjectPersistenceError(f"项目 {book_id} 不存在第 {chapter_number} 章快照")
-        return decode_story_state(row.state_json)
+        return decode_story_state(row.state_after_json)
 
     def load_chapter_index(self, book_id: str) -> tuple[ChapterMetadata, ...]:
         self._book(book_id)
@@ -211,9 +206,11 @@ class PostgresNovelProjectStore:
             try:
                 with session.begin():
                     self._require_book(session, proposal.book_id)
-                    row = session.get(PlanProposalRow, proposal.proposal_id)
+                    row = session.get(ChapterRunRow, proposal.proposal_id)
                     if row is not None:
-                        current = decode_chapter_plan_proposal(row.proposal_json)
+                        if row.run_type != "create" or row.plan_json is None:
+                            raise ProjectPersistenceError("章节运行记录类型不兼容")
+                        current = decode_chapter_plan_proposal(row.plan_json)
                         if proposal.book_id != current.book_id:
                             raise ProjectPersistenceError("候选计划不能切换作品")
                         if proposal.created_at != current.created_at:
@@ -222,42 +219,37 @@ class PostgresNovelProjectStore:
                             raise ProjectPersistenceError("不能用较旧版本覆盖候选计划")
                         row.version = proposal.version
                         row.chapter_number = proposal.chapter_number
-                        row.base_chapter_number = proposal.base_chapter_number
                         row.status = proposal.status
                         row.updated_at = proposal.updated_at
-                        row.proposal_json = encoded
+                        row.plan_json = encoded
+                        history = list(row.plan_history_json or [])
+                        if not any(item.get("version") == proposal.version for item in history if isinstance(item, dict)):
+                            history.append({"version": proposal.version, "created_at": proposal.updated_at, "proposal_json": encoded})
+                        row.plan_history_json = history
                     else:
-                        session.add(PlanProposalRow(
-                            proposal_id=proposal.proposal_id,
+                        session.add(ChapterRunRow(
+                            run_id=proposal.proposal_id,
                             book_id=proposal.book_id,
                             chapter_number=proposal.chapter_number,
-                            base_chapter_number=proposal.base_chapter_number,
+                            run_type="create",
                             status=proposal.status,
                             version=proposal.version,
                             created_at=proposal.created_at,
                             updated_at=proposal.updated_at,
-                            proposal_json=encoded,
-                        ))
-                    existing = session.scalar(select(PlanProposalVersionRow).where(
-                        PlanProposalVersionRow.proposal_id == proposal.proposal_id,
-                        PlanProposalVersionRow.version == proposal.version,
-                    ))
-                    if existing is None:
-                        session.add(PlanProposalVersionRow(
-                            proposal_id=proposal.proposal_id,
-                            version=proposal.version,
-                            created_at=proposal.updated_at,
-                            proposal_json=encoded,
+                            base_book_version=proposal.base_chapter_number,
+                            plan_json=encoded,
+                            plan_history_json=[{"version": proposal.version, "created_at": proposal.updated_at, "proposal_json": encoded}],
+                            artifacts_json={},
                         ))
             except IntegrityError as exc:
                 raise ProjectPersistenceError(f"保存候选计划失败：{exc}") from exc
 
     def load_plan_proposal(self, book_id: str, proposal_id: str) -> ChapterPlanProposal:
         with self.database.session() as session:
-            row = session.get(PlanProposalRow, proposal_id)
-        if row is None or row.book_id != book_id:
+            row = session.get(ChapterRunRow, proposal_id)
+        if row is None or row.book_id != book_id or row.run_type != "create" or row.plan_json is None:
             raise ProjectPersistenceError(f"候选章节计划不存在：{proposal_id}")
-        return decode_chapter_plan_proposal(row.proposal_json)
+        return decode_chapter_plan_proposal(row.plan_json)
 
     def save_chapter_candidate(
         self,
@@ -281,7 +273,7 @@ class PostgresNovelProjectStore:
         if not reason.strip():
             raise ValueError("候选草稿拒绝原因不能为空")
         metadata = ChapterCandidateMetadata(
-            schema_version=1, candidate_id=str(uuid4()), proposal_id=proposal.proposal_id,
+            schema_version=1, candidate_id=proposal.proposal_id, proposal_id=proposal.proposal_id,
             book_id=proposal.book_id, chapter_number=expected, title=final_draft.title,
             word_count=final_draft.word_count, original_title=draft.title,
             original_word_count=draft.word_count, status="review_rejected", reason=reason.strip(),
@@ -289,32 +281,32 @@ class PostgresNovelProjectStore:
         )
         with self.database.session() as session:
             with session.begin():
-                session.add(ChapterCandidateRow(
-                    candidate_id=metadata.candidate_id, book_id=metadata.book_id,
-                    proposal_id=metadata.proposal_id, chapter_number=metadata.chapter_number,
-                    status=metadata.status, reason=metadata.reason, revised=metadata.revised,
-                    created_at=metadata.created_at,
-                    metadata_json=_data(metadata), proposal_json=_data(proposal),
-                    draft_json=_data(draft), final_draft_json=_data(final_draft),
-                    initial_review_json=_data(initial_review), final_review_json=_data(final_review),
-                    context_trace_json=_data(context_trace), draft_history_json=_data_list(draft_history),
-                    review_history_json=_data_list(review_history),
-                ))
+                row = session.get(ChapterRunRow, proposal.proposal_id, with_for_update=True)
+                if row is None:
+                    raise ProjectPersistenceError("候选计划运行记录不存在")
+                row.status = metadata.status
+                row.updated_at = metadata.created_at
+                row.artifacts_json = {
+                    "candidate_metadata": _data(metadata), "draft": _data(draft), "final_draft": _data(final_draft),
+                    "initial_review": _data(initial_review), "final_review": _data(final_review),
+                    "context_trace": _data(context_trace), "draft_history": _data_list(draft_history),
+                    "review_history": _data_list(review_history),
+                }
         return metadata
 
     def load_chapter_candidate(self, book_id: str, candidate_id: str) -> ChapterCandidateMetadata:
         with self.database.session() as session:
-            row = session.get(ChapterCandidateRow, candidate_id)
-        if row is None or row.book_id != book_id:
+            row = session.get(ChapterRunRow, candidate_id)
+        if row is None or row.book_id != book_id or "candidate_metadata" not in row.artifacts_json:
             raise ProjectPersistenceError(f"候选章节不存在：{candidate_id}")
-        return decode_chapter_candidate_metadata(row.metadata_json)
+        return decode_chapter_candidate_metadata(row.artifacts_json["candidate_metadata"])
 
     def load_candidate_draft(self, book_id: str, candidate_id: str, *, final: bool = True) -> ChapterDraft:
         with self.database.session() as session:
-            row = session.get(ChapterCandidateRow, candidate_id)
-        if row is None or row.book_id != book_id:
+            row = session.get(ChapterRunRow, candidate_id)
+        if row is None or row.book_id != book_id or "final_draft" not in row.artifacts_json:
             raise ProjectPersistenceError(f"候选章节不存在：{candidate_id}")
-        return decode_chapter_draft(row.final_draft_json if final else row.draft_json)
+        return decode_chapter_draft(row.artifacts_json["final_draft"] if final else row.artifacts_json["draft"])
 
     def commit_chapter(
         self,
@@ -368,6 +360,17 @@ class PostgresNovelProjectStore:
                         file_name=f"{expected:04d}.md", word_count=committed_draft.word_count,
                         status=status, created_at=timestamp,
                     )
+                    source_run_id = None
+                    for run in session.scalars(select(ChapterRunRow).where(
+                        ChapterRunRow.book_id == book_id,
+                        ChapterRunRow.chapter_number == expected,
+                        ChapterRunRow.run_type == "create",
+                    ).order_by(ChapterRunRow.updated_at.desc())).all():
+                        if run.plan_json is not None and decode_chapter_plan_proposal(run.plan_json).plan == plan:
+                            source_run_id = run.run_id
+                            run.status = "committed"
+                            run.updated_at = timestamp
+                            break
                     session.add(ChapterRow(
                         book_id=book_id, chapter_number=expected, metadata_json=_data(chapter_metadata),
                         draft_json=_data(committed_draft), original_draft_json=_data(draft),
@@ -376,8 +379,8 @@ class PostgresNovelProjectStore:
                         final_review_json=_data(final_review) if final_review else None,
                         context_trace_json=_data(context_trace) if context_trace else None,
                         draft_history_json=_data_list(draft_history), review_history_json=_data_list(review_history),
+                        state_after_json=_data(new_state), source_run_id=source_run_id,
                     ))
-                    session.add(StorySnapshotRow(book_id=book_id, chapter_number=expected, state_json=_data(new_state)))
                     book.metadata_json = _data(replace(metadata, updated_at=timestamp))
                     book.state_json = _data(new_state)
                     book.version += 1
@@ -402,30 +405,34 @@ class PostgresNovelProjectStore:
                 archived_chapters = session.scalars(select(ChapterRow).where(
                     ChapterRow.book_id == book_id, ChapterRow.chapter_number >= chapter_number,
                 )).all()
-                archived_snapshots = session.scalars(select(StorySnapshotRow).where(
-                    StorySnapshotRow.book_id == book_id, StorySnapshotRow.chapter_number >= chapter_number,
-                )).all()
-                base = session.scalar(select(StorySnapshotRow).where(
-                    StorySnapshotRow.book_id == book_id, StorySnapshotRow.chapter_number == chapter_number - 1,
-                ))
-                if base is None:
-                    raise ProjectPersistenceError("重写缺少上一章状态快照")
+                if chapter_number == 1:
+                    base_state = book.initial_state_json
+                else:
+                    base = session.scalar(select(ChapterRow).where(
+                        ChapterRow.book_id == book_id, ChapterRow.chapter_number == chapter_number - 1,
+                    ))
+                    if base is None:
+                        raise ProjectPersistenceError("重写缺少上一章状态快照")
+                    base_state = base.state_after_json
                 archive = {
                     "metadata": book.metadata_json, "state": book.state_json,
                     "chapters": [self._chapter_payload(item) for item in archived_chapters],
-                    "snapshots": [self._snapshot_payload(item) for item in archived_snapshots],
                 }
-                session.add(RewriteRow(rewrite_id=record.rewrite_id, book_id=book_id, record_json=_data(record), archive_json=archive, status="pending"))
+                session.add(ChapterRunRow(
+                    run_id=record.rewrite_id, book_id=book_id, chapter_number=chapter_number,
+                    run_type="rewrite", status="pending", version=1, base_book_version=int(book.version),
+                    created_at=record.created_at, updated_at=record.created_at, plan_json=None,
+                    plan_history_json=[], artifacts_json={"record": _data(record), "archive": archive},
+                ))
                 session.execute(delete(ChapterRow).where(ChapterRow.book_id == book_id, ChapterRow.chapter_number >= chapter_number))
-                session.execute(delete(StorySnapshotRow).where(StorySnapshotRow.book_id == book_id, StorySnapshotRow.chapter_number >= chapter_number))
-                book.state_json = base.state_json
+                book.state_json = base_state
                 book.version += 1
                 return record
 
     def finalize_chapter_rewrite(self, record: ChapterRewriteRecord) -> None:
         with self.database.session() as session:
             with session.begin():
-                row = session.get(RewriteRow, record.rewrite_id)
+                row = session.get(ChapterRunRow, record.rewrite_id)
                 if row is None or row.book_id != record.book_id:
                     raise ProjectPersistenceError("章节重写记录不存在")
                 row.status = "finalized"
@@ -433,19 +440,17 @@ class PostgresNovelProjectStore:
     def rollback_chapter_rewrite(self, record: ChapterRewriteRecord) -> None:
         with self.database.session() as session:
             with session.begin():
-                row = session.get(RewriteRow, record.rewrite_id)
+                row = session.get(ChapterRunRow, record.rewrite_id)
                 if row is None or row.book_id != record.book_id:
                     raise ProjectPersistenceError("章节重写记录不存在")
                 if row.status != "pending":
                     return
                 book = self._require_book(session, record.book_id, lock=True)
-                archive = row.archive_json
+                archive = row.artifacts_json["archive"]
                 book.metadata_json = archive["metadata"]
                 book.state_json = archive["state"]
                 for payload in archive["chapters"]:
                     session.add(ChapterRow(**payload))
-                for payload in archive["snapshots"]:
-                    session.add(StorySnapshotRow(**payload))
                 book.version += 1
                 row.status = "rolled_back"
 
@@ -484,11 +489,8 @@ class PostgresNovelProjectStore:
             "delta_json": row.delta_json, "initial_review_json": row.initial_review_json,
             "final_review_json": row.final_review_json, "context_trace_json": row.context_trace_json,
             "draft_history_json": row.draft_history_json, "review_history_json": row.review_history_json,
+            "state_after_json": row.state_after_json, "source_run_id": row.source_run_id,
         }
-
-    @staticmethod
-    def _snapshot_payload(row: StorySnapshotRow) -> dict[str, object]:
-        return {"book_id": row.book_id, "chapter_number": row.chapter_number, "state_json": row.state_json}
 
     @staticmethod
     def _validate_initial_project(metadata: BookMetadata, foundation: NovelFoundation, state: StoryState) -> None:

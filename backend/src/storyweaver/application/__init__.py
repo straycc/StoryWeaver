@@ -3,7 +3,7 @@
 from typing import TYPE_CHECKING, Any
 
 from .models import ChatMessage, ChatSession, ChatSessionSummary
-from .session_store import ChatSessionStore
+from .ports import ChatSessionRepository
 
 if TYPE_CHECKING:
     from .workspace import ChatWorkspaceApplication
@@ -25,7 +25,7 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "ChatMessage",
     "ChatSession",
-    "ChatSessionStore",
+    "ChatSessionRepository",
     "ChatSessionSummary",
     "ChatWorkspaceApplication",
     "build_chat_workspace",

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import MISSING, fields, is_dataclass
-from pathlib import Path
 from typing import Any, Callable, Mapping, TypeVar
 
 from .exceptions import SerializationError
@@ -79,13 +78,6 @@ def loads_json(text: str) -> object:
         return json.loads(text)
     except json.JSONDecodeError as exc:
         raise SerializationError(f"JSON 格式错误：{exc.msg}") from exc
-
-
-def load_json_file(path: Path) -> object:
-    try:
-        return loads_json(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise SerializationError(f"无法读取文件 {path}：{exc}") from exc
 
 
 def decode_book_metadata(data: object) -> BookMetadata:

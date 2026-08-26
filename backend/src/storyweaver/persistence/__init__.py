@@ -6,11 +6,12 @@
 from .database import Database, DatabaseSettings
 from .jobs import Job, JobEvent, JobRepository
 from .memory_store import PostgresLongTermMemoryStore
-from .project_store import PostgresNovelProjectStore
-from .session_store import PostgresChatSessionStore
+from .project_store import PostgresStoryProjectRepository
+from .session_store import PostgresChatSessionRepository
 from .action_proposals import ActionProposal, ActionProposalRepository
 from .creative_control import CreativeControl, CreativeControlRepository
 from .context_snapshots import ContextSnapshot, ContextSnapshotRepository
+from .simulations import SimulationRepository
 
 __all__ = [
     "Database",
@@ -19,12 +20,13 @@ __all__ = [
     "JobEvent",
     "JobRepository",
     "PostgresLongTermMemoryStore",
-    "PostgresNovelProjectStore",
-    "PostgresChatSessionStore",
+    "PostgresStoryProjectRepository",
+    "PostgresChatSessionRepository",
     "ActionProposal",
     "ActionProposalRepository",
     "CreativeControl",
     "CreativeControlRepository",
     "ContextSnapshot",
     "ContextSnapshotRepository",
+    "SimulationRepository",
 ]

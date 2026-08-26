@@ -60,7 +60,7 @@ from .models import (
 )
 from .state_reducer import NovelStateReducer
 from .hook_manager import HookGovernanceReport, HookManager
-from .project_store import NovelProjectStore
+from .repository import StoryProjectRepository
 from .pipeline import (
     Architect,
     ChapterAnalyzer,
@@ -139,7 +139,7 @@ __all__ = [
     "NovelFoundationValidationError",
     "NovelFoundationValidator",
     "NovelProject",
-    "NovelProjectStore",
+    "StoryProjectRepository",
     "NovelRunObserver",
     "NovelService",
     "NovelStateReducer",

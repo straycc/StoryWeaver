@@ -17,6 +17,11 @@ from .tables import ContextSnapshotRow
 class ContextSnapshot:
     snapshot_id: str
     job_id: str | None
+    simulation_id: str | None
+    simulation_turn_id: str | None
+    simulation_stage: str | None
+    simulation_character_id: str | None
+    simulation_ordinal: int | None
     book_id: str | None
     agent_role: str
     book_version: int | None
@@ -44,10 +49,17 @@ class ContextSnapshotRepository:
         rendered_context: str,
         trace: Mapping[str, Any],
         job_id: str | None = None,
+        simulation_id: str | None = None,
+        simulation_turn_id: str | None = None,
+        simulation_stage: str | None = None,
+        simulation_character_id: str | None = None,
+        simulation_ordinal: int | None = None,
     ) -> ContextSnapshot:
         now = datetime.now(timezone.utc).isoformat()
         row = ContextSnapshotRow(
-            snapshot_id=str(uuid4()), job_id=job_id, book_id=book_id,
+            snapshot_id=str(uuid4()), job_id=job_id, simulation_id=simulation_id,
+            simulation_turn_id=simulation_turn_id, simulation_stage=simulation_stage,
+            simulation_character_id=simulation_character_id, simulation_ordinal=simulation_ordinal, book_id=book_id,
             agent_role=agent_role, book_version=book_version,
             policy_version=policy_version, renderer_version=renderer_version,
             rendered_context=rendered_context, trace_json=dict(trace), created_at=now,
@@ -70,7 +82,10 @@ class ContextSnapshotRepository:
     @staticmethod
     def _decode(row: ContextSnapshotRow) -> ContextSnapshot:
         return ContextSnapshot(
-            snapshot_id=row.snapshot_id, job_id=row.job_id, book_id=row.book_id,
+            snapshot_id=row.snapshot_id, job_id=row.job_id, simulation_id=row.simulation_id,
+            simulation_turn_id=row.simulation_turn_id, simulation_stage=row.simulation_stage,
+            simulation_character_id=row.simulation_character_id, simulation_ordinal=row.simulation_ordinal,
+            book_id=row.book_id,
             agent_role=row.agent_role, book_version=row.book_version,
             policy_version=row.policy_version, renderer_version=row.renderer_version,
             rendered_context=row.rendered_context, trace=dict(row.trace_json), created_at=row.created_at,

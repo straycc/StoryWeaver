@@ -18,12 +18,7 @@ from storyweaver.novel_creation import (
     NovelProject,
     StoryHook,
 )
-from storyweaver.memory import (
-    LongTermMemoryRecord,
-    LongTermMemoryStatus,
-    LongTermMemoryType,
-    MemoryScopeType,
-)
+from storyweaver.context_management import ContextBudgetExceededError
 
 
 def create_history_project() -> NovelProject:
@@ -110,7 +105,14 @@ def create_history_project() -> NovelProject:
 
 
 def create_next_plan():
-    return replace(create_chapter_plan(), chapter_number=6)
+    # 该测试作品已有大量未解伏笔，当前 Hook 治理不允许继续新增；
+    # 上下文选择测试不关心新伏笔额度，因此显式设为 0。
+    plan = create_chapter_plan()
+    return replace(
+        plan,
+        chapter_number=6,
+        hook_plan=replace(plan.hook_plan, new_hook_budget=0),
+    )
 
 
 def create_summaries() -> tuple[ChapterSummary, ...]:
@@ -121,75 +123,19 @@ def create_summaries() -> tuple[ChapterSummary, ...]:
 
 
 class ChapterContextBuilderTests(unittest.TestCase):
-    def test_long_term_directive_is_protected_but_reference_is_not_injected(self) -> None:
-        common = {
-            "scope_type": MemoryScopeType.BOOK,
-            "scope_id": "rainy-hotel",
-            "importance": 5,
-            "source_refs": ("session:test",),
-            "status": LongTermMemoryStatus.ACTIVE,
-            "created_at": "2026-08-14T00:00:00+00:00",
-            "updated_at": "2026-08-14T00:00:00+00:00",
-        }
-        directive = LongTermMemoryRecord(
-            memory_id="directive-1",
-            memory_type=LongTermMemoryType.PROJECT_DIRECTIVE,
-            name="叙事视角",
-            description="保持林默有限视角",
-            content="不得切换到神秘人的内心视角",
-            fingerprint="fingerprint-directive",
-            **common,
-        )
-        reference = LongTermMemoryRecord(
-            memory_id="reference-1",
-            memory_type=LongTermMemoryType.REFERENCE,
-            name="参考作品",
-            description="仅供灵感参考",
-            content="参考某部悬疑作品的节奏",
-            fingerprint="fingerprint-reference",
-            **common,
-        )
-
-        context, trace = ChapterContextBuilder(token_budget=10000).build(
-            project=create_history_project(),
-            plan=create_next_plan(),
-            long_term_memories=(directive, reference),
-        )
-
-        self.assertIn("long-term-memory:directive-1", trace.protected_source_ids)
-        self.assertNotIn("long-term-memory:reference-1", trace.selected_source_ids)
-        self.assertTrue(
-            any("不得切换到神秘人的内心视角" in item.content for item in context.entries)
-        )
-
-    def test_protected_sources_are_always_selected(self) -> None:
+    def test_protected_sources_over_budget_fail_explicitly(self) -> None:
         builder = ChapterContextBuilder(
             token_budget=10,
             token_estimator=len,
         )
 
-        context, trace = builder.build(
-            project=create_history_project(),
-            plan=create_next_plan(),
-            chapter_summaries=create_summaries(),
-            user_instruction="本章强化雨声带来的压迫感",
-        )
-
-        expected_protected = {
-            "plan:6",
-            "book-constraints",
-            "story-foundation",
-            "writing-rules",
-            "state:5",
-            "user-instruction:6",
-            "character:lin-mo",
-            "character:stranger",
-            "hook:basement-door",
-        }
-        self.assertEqual(set(trace.protected_source_ids), expected_protected)
-        self.assertTrue(expected_protected <= set(trace.selected_source_ids))
-        self.assertGreater(context.estimated_tokens, trace.budget)
-        self.assertTrue(any("超过预算" in note for note in trace.notes))
+        with self.assertRaisesRegex(ContextBudgetExceededError, "拒绝静默删除"):
+            builder.build(
+                project=create_history_project(),
+                plan=create_next_plan(),
+                chapter_summaries=create_summaries(),
+                user_instruction="本章强化雨声带来的压迫感",
+            )
 
     def test_only_three_recent_summaries_are_candidates(self) -> None:
         builder = ChapterContextBuilder(

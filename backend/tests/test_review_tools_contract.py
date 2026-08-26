@@ -66,8 +66,9 @@ class ReviewToolContractTests(unittest.TestCase):
         self.assertEqual(result["first"], result["second"])
         self.assertEqual(len(evidence), 1)
         self.assertEqual(len(completed), 2)
-        self.assertFalse(bool(completed[0][-1]))
-        self.assertTrue(bool(completed[1][-1]))
+        self.assertFalse(bool(completed[0][-2]))
+        self.assertTrue(bool(completed[1][-2]))
+        self.assertEqual(completed[0][-1], {"chapter_number": 0})
 
 
 if __name__ == "__main__":

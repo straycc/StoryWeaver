@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from typing import Protocol
 from uuid import uuid4
 
-from ..memory.services import LongTermMemoryRetriever
 from ..observability import get_log_context, logging_context
 from ..context_management import trace_from_selected_entries
 
@@ -35,7 +34,7 @@ from .models import (
     StoryState,
     StoryStateDelta,
 )
-from .project_store import NovelProjectStore
+from .repository import StoryProjectRepository
 from .quality_gate import (
     ReviewDecision,
     ReviewGateResult,
@@ -122,7 +121,7 @@ class CreateNovelPipeline:
         self,
         *,
         architect: Architect,
-        store: NovelProjectStore,
+        store: StoryProjectRepository,
         validator: NovelFoundationValidator | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -217,7 +216,7 @@ class WriteNextChapterPipeline:
     def __init__(
         self,
         *,
-        store: NovelProjectStore,
+        store: StoryProjectRepository,
         planner: Planner,
         context_builder: ChapterContextBuilder,
         writer: Writer,
@@ -226,7 +225,6 @@ class WriteNextChapterPipeline:
         analyzer: ChapterAnalyzer,
         draft_validator: ChapterDraftValidator | None = None,
         state_reducer: NovelStateReducer | None = None,
-        memory_retriever: LongTermMemoryRetriever | None = None,
         creative_control_provider: Callable[[str], object] | None = None,
         context_snapshot_sink: object | None = None,
         review_policy: str = "strict",
@@ -243,7 +241,6 @@ class WriteNextChapterPipeline:
         self._analyzer = analyzer
         self._draft_validator = draft_validator or ChapterDraftValidator()
         self._state_reducer = state_reducer or NovelStateReducer()
-        self._memory_retriever = memory_retriever
         self._creative_control_provider = creative_control_provider
         # 采用鸭子类型，领域 Pipeline 不反向依赖 PostgreSQL ORM。
         self._context_snapshot_sink = context_snapshot_sink
@@ -291,11 +288,6 @@ class WriteNextChapterPipeline:
             plan.chapter_number,
             self._short_text(plan.goal),
         )
-        long_term_memories = await self._retrieve_memories(
-            book_id=book_id,
-            plan=plan,
-            user_instruction=user_instruction,
-        )
         timestamp = datetime.now(timezone.utc).isoformat()
         return ChapterPlanProposal(
             proposal_id=str(uuid4()),
@@ -308,12 +300,10 @@ class WriteNextChapterPipeline:
             plan=plan,
             user_instruction=user_instruction,
             feedback_history=(),
-            selected_memory_ids=tuple(
-                item.memory_id for item in long_term_memories
-            ),
-            selected_memory_descriptions=tuple(
-                f"{item.name}：{item.description}" for item in long_term_memories
-            ),
+            # 会话记忆只服务于 Main Agent 的对话理解，不能绕过创作控制
+            # 直接影响 Planner / Writer。历史 Proposal 字段继续保留兼容读取。
+            selected_memory_ids=(),
+            selected_memory_descriptions=(),
             created_at=timestamp,
             updated_at=timestamp,
         )
@@ -350,25 +340,13 @@ class WriteNextChapterPipeline:
             proposal.version + 1,
             self._short_text(plan.goal),
         )
-        long_term_memories = await self._retrieve_memories(
-            book_id=proposal.book_id,
-            plan=plan,
-            user_instruction=self._effective_instruction(
-                proposal,
-                additional_feedback=normalized_feedback,
-            ),
-        )
         return replace(
             proposal,
             version=proposal.version + 1,
             plan=plan,
             feedback_history=(*proposal.feedback_history, normalized_feedback),
-            selected_memory_ids=tuple(
-                item.memory_id for item in long_term_memories
-            ),
-            selected_memory_descriptions=tuple(
-                f"{item.name}：{item.description}" for item in long_term_memories
-            ),
+            selected_memory_ids=(),
+            selected_memory_descriptions=(),
             updated_at=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -383,25 +361,17 @@ class WriteNextChapterPipeline:
         project = self._validate_proposal_base(proposal)
         active_quality_gate = quality_gate or self._quality_gate
         summaries = self._store.load_chapter_summaries(proposal.book_id)
-        long_term_memories = ()
-        if self._memory_retriever is not None:
-            long_term_memories = self._memory_retriever.load_selected(
-                memory_ids=proposal.selected_memory_ids,
-                book_id=proposal.book_id,
-            )
         context, context_trace = self._context_builder.build(
             project=project,
             plan=proposal.plan,
             chapter_summaries=summaries,
             user_instruction=self._effective_instruction(proposal),
-            long_term_memories=long_term_memories,
         )
         self._log_stage_summary(
             "pipeline",
-            "上下文 | %d 个来源 · 估算 %s Token · 长期记忆 %d 条",
+            "上下文 | %d 个来源 · 估算 %s Token · 创作控制由显式设置提供",
             len(context.entries),
             f"{context.estimated_tokens:,}",
-            len(long_term_memories),
         )
         self._record_writer_context_snapshot(
             project=project,
@@ -631,30 +601,6 @@ class WriteNextChapterPipeline:
             f"当前焦点：{current_focus or '未设置'}"
         )
         return f"{user_instruction or '无额外用户要求'}\n\n{control_text}"
-
-    async def _retrieve_memories(
-        self,
-        *,
-        book_id: str,
-        plan: ChapterPlan,
-        user_instruction: str | None,
-    ) -> tuple[object, ...]:
-        if self._memory_retriever is None:
-            return ()
-        memory_query = " ".join(
-            (
-                user_instruction or "",
-                plan.goal,
-                plan.location,
-                plan.ending_hook,
-                *plan.required_beats,
-                *plan.style_focus,
-            )
-        )
-        return await self._memory_retriever.retrieve(
-            query=memory_query,
-            book_id=book_id,
-        )
 
     def _record_writer_context_snapshot(
         self,

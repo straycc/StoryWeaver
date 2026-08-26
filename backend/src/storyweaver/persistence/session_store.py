@@ -14,8 +14,8 @@ from .tables import ChatSessionEventRow, ChatSessionRow
 from .timeline import TimelineProjector
 
 
-class PostgresChatSessionStore:
-    """保留 ChatSessionStore 的事件溯源接口，运行时不再写 JSONL。"""
+class PostgresChatSessionRepository:
+    """PostgreSQL 会话事件仓储。"""
 
     def __init__(self, database: Database) -> None:
         self.database = database

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any
+from typing import Any, Mapping
 
 from ...context_management import ContextCandidate, source_ref, trace_from_candidates, with_tool_results
 from ...observability import get_log_context
@@ -13,7 +13,7 @@ from ...llm import LlmEvent, LlmEventSink, LlmEventType, NOVEL_OUTPUT_TYPES, Wor
 from ..context_renderer import ChapterContextRenderer
 from ..exceptions import SerializationError
 from ..models import ChapterContext, ChapterDraft, ChapterPlan, ReviewReport
-from ..project_store import NovelProjectStore
+from ..repository import StoryProjectRepository
 from ..review_tools import (
     CanonEvidenceSearchTool,
     ChapterSummaryTool,
@@ -143,7 +143,7 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
         *,
         renderer: ChapterContextRenderer | None = None,
         retry_policy: WorkerRetryPolicy | None = None,
-        store: NovelProjectStore | None = None,
+        store: StoryProjectRepository | None = None,
         sdk_settings: WorkerSettings | None = None,
         event_sinks: tuple[LlmEventSink, ...] = (),
         context_snapshot_sink: object | None = None,
@@ -241,11 +241,11 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
     ) -> ReviewReport:
         active_settings = settings or self._sdk_settings
         evidence: list[dict[str, object]] = []
-        async def completed(name: str, index: int, succeeded: bool, exhausted: bool, elapsed: float, error: str | None, deduplicated: bool) -> None:
+        async def completed(name: str, index: int, succeeded: bool, exhausted: bool, elapsed: float, error: str | None, deduplicated: bool, arguments: Mapping[str, object]) -> None:
             event = LlmEvent(LlmEventType.TOOL_COMPLETED, active_settings.worker_id, {
                 "tool_name": name, "tool_call_index": index, "tool_call_limit": max_tool_calls,
                 "succeeded": succeeded, "budget_exhausted": exhausted, "elapsed_seconds": elapsed,
-                "error": error, "deduplicated": deduplicated,
+                "error": error, "deduplicated": deduplicated, "tool_arguments": dict(arguments),
             })
             for sink in self._event_sinks:
                 await sink.on_event(event)

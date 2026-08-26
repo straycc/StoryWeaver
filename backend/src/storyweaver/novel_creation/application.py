@@ -12,9 +12,8 @@ from pathlib import Path
 from agents import ModelSettings
 
 from ..llm.errors import ConfigurationError
-from ..memory import JsonLongTermMemoryStore, LongTermMemoryRetriever
 from ..observability import ModelFailureDiagnosticWriter
-from ..llm import OpenAICompatibleProviderSettings, WorkerSettings, run_text_worker
+from ..llm import OpenAICompatibleProviderSettings, WorkerSettings
 from .agents import (
     ArchitectAgent,
     ChapterAnalyzerAgent,
@@ -42,16 +41,12 @@ from .models import (
 )
 from .observability import NovelRunObserver
 from .pipeline import CreateNovelPipeline, WriteNextChapterPipeline
-from .project_store import NovelProjectStore
+from .repository import StoryProjectRepository
 from .quality_gate import ReviewQualityGate, ReviewQualityGatePolicy
 from .sdk_tracing import configure_local_sdk_tracing
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
-DEFAULT_BOOKS_DIRECTORY = PROJECT_ROOT / "data" / "books"
-DEFAULT_LONG_TERM_MEMORY_DIRECTORY = PROJECT_ROOT / "data" / "long_term_memory"
-DEFAULT_TOOL_RESULT_DIRECTORY = PROJECT_ROOT / "data" / "tool_results"
-DEFAULT_LOG_DIRECTORY = PROJECT_ROOT / "runtime" / "logs"
 DEFAULT_MODEL_DIAGNOSTICS_DIRECTORY = (
     PROJECT_ROOT / "runtime" / "diagnostics" / "model_failures"
 )
@@ -122,11 +117,10 @@ def _read_int(name: str, default: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class NovelApplicationSettings:
-    """CLI 和真实模型小说应用所需配置。"""
+    """正式 Web 运行时所需配置。"""
 
     base_url: str
     model: str
-    books_directory: Path = DEFAULT_BOOKS_DIRECTORY
     api_key: str | None = field(default=None, repr=False)
     temperature: float = 0.8
     timeout_seconds: float = 180.0
@@ -147,7 +141,6 @@ class NovelApplicationSettings:
     review_maximum_target_ratio: float = 1.8
     review_warning_count_threshold: int = 3
     review_max_revision_rounds: int = 1
-    long_term_memory_directory: Path = DEFAULT_LONG_TERM_MEMORY_DIRECTORY
     model_diagnostics_directory: Path = DEFAULT_MODEL_DIAGNOSTICS_DIRECTORY
     agent_trace_directory: Path = DEFAULT_AGENT_TRACE_DIRECTORY
 
@@ -158,10 +151,6 @@ class NovelApplicationSettings:
             raise ConfigurationError(
                 "缺少 STORYWEAVER_LLM_MODEL，请在 .env 中配置模型名称"
             )
-        if not isinstance(self.books_directory, Path):
-            raise TypeError("books_directory 必须是 Path")
-        if not isinstance(self.long_term_memory_directory, Path):
-            raise TypeError("long_term_memory_directory 必须是 Path")
         if not isinstance(self.model_diagnostics_directory, Path):
             raise TypeError("model_diagnostics_directory 必须是 Path")
         if not isinstance(self.agent_trace_directory, Path):
@@ -213,8 +202,6 @@ class NovelApplicationSettings:
     @classmethod
     def from_env(
         cls,
-        *,
-        books_directory: str | Path | None = None,
     ) -> "NovelApplicationSettings":
         base_url = _read_env(
             "STORYWEAVER_LLM_BASE_URL",
@@ -225,13 +212,8 @@ class NovelApplicationSettings:
         reasoning_effort = os.getenv("STORYWEAVER_LLM_REASONING_EFFORT")
         thinking = os.getenv("STORYWEAVER_LLM_THINKING")
         json_mode = os.getenv("STORYWEAVER_LLM_JSON_MODE", "auto")
-        configured_books = os.getenv("STORYWEAVER_BOOKS_DIR")
-        configured_memories = os.getenv("STORYWEAVER_MEMORY_DIR")
         configured_diagnostics = os.getenv("STORYWEAVER_DIAGNOSTICS_DIR")
         configured_traces = os.getenv("STORYWEAVER_TRACE_DIR")
-        resolved_books = Path(
-            books_directory or configured_books or DEFAULT_BOOKS_DIRECTORY
-        ).expanduser()
         return cls(
             base_url=base_url,
             model=model,
@@ -276,10 +258,6 @@ class NovelApplicationSettings:
                 "STORYWEAVER_REVIEW_MAX_REVISION_ROUNDS",
                 1,
             ),
-            books_directory=resolved_books,
-            long_term_memory_directory=Path(
-                configured_memories or DEFAULT_LONG_TERM_MEMORY_DIRECTORY
-            ).expanduser(),
             model_diagnostics_directory=Path(
                 configured_diagnostics or DEFAULT_MODEL_DIAGNOSTICS_DIRECTORY
             ).expanduser(),
@@ -289,12 +267,12 @@ class NovelApplicationSettings:
         )
 
 class NovelService:
-    """CLI、未来 API 共用的小说创作应用入口。"""
+    """FastAPI 与 JobSupervisor 共用的小说创作应用入口。"""
 
     def __init__(
         self,
         *,
-        store: NovelProjectStore,
+        store: StoryProjectRepository,
         create_pipeline: CreateNovelPipeline,
         write_pipeline: WriteNextChapterPipeline,
         execution_locks: BookExecutionLockManager | None = None,
@@ -485,8 +463,7 @@ def build_novel_service(
     *,
     observer: NovelRunObserver | None = None,
     creative_control_provider: object | None = None,
-    store: object | None = None,
-    memory_store: object | None = None,
+    store: StoryProjectRepository,
     context_snapshot_sink: object | None = None,
 ) -> NovelService:
     """使用一个共享 Runtime 组装真实模型小说创作服务。"""
@@ -494,10 +471,7 @@ def build_novel_service(
     configure_local_sdk_tracing(settings.agent_trace_directory)
     diagnostic_writer = ModelFailureDiagnosticWriter(settings.model_diagnostics_directory)
     hooks = (observer,) if observer is not None else ()
-    # 生产小说 Worker 全部直接使用 SDK。旧 Runtime 仅暂留给既有离线替身，
-    # 下一阶段会由 ScriptedModel 测试替换后删除。
-    # 无工具 Worker 已直接走 SDK。Planner/Reviewer 和 Memory 仍在下一切片
-    # 迁移，故暂时共用同一 Provider 配置而非再创建第二个 HTTP 客户端。
+    # 生产小说 Worker 全部直接使用 SDK，并共用同一 Provider 配置。
     sdk_model = None
     sdk_provider = OpenAICompatibleProviderSettings(
         base_url=settings.base_url,
@@ -532,26 +506,6 @@ def build_novel_service(
             timeout_seconds=timeout_seconds or settings.timeout_seconds,
             diagnostic_writer=diagnostic_writer,
         )
-    # CLI 仍可显式使用文件仓储；FastAPI 传入 PostgreSQL 仓储后，小说正史
-    # 完全不再读取 data/books。这里保留鸭子类型，避免领域层反向依赖 ORM。
-    resolved_store = store if store is not None else NovelProjectStore(settings.books_directory)
-    async def generate_memory_text(prompt: str) -> str:
-        provider = OpenAICompatibleProviderSettings(
-            base_url=settings.base_url, model_name=settings.model, api_key=settings.api_key,
-        ).create_provider()
-        return await run_text_worker(
-            settings=WorkerSettings(
-                worker_id="long-term-memory", name="长期记忆", instructions="只完成用户给定的记忆任务。",
-                model=provider.get_model(settings.model), model_settings=ModelSettings(temperature=0.1),
-                timeout_seconds=settings.timeout_seconds,
-            ),
-            prompt=prompt,
-        )
-    memory_retriever = LongTermMemoryRetriever(
-        generate_text=generate_memory_text,
-        store=(memory_store if memory_store is not None else JsonLongTermMemoryStore(settings.long_term_memory_directory)),
-    )
-
     architect = ArchitectAgent(
         sdk_settings=sdk_worker_settings(
             worker_id="novel-architect",
@@ -562,7 +516,7 @@ def build_novel_service(
         event_sinks=hooks,
     )
     planner = PlannerAgent(
-        store=resolved_store,
+        store=store,
         context_snapshot_sink=context_snapshot_sink,
         sdk_settings=sdk_worker_settings(
             worker_id="novel-planner", name="章节规划师",
@@ -580,7 +534,7 @@ def build_novel_service(
         event_sinks=hooks,
     )
     reviewer = ReviewerAgent(
-        store=resolved_store,
+        store=store,
         context_snapshot_sink=context_snapshot_sink,
         sdk_settings=sdk_worker_settings(
             worker_id="novel-reviewer", name="章节审查员",
@@ -609,13 +563,13 @@ def build_novel_service(
     )
 
     return NovelService(
-        store=resolved_store,
+        store=store,
         create_pipeline=CreateNovelPipeline(
             architect=architect,
-            store=resolved_store,
+            store=store,
         ),
         write_pipeline=WriteNextChapterPipeline(
-            store=resolved_store,
+            store=store,
             planner=planner,
             context_builder=ChapterContextBuilder(
                 token_budget=settings.context_token_budget,
@@ -625,7 +579,6 @@ def build_novel_service(
             reviewer=reviewer,
             reviser=reviser,
             analyzer=analyzer,
-            memory_retriever=memory_retriever,
             creative_control_provider=creative_control_provider if callable(creative_control_provider) else None,
             context_snapshot_sink=context_snapshot_sink,
             review_policy=settings.review_policy,

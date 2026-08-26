@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from storyweaver.persistence import ActionProposalRepository, Database, DatabaseSettings, PostgresChatSessionStore
+from storyweaver.persistence import ActionProposalRepository, Database, DatabaseSettings, PostgresChatSessionRepository
 
 
 class ActionProposalRepositoryTests(unittest.TestCase):
@@ -14,7 +14,7 @@ class ActionProposalRepositoryTests(unittest.TestCase):
         self._directory = tempfile.TemporaryDirectory()
         self.database = Database(DatabaseSettings(f"sqlite+pysqlite:///{Path(self._directory.name) / 'test.db'}"))
         self.database.create_schema()
-        self.sessions = PostgresChatSessionStore(self.database)
+        self.sessions = PostgresChatSessionRepository(self.database)
         self.session = self.sessions.create_session(book_id="book-1")
         self.repository = ActionProposalRepository(self.database)
 

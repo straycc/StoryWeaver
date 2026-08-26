@@ -6,7 +6,6 @@ import re
 from collections.abc import Callable, Iterable
 
 from ..context_management import ContextBudgetExceededError
-from ..memory.long_term import LongTermMemoryRecord, LongTermMemoryType
 
 from .models import (
     ChapterContext,
@@ -60,7 +59,6 @@ class ChapterContextBuilder:
         plan: ChapterPlan,
         chapter_summaries: tuple[ChapterSummary, ...] = (),
         user_instruction: str | None = None,
-        long_term_memories: tuple[LongTermMemoryRecord, ...] = (),
     ) -> tuple[ChapterContext, ContextTrace]:
         """构造有限上下文和选择 Trace。"""
 
@@ -74,7 +72,6 @@ class ChapterContextBuilder:
             project=project,
             plan=plan,
             user_instruction=user_instruction,
-            long_term_memories=long_term_memories,
         )
         candidate_entries, pre_excluded = self._build_candidate_entries(
             project=project,
@@ -142,7 +139,6 @@ class ChapterContextBuilder:
         project: NovelProject,
         plan: ChapterPlan,
         user_instruction: str | None,
-        long_term_memories: tuple[LongTermMemoryRecord, ...],
     ) -> tuple[ContextEntry, ...]:
         entries = [
             self._entry(
@@ -230,24 +226,6 @@ class ChapterContextBuilder:
                     reason="用户对本章的直接要求",
                     protected=True,
                     priority=100,
-                )
-            )
-
-        for memory in long_term_memories:
-            if memory.memory_type == LongTermMemoryType.REFERENCE:
-                continue
-            entries.append(
-                self._entry(
-                    source_id=f"long-term-memory:{memory.memory_id}",
-                    source_type=memory.memory_type.value,
-                    value={
-                        "description": memory.description,
-                        "content": memory.content,
-                        "scope": f"{memory.scope_type.value}:{memory.scope_id}",
-                    },
-                    reason="用户跨会话偏好或当前作品长期指令",
-                    protected=True,
-                    priority=96,
                 )
             )
 

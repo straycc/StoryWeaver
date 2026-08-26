@@ -26,6 +26,10 @@ runtime/*
 # 本地归档内容不进入源码仓库
 archive/
 /docs/
+
+# 新环境使用 database/schema.sql 初始化
+alembic/
+alembic.ini
 # 本地虚拟环境
 .venv/
 venv/

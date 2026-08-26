@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 from ...context_management import ContextCandidate, source_ref, trace_from_candidates, with_tool_results
 from ...observability import get_log_context
@@ -19,7 +19,7 @@ from ...llm import (
 from ..exceptions import ChapterPlanValidationError, SerializationError
 from ..hook_manager import HookManager
 from ..models import BatchPlanningContext, ChapterPlan, NovelProject
-from ..project_store import NovelProjectStore
+from ..repository import StoryProjectRepository
 from ..review_tools import (
     CanonEvidenceSearchTool,
     ChapterSummaryTool,
@@ -73,7 +73,7 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
         validator: ChapterPlanValidator | None = None,
         retry_policy: WorkerRetryPolicy | None = None,
         hook_manager: HookManager | None = None,
-        store: NovelProjectStore | None = None,
+        store: StoryProjectRepository | None = None,
         sdk_settings: WorkerSettings | None = None,
         event_sinks: tuple[LlmEventSink, ...] = (),
         context_snapshot_sink: object | None = None,
@@ -125,7 +125,7 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
             return plan
 
         if self._store is None:
-            raise ValueError("Planner 必须注入 NovelProjectStore")
+            raise ValueError("Planner 必须注入 StoryProjectRepository")
         snapshot = self._load_snapshot(project)
         prompt = self._tool_prompt(snapshot=snapshot, user_instruction=user_instruction, batch_context=batch_context)
         return await self._run_sdk_plan(prompt, snapshot, convert)
@@ -134,11 +134,11 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
         """SDK 两阶段规划；报告修复不重新运行研究工具。"""
         evidence: list[dict[str, object]] = []
 
-        async def completed(name: str, index: int, succeeded: bool, exhausted: bool, elapsed: float, error: str | None, deduplicated: bool) -> None:
+        async def completed(name: str, index: int, succeeded: bool, exhausted: bool, elapsed: float, error: str | None, deduplicated: bool, arguments: Mapping[str, object]) -> None:
             event = LlmEvent(LlmEventType.TOOL_COMPLETED, "novel-planner", {
                 "tool_name": name, "tool_call_index": index, "tool_call_limit": 4,
                 "succeeded": succeeded, "budget_exhausted": exhausted, "elapsed_seconds": elapsed,
-                "error": error, "deduplicated": deduplicated,
+                "error": error, "deduplicated": deduplicated, "tool_arguments": dict(arguments),
             })
             for sink in self._event_sinks:
                 await sink.on_event(event)

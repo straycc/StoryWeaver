@@ -69,6 +69,7 @@ async def run_structured_worker(
     output_type: type[BaseModel],
     event_sinks: Sequence[LlmEventSink] = (),
     tracing_enabled: bool = False,
+    stream_text_field: str | None = None,
 ) -> BaseModel:
     """运行一个无工具、Pydantic 结构化输出的 SDK Worker。"""
 
@@ -87,19 +88,25 @@ async def run_structured_worker(
             model=settings.model,
             model_settings=settings.model_settings,
         )
-        result = await asyncio.wait_for(
-            Runner.run(
-                agent,
-                prompt,
-                max_turns=settings.max_turns,
-                run_config=RunConfig(
-                    tracing_disabled=not tracing_enabled,
-                    workflow_name=settings.worker_id,
-                ),
-                hooks=hooks,
-            ),
-            timeout=settings.timeout_seconds,
+        run_config = RunConfig(
+            tracing_disabled=not tracing_enabled,
+            workflow_name=settings.worker_id,
         )
+        if stream_text_field is None:
+            result = await asyncio.wait_for(
+                Runner.run(agent, prompt, max_turns=settings.max_turns,
+                           run_config=run_config, hooks=hooks),
+                timeout=settings.timeout_seconds,
+            )
+        else:
+            result = await asyncio.wait_for(
+                _consume_structured_stream(
+                    agent=agent, prompt=prompt, settings=settings, hooks=hooks,
+                    run_config=run_config, event_sinks=event_sinks,
+                    text_field=stream_text_field,
+                ),
+                timeout=settings.timeout_seconds,
+            )
         output = _parse_structured_output(result.final_output, output_type)
         await _emit(event_sinks, LlmEventType.RUN_FINISHED, settings.worker_id, {
             "elapsed_seconds": max(0.0, time.perf_counter() - started_at),
@@ -122,6 +129,105 @@ async def run_structured_worker(
             "error": f"{type(exc).__name__}: {exc}",
         })
         raise WorkerExecutionError(f"{type(exc).__name__}: {exc}") from exc
+
+
+async def _consume_structured_stream(
+    *,
+    agent: Agent[Any],
+    prompt: str,
+    settings: WorkerSettings,
+    hooks: RunHooks[Any],
+    run_config: RunConfig,
+    event_sinks: Sequence[LlmEventSink],
+    text_field: str,
+) -> Any:
+    """从结构化 JSON 中仅投影一个字符串字段的可见预览。
+
+    Provider 的真实输出仍完整交给 `_parse_structured_output` 与 Pydantic；投影器
+    只是 UI 预览，绝不参与提交决策。这样正文很长时可边生成边阅读，也不会让
+    前端接收到 ``{\"chapter_number\": ...`` 一类内部协议文本。
+    """
+
+    projector = _JsonStringFieldProjector(text_field)
+    result = Runner.run_streamed(
+        agent, prompt, max_turns=settings.max_turns,
+        run_config=run_config, hooks=hooks,
+    )
+    await _emit(event_sinks, LlmEventType.STREAM_STARTED, settings.worker_id, {
+        "field": text_field,
+    })
+    async for event in result.stream_events():
+        data = getattr(event, "data", None)
+        if (
+            getattr(event, "type", None) == "raw_response_event"
+            and getattr(data, "type", None) == "response.output_text.delta"
+        ):
+            delta = getattr(data, "delta", None)
+            if isinstance(delta, str):
+                preview = projector.feed(delta)
+                if preview:
+                    await _emit(event_sinks, LlmEventType.TEXT_DELTA, settings.worker_id, {
+                        "field": text_field,
+                        "delta": preview,
+                        "preview": True,
+                    })
+    await _emit(event_sinks, LlmEventType.STREAM_COMPLETED, settings.worker_id, {
+        "field": text_field,
+    })
+    return result
+
+
+class _JsonStringFieldProjector:
+    """跨 SDK 增量切片提取 JSON 字符串字段，供非权威文本预览使用。"""
+
+    def __init__(self, field: str) -> None:
+        self._marker = re.compile(rf'"{re.escape(field)}"\s*:\s*"')
+        self._buffer = ""
+        self._started = False
+        self._finished = False
+        self._escaped = False
+        self._unicode: str | None = None
+
+    def feed(self, chunk: str) -> str:
+        if self._finished:
+            return ""
+        if not self._started:
+            self._buffer += chunk
+            match = self._marker.search(self._buffer)
+            if match is None:
+                # marker 的最长长度很短；保留尾部以支持跨分片匹配，避免无限缓存。
+                self._buffer = self._buffer[-max(64, len(self._marker.pattern) * 2):]
+                return ""
+            self._started = True
+            chunk = self._buffer[match.end():]
+            self._buffer = ""
+        output: list[str] = []
+        for char in chunk:
+            if self._unicode is not None:
+                self._unicode += char
+                if len(self._unicode) == 4:
+                    try:
+                        output.append(chr(int(self._unicode, 16)))
+                    except ValueError:
+                        output.append("\\u" + self._unicode)
+                    self._unicode = None
+                    self._escaped = False
+                continue
+            if self._escaped:
+                if char == "u":
+                    self._unicode = ""
+                    continue
+                output.append({"n": "\n", "r": "\r", "t": "\t"}.get(char, char))
+                self._escaped = False
+                continue
+            if char == "\\":
+                self._escaped = True
+            elif char == '"':
+                self._finished = True
+                break
+            else:
+                output.append(char)
+        return "".join(output)
 
 
 def _parse_structured_output(raw: Any, output_type: type[BaseModel]) -> BaseModel:
@@ -179,7 +285,9 @@ def _extract_json_object(raw: str) -> object:
     candidate = raw.strip()
     parse_error: json.JSONDecodeError | None = None
     try:
-        return json.loads(candidate)
+        # 正文模型偶尔会在 JSON 字符串中直接输出换行或制表符。它们不改变
+        # 对象结构，允许后再由 Pydantic 与领域校验继续把关，避免无谓重写正文。
+        return json.loads(candidate, strict=False)
     except json.JSONDecodeError as exc:
         parse_error = exc
 
@@ -190,11 +298,11 @@ def _extract_json_object(raw: str) -> object:
     )
     for block in reversed(fenced_blocks):
         try:
-            return json.loads(block.strip())
+            return json.loads(block.strip(), strict=False)
         except json.JSONDecodeError as exc:
             parse_error = exc
 
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(strict=False)
     for match in reversed(list(re.finditer(r"\{", candidate))):
         try:
             value, end = decoder.raw_decode(candidate[match.start() :])
@@ -216,14 +324,18 @@ async def run_text_worker(
     event_sinks: Sequence[LlmEventSink] = (),
     tracing_enabled: bool = False,
 ) -> str:
-    """运行无工具文本 Worker，供聊天和摘要类调用复用。"""
+    """运行无工具文本 Worker，供聊天和摘要类调用复用。
+
+    纯文本任务可以安全地把 SDK 的文本增量投影出去。结构化 Worker 则仍然只在
+    Pydantic 校验完成后交付，避免把半截 JSON 当作用户可见内容。
+    """
 
     await _emit(event_sinks, LlmEventType.RUN_STARTED, settings.worker_id, {
         "max_steps": settings.max_turns,
     })
     try:
-        result = await asyncio.wait_for(
-            Runner.run(
+        async def consume_stream() -> Any:
+            result = Runner.run_streamed(
                 Agent(
                     name=settings.name,
                     instructions=settings.instructions,
@@ -237,14 +349,35 @@ async def run_text_worker(
                     workflow_name=settings.worker_id,
                 ),
                 hooks=_WorkerHooks(settings.worker_id, event_sinks),
-            ),
-            timeout=settings.timeout_seconds,
-        )
+            )
+            await _emit(event_sinks, LlmEventType.STREAM_STARTED, settings.worker_id, {})
+            async for event in result.stream_events():
+                # OpenAI Agents SDK 对 Responses 与 Chat Completions 都统一投影为
+                # response.output_text.delta，因此不依赖具体 Provider 的原始格式。
+                data = getattr(event, "data", None)
+                if (
+                    getattr(event, "type", None) == "raw_response_event"
+                    and getattr(data, "type", None) == "response.output_text.delta"
+                ):
+                    delta = getattr(data, "delta", None)
+                    if isinstance(delta, str) and delta:
+                        await _emit(event_sinks, LlmEventType.TEXT_DELTA, settings.worker_id, {
+                            "delta": delta,
+                        })
+            await _emit(event_sinks, LlmEventType.STREAM_COMPLETED, settings.worker_id, {})
+            return result
+
+        result = await asyncio.wait_for(consume_stream(), timeout=settings.timeout_seconds)
         output = result.final_output
         if not isinstance(output, str) or not output.strip():
             raise WorkerExecutionError("模型没有返回非空文本")
         await _emit(event_sinks, LlmEventType.RUN_FINISHED, settings.worker_id, {})
         return output.strip()
+    except asyncio.CancelledError:
+        await _emit(event_sinks, LlmEventType.RUN_FAILED, settings.worker_id, {
+            "error": "模型调用已取消",
+        })
+        raise
     except Exception as exc:
         await _emit(event_sinks, LlmEventType.RUN_FAILED, settings.worker_id, {
             "error": f"{type(exc).__name__}: {exc}",

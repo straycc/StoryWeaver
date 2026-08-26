@@ -497,7 +497,7 @@ def build_sdk_read_tools(
     *,
     snapshot: ReviewSnapshot,
     max_tool_calls: int,
-    on_completed: Callable[[str, int, bool, bool, float, str | None, bool], Awaitable[None]] | None = None,
+    on_completed: Callable[[str, int, bool, bool, float, str | None, bool, Mapping[str, object]], Awaitable[None]] | None = None,
     evidence: list[dict[str, object]] | None = None,
 ) -> list[FunctionTool]:
     """从一次性正史快照构造 SDK 只读工具。
@@ -544,7 +544,7 @@ def build_sdk_read_tools(
                 else:
                     if counter >= max_tool_calls:
                         if on_completed is not None:
-                            await on_completed(name, counter, True, True, 0.0, None, False)
+                            await on_completed(name, counter, True, True, 0.0, None, False, raw_arguments if isinstance(raw_arguments, dict) else {})
                         return json.dumps(
                             {"error": "工具调用预算已耗尽"}, ensure_ascii=False
                         )
@@ -556,7 +556,7 @@ def build_sdk_read_tools(
             if duplicate_result is not None or duplicate_future is not None:
                 result_text = duplicate_result if duplicate_result is not None else await duplicate_future
                 if on_completed is not None:
-                    await on_completed(name, call_index, True, False, time.perf_counter() - started_at, None, True)
+                    await on_completed(name, call_index, True, False, time.perf_counter() - started_at, None, True, raw_arguments if isinstance(raw_arguments, dict) else {})
                 return result_text
             try:
                 if raw_arguments is None:
@@ -580,7 +580,7 @@ def build_sdk_read_tools(
                         if own_future is not None and not own_future.done():
                             own_future.set_result(serialized)
                 if on_completed is not None:
-                    await on_completed(name, call_index, True, False, time.perf_counter() - started_at, None, False)
+                    await on_completed(name, call_index, True, False, time.perf_counter() - started_at, None, False, validated.model_dump())
                 return serialized
             except Exception as exc:
                 detail = f"{type(exc).__name__}: {exc}"
@@ -599,7 +599,7 @@ def build_sdk_read_tools(
                         if own_future is not None and not own_future.done():
                             own_future.set_result(json.dumps({"error": detail}, ensure_ascii=False))
                 if on_completed is not None:
-                    await on_completed(name, call_index, False, False, time.perf_counter() - started_at, detail, False)
+                    await on_completed(name, call_index, False, False, time.perf_counter() - started_at, detail, False, raw_arguments if isinstance(raw_arguments, dict) else {})
                 return json.dumps({"error": detail}, ensure_ascii=False)
 
         return FunctionTool(

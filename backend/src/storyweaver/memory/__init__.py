@@ -1,6 +1,5 @@
-"""角色记忆模型、存储与投影服务。"""
+"""长期会话记忆模型、端口与服务。"""
 
-from .manager import MemoryManager
 from .long_term import (
     LongTermMemoryRecord,
     LongTermMemoryStatus,
@@ -9,31 +8,11 @@ from .long_term import (
     MemoryExtractionResult,
     MemoryScopeType,
 )
-from .long_term_store import JsonLongTermMemoryStore, LongTermMemoryStore
-from .record import MemoryRecord, MemoryType
-from .services import (
-    LongTermMemoryConsolidator,
-    LongTermMemoryExtractor,
-    LongTermMemoryRetriever,
-)
-from .store import InMemoryMemoryStore, JsonCharacterMemoryStore, MemoryStore
+from .long_term_store import LongTermMemoryStore
+from .services import LongTermMemoryConsolidator, LongTermMemoryExtractor, LongTermMemoryRetriever
 
 __all__ = [
-    "InMemoryMemoryStore",
-    "JsonLongTermMemoryStore",
-    "JsonCharacterMemoryStore",
-    "LongTermMemoryConsolidator",
-    "LongTermMemoryExtractor",
-    "LongTermMemoryRecord",
-    "LongTermMemoryRetriever",
-    "LongTermMemoryStatus",
-    "LongTermMemoryStore",
-    "LongTermMemoryType",
-    "MemoryCandidate",
-    "MemoryExtractionResult",
-    "MemoryManager",
-    "MemoryRecord",
-    "MemoryScopeType",
-    "MemoryStore",
-    "MemoryType",
+    "LongTermMemoryConsolidator", "LongTermMemoryExtractor", "LongTermMemoryRecord",
+    "LongTermMemoryRetriever", "LongTermMemoryStatus", "LongTermMemoryStore",
+    "LongTermMemoryType", "MemoryCandidate", "MemoryExtractionResult", "MemoryScopeType",
 ]

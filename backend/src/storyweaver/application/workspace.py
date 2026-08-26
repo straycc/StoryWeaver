@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from pathlib import Path
 import re
 from collections.abc import Awaitable, Callable
 from typing import Any, Mapping
@@ -14,35 +13,25 @@ from ..llm import LlmMessage, LlmMessageRole
 from ..context_management import ContextPolicy, SessionContextManager
 from ..llm import OpenAICompatibleProviderSettings, WorkerSettings, run_text_worker
 from ..memory import (
-    JsonLongTermMemoryStore,
+    LongTermMemoryStore,
     LongTermMemoryConsolidator,
     LongTermMemoryExtractor,
     LongTermMemoryRetriever,
     MemoryScopeType,
     LongTermMemoryStatus,
 )
-from ..novel_creation.application import (
-    PROJECT_ROOT,
-    NovelApplicationSettings,
-    NovelService,
-    build_novel_service,
-)
+from ..novel_creation.application import NovelApplicationSettings, NovelService
 from ..novel_creation.exceptions import ProjectAlreadyExistsError, ProjectPersistenceError
 from ..novel_creation.models import (
     BatchPlanningContext,
     ChapterPlanProposal,
     CreateNovelRequest,
 )
-from ..novel_creation.observability import NovelRunObserver
 from ..novel_creation.pipeline import CreateNovelPipeline
 from ..observability import logging_context
 from ..skills import applied_skill_markers
 from .models import ChatMessage, ChatSession
-from .run_progress import RunProgressStore
-from .session_store import ChatSessionStore
-
-
-DEFAULT_SESSIONS_DIRECTORY = PROJECT_ROOT / "data" / "chat_sessions"
+from .ports import ChatSessionRepository
 
 ACTION_LABELS = {
     "chat": "自由对话",
@@ -82,6 +71,19 @@ CHAT_SYSTEM_PROMPT = """你是 StoryWeaver 小说创作工作台中的编辑助�
 回答使用清晰自然的中文；需要用户决定时，给出少量明确选项。
 """
 
+# 示例作品仅供 Workspace 预设动作使用，不依赖已删除的命令行模块。
+_EXAMPLE_NOVEL_REQUEST = CreateNovelRequest(
+    title="雨夜入局",
+    genre="武侠悬疑",
+    premise="一卷残卷引出雁门旧案，年轻镖师在追查父亲失踪时卷入江湖阴谋。",
+    protagonist="沈照",
+    central_conflict="沈照必须在镖局同门与雁门旧案的多重谎言中辨明真相。",
+    tone="冷峻、克制、带有江湖悬疑感",
+    target_chapters=12,
+    chapter_target_words=1600,
+    language="zh",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ChatActionResult:
@@ -95,15 +97,14 @@ class ChatWorkspaceApplication:
     def __init__(
         self,
         *,
-        sessions: ChatSessionStore,
+        sessions: ChatSessionRepository,
         novels: NovelService,
         generate_chat_text: Callable[[str], Awaitable[str]],
         model_name: str,
         context_manager: SessionContextManager | None = None,
-        memory_store: JsonLongTermMemoryStore | None = None,
+        memory_store: LongTermMemoryStore | None = None,
         memory_extractor: LongTermMemoryExtractor | None = None,
         memory_consolidator: LongTermMemoryConsolidator | None = None,
-        run_progress: RunProgressStore | None = None,
     ) -> None:
         self.sessions = sessions
         self.novels = novels
@@ -113,7 +114,6 @@ class ChatWorkspaceApplication:
         self.memory_store = memory_store
         self.memory_extractor = memory_extractor
         self.memory_consolidator = memory_consolidator
-        self.run_progress = run_progress or RunProgressStore()
 
     def bootstrap(self) -> dict[str, Any]:
         return {
@@ -224,7 +224,6 @@ class ChatWorkspaceApplication:
             else None
         )
         action_root_run_id = root_run_id or action_run_id
-        progress_started = False
         if action != "chat":
             action_payload = {
                 "run_id": action_run_id,
@@ -242,13 +241,6 @@ class ChatWorkspaceApplication:
                 event_type="action_started",
                 payload=action_payload,
             )
-            self.run_progress.start_run(
-                action_run_id,
-                session_id=session_id,
-                action=action,
-                label=ACTION_LABELS[action],
-            )
-            progress_started = True
 
         try:
             with logging_context(
@@ -336,11 +328,6 @@ class ChatWorkspaceApplication:
                     assistant_message=session.messages[-1],
                 )
                 session = self.sessions.load_session(session_id)
-            elif progress_started:
-                self.run_progress.complete_run(
-                    action_run_id,
-                    summary=self._compact_action_summary(reply),
-                )
             return ChatActionResult(session=session, assistant_message=session.messages[-1])
         except Exception as exc:
             error_message = f"操作失败：{type(exc).__name__}: {exc}"
@@ -366,11 +353,6 @@ class ChatWorkspaceApplication:
                     content=error_message,
                     action=action,
                     metadata={"error": True},
-                )
-            if progress_started:
-                self.run_progress.fail_run(
-                    action_run_id,
-                    error=error_message,
                 )
             raise
 
@@ -1514,9 +1496,7 @@ class ChatWorkspaceApplication:
     @staticmethod
     def _create_request(payload: Mapping[str, Any], *, example: bool) -> CreateNovelRequest:
         if example:
-            from ..novel_creation.cli import RAINY_HOTEL_REQUEST
-
-            return RAINY_HOTEL_REQUEST
+            return _EXAMPLE_NOVEL_REQUEST
         required = (
             "title",
             "genre",
@@ -1618,18 +1598,11 @@ class ChatWorkspaceApplication:
 def build_chat_workspace(
     settings: NovelApplicationSettings,
     *,
-    sessions_directory: str | Path = DEFAULT_SESSIONS_DIRECTORY,
-    memory_directory: str | Path | None = None,
-    sessions: Any | None = None,
-    memory_store: Any | None = None,
-    novels: NovelService | None = None,
-    run_progress: RunProgressStore | None = None,
+    sessions: ChatSessionRepository,
+    memory_store: LongTermMemoryStore,
+    novels: NovelService,
 ) -> ChatWorkspaceApplication:
-    """构造对话编排层。
-
-    默认保留旧文件仓储行为，FastAPI 则注入 PostgreSQL 仓储和已组装的
-    NovelService，使原有 UI 动作语义可以复用而不再写入 ``data/``。
-    """
+    """构造正式 PostgreSQL 对话编排层。"""
     provider = OpenAICompatibleProviderSettings(
         base_url=settings.base_url,
         model_name=settings.model,
@@ -1668,39 +1641,29 @@ def build_chat_workspace(
                 timeout_seconds=settings.timeout_seconds,
             ), prompt=prompt,
         )
-    resolved_progress = run_progress or RunProgressStore()
-    resolved_sessions = sessions or ChatSessionStore(sessions_directory)
-    resolved_memory_store = memory_store or JsonLongTermMemoryStore(
-        memory_directory or settings.long_term_memory_directory
-    )
-    resolved_novels = novels or build_novel_service(
-        settings,
-        observer=NovelRunObserver(output=None, event_sink=resolved_progress.append),
-    )
     memory_retriever = LongTermMemoryRetriever(
         generate_text=generate_memory_text,
-        store=resolved_memory_store,
+        store=memory_store,
     )
     context_manager = SessionContextManager(
-        sessions=resolved_sessions,
+        sessions=sessions,
         generate_text=generate_context_text,
         memory_retriever=memory_retriever,
         policy=ContextPolicy(token_budget=settings.context_token_budget),
     )
     return ChatWorkspaceApplication(
-        sessions=resolved_sessions,
-        novels=resolved_novels,
+        sessions=sessions,
+        novels=novels,
         generate_chat_text=generate_chat_text,
         model_name=settings.model,
         context_manager=context_manager,
-        memory_store=resolved_memory_store,
+        memory_store=memory_store,
         memory_extractor=LongTermMemoryExtractor(
             generate_text=generate_memory_text,
-            store=resolved_memory_store,
+            store=memory_store,
         ),
         memory_consolidator=LongTermMemoryConsolidator(
             generate_text=generate_memory_text,
-            store=resolved_memory_store,
+            store=memory_store,
         ),
-        run_progress=resolved_progress,
     )

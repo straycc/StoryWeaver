@@ -97,6 +97,9 @@ class BaseNovelAgent(Generic[OutputT]):
                     output_type=output_type,
                     event_sinks=self._event_sinks,
                     tracing_enabled=True,
+                    # 只有 Writer 的 content 能安全成为最终正文预览。Reviser、
+                    # Analyzer 等仍在校验完成前保持静默，避免预览未提交改稿。
+                    stream_text_field="content" if self._agent_id == "novel-writer" else None,
                 )
             except StructuredOutputError as exc:
                 repair_raw_output = exc.raw_output
