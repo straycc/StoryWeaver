@@ -14,10 +14,13 @@ from storyweaver.novel_creation import (
     ReviewReport,
 )
 from storyweaver.novel_creation.repository import ChapterRunCheckpoint
+from storyweaver.novel_creation.exceptions import ProjectNotFoundError
 from storyweaver.persistence import (
     Database,
     DatabaseSettings,
+    DeletionConflictError,
     JobRepository,
+    PostgresDeletionRepository,
     PostgresLongTermMemoryStore,
     PostgresChatSessionRepository,
     PostgresStoryProjectRepository,
@@ -256,6 +259,67 @@ class PersistenceJobsTests(unittest.TestCase):
         self.assertEqual(summary.title, "帮我继续写这一章")
         self.assertEqual(summary.book_id, BOOK_ID)
         self.assertEqual(summary.message_count, 1)
+
+    def test_session_deletion_rejects_active_job_then_removes_transcript(self) -> None:
+        sessions = PostgresChatSessionRepository(self.database)
+        jobs = JobRepository(self.database)
+        deletions = PostgresDeletionRepository(self.database)
+        created = sessions.create_session()
+        active = jobs.create(
+            job_type="session_action",
+            book_id=None,
+            payload={"session_id": created.session_id},
+        )
+
+        with self.assertRaises(DeletionConflictError):
+            deletions.delete_session(created.session_id)
+        jobs.succeed(active.job_id)
+        deletions.delete_session(created.session_id)
+
+        with self.assertRaises(KeyError):
+            sessions.load_session(created.session_id)
+        # 删除对话不抹掉已经完成的 Job 审计记录。
+        self.assertEqual(jobs.get(active.job_id).status, "succeeded")
+
+    def test_book_deletion_unbinds_sessions_and_removes_book_memory(self) -> None:
+        projects = PostgresStoryProjectRepository(self.database)
+        sessions = PostgresChatSessionRepository(self.database)
+        memories = PostgresLongTermMemoryStore(self.database)
+        deletions = PostgresDeletionRepository(self.database)
+        projects.create_project(
+            metadata=create_metadata(),
+            foundation=create_foundation(),
+            initial_state=create_initial_state(),
+        )
+        chat = sessions.create_session(book_id=BOOK_ID)
+        book_memory = self._memory_record("book-memory", "只属于当前作品")
+        self.assertTrue(memories.save(book_memory))
+
+        result = deletions.delete_book(BOOK_ID)
+
+        self.assertEqual(result.unbound_session_ids, (chat.session_id,))
+        self.assertIsNone(sessions.load_session(chat.session_id).book_id)
+        self.assertEqual(sessions.list_events(chat.session_id)[-1].event_type, "book_bound")
+        self.assertEqual(sessions.list_events(chat.session_id)[-1].payload["book_id"], None)
+        with self.assertRaises(ProjectNotFoundError):
+            projects.load_project(BOOK_ID)
+        with self.assertRaises(KeyError):
+            memories.get(book_memory.memory_id)
+
+    def test_book_deletion_rejects_active_job(self) -> None:
+        projects = PostgresStoryProjectRepository(self.database)
+        jobs = JobRepository(self.database)
+        deletions = PostgresDeletionRepository(self.database)
+        projects.create_project(
+            metadata=create_metadata(),
+            foundation=create_foundation(),
+            initial_state=create_initial_state(),
+        )
+        jobs.create(job_type="session_action", book_id=BOOK_ID, payload={})
+
+        with self.assertRaises(DeletionConflictError):
+            deletions.delete_book(BOOK_ID)
+        self.assertEqual(projects.load_metadata(BOOK_ID).book_id, BOOK_ID)
 
 
 if __name__ == "__main__":

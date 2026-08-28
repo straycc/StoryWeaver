@@ -12,6 +12,7 @@ from .action_proposals import ActionProposal, ActionProposalRepository
 from .creative_control import CreativeControl, CreativeControlRepository
 from .context_snapshots import ContextSnapshot, ContextSnapshotRepository
 from .simulations import SimulationRepository
+from .deletion import BookDeletionResult, DeletionConflictError, PostgresDeletionRepository
 
 __all__ = [
     "Database",
@@ -29,4 +30,7 @@ __all__ = [
     "ContextSnapshot",
     "ContextSnapshotRepository",
     "SimulationRepository",
+    "BookDeletionResult",
+    "DeletionConflictError",
+    "PostgresDeletionRepository",
 ]

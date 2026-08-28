@@ -128,11 +128,13 @@ button { color: inherit; }
   scrollbar-width: thin;
 }
 .conversations-section .compact-list { flex: 1; }
+.compact-item-shell { position: relative; min-width: 0; }
 .compact-item {
+  width: 100%;
   border: 0;
   border-radius: 9px;
   background: transparent;
-  padding: 9px 10px;
+  padding: 9px 34px 9px 10px;
   cursor: pointer;
   text-align: left;
   overflow: hidden;
@@ -146,6 +148,27 @@ button { color: inherit; }
 }
 .compact-item strong { font-size: 13px; font-weight: 520; }
 .compact-item span { margin-top: 3px; color: var(--muted); font-size: 10px; }
+.compact-delete-button {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 22px;
+  opacity: 0;
+  transform: translateY(-50%);
+}
+.compact-item-shell:hover .compact-delete-button,
+.compact-delete-button:focus-visible { opacity: 1; }
+.compact-delete-button:hover { color: #b42318; background: #fef3f2; }
+.compact-delete-button:disabled { cursor: wait; opacity: .35; }
+@media (pointer: coarse) { .compact-delete-button { opacity: 1; } }
 .empty-list { padding: 8px 10px; color: var(--muted-light); font-size: 11px; }
 .sidebar-footer {
   display: flex;

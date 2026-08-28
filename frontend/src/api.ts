@@ -25,6 +25,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 export const api = {
   bootstrap: () => request<{ model: string; sessions: SessionSummary[]; projects: ProjectSummary[]; actions: Record<string, string> }>("/bootstrap"),
   createSession: (book_id: string | null = null) => request<Session>("/sessions", { method: "POST", body: JSON.stringify({ book_id }) }),
+  deleteSession: (id: string) => request<{ ok: boolean }>(`/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }),
   getSession: (id: string, before?: number | null) => request<Session>(`/sessions/${encodeURIComponent(id)}?limit=50${before ? `&before_sequence=${before}` : ""}`),
   bindBook: (id: string, book_id: string | null) => request<Session>(`/sessions/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ book_id }) }),
   send: (id: string, value: Json) => request<{ job_id: string }>(`/sessions/${encodeURIComponent(id)}/messages`, { method: "POST", body: JSON.stringify(value) }),
@@ -34,6 +35,7 @@ export const api = {
   cancelActionProposal: (id: string) => request<{ proposal: ActionProposal }>(`/action-proposals/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
   getProject: (id: string) => request<Json>(`/books/${encodeURIComponent(id)}`),
   getBook: (id: string) => request<Json>(`/books/${encodeURIComponent(id)}`),
+  deleteBook: (id: string) => request<{ ok: boolean; book_id: string; unbound_session_ids: string[] }>(`/books/${encodeURIComponent(id)}`, { method: "DELETE" }),
   getCreativeControl: (id: string) => request<Json>(`/books/${encodeURIComponent(id)}/creative-control`),
   updateCreativeControl: (id: string, body: Json) => request<Json>(`/books/${encodeURIComponent(id)}/creative-control`, { method: "PUT", body: JSON.stringify(body) }),
   getChapter: (id: string, number: number) => request<Json>(`/books/${encodeURIComponent(id)}/chapters/${number}/content`),

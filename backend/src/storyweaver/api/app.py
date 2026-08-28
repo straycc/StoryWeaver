@@ -17,7 +17,7 @@ from ..novel_creation.exceptions import BookBusyError, NovelCreationError
 from ..novel_creation.observability import NovelRunObserver
 from ..novel_creation.pipeline import CreateNovelPipeline
 from ..novel_creation.serialization import to_data
-from ..persistence import ActionProposalRepository, ContextSnapshotRepository, CreativeControlRepository, Database, DatabaseSettings, JobRepository, PostgresChatSessionRepository, PostgresLongTermMemoryStore, PostgresStoryProjectRepository
+from ..persistence import ActionProposalRepository, ContextSnapshotRepository, CreativeControlRepository, Database, DatabaseSettings, DeletionConflictError, JobRepository, PostgresChatSessionRepository, PostgresDeletionRepository, PostgresLongTermMemoryStore, PostgresStoryProjectRepository
 from ..persistence import SimulationRepository
 from ..story_simulation.service import RoleplayService
 from ..story_simulation.agent import (CHARACTER_SYSTEM_PROMPT, DIRECTOR_SYSTEM_PROMPT,
@@ -133,6 +133,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     skills = load_configured_skills(PROJECT_ROOT)
     creative_controls = CreativeControlRepository(database)
     sessions = PostgresChatSessionRepository(database)
+    deletions = PostgresDeletionRepository(database)
     memories = PostgresLongTermMemoryStore(database)
     live_previews = LivePreviewHub()
 
@@ -236,6 +237,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     app.state.supervisor = supervisor
     app.state.novels = service
     app.state.sessions = sessions
+    app.state.deletions = deletions
     app.state.memories = memories
     app.state.workspace = workspace
     app.state.action_proposals = action_proposals
@@ -312,8 +314,13 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
 
     @app.delete("/api/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> dict[str, bool]:
-        sessions.delete_session(session_id)
-        return {"ok": True}
+        try:
+            deletions.delete_session(session_id)
+            return {"ok": True}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except DeletionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/v1/sessions/{session_id}/messages", status_code=202)
     async def send_session_message(session_id: str, body: SessionMessageBody) -> dict[str, Any]:
@@ -490,6 +497,20 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         book_id = CreateNovelPipeline.build_book_id(CreateNovelRequest(**request_data))
         job = await supervisor.submit(job_type="create_book", book_id=book_id, payload={"request": request_data})
         return _accepted(job)
+
+    @app.delete("/api/v1/books/{book_id}")
+    async def delete_book(book_id: str) -> dict[str, Any]:
+        try:
+            result = deletions.delete_book(book_id)
+            return {
+                "ok": True,
+                "book_id": result.book_id,
+                "unbound_session_ids": list(result.unbound_session_ids),
+            }
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except DeletionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/v1/books/{book_id}/metadata")
     async def get_book_metadata(book_id: str) -> dict[str, Any]:

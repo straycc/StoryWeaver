@@ -71,6 +71,7 @@ export default function App() {
   const [chapter, setChapter] = useState<Json | null>(null);
   const [activeAction, setActiveAction] = useState("chat");
   const [busy, setBusy] = useState(false);
+  const [deletingResource, setDeletingResource] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [batchOpen, setBatchOpen] = useState(false);
   const [rewriteOpen, setRewriteOpen] = useState(false);
@@ -124,6 +125,57 @@ export default function App() {
       return data;
     },
     [refreshBootstrap],
+  );
+
+  const deleteSession = useCallback(
+    async (sessionId: string, title: string) => {
+      if (!window.confirm(`永久删除对话“${title}”及其全部消息？此操作无法恢复。`)) return;
+      setDeletingResource(`session:${sessionId}`);
+      try {
+        await api.deleteSession(sessionId);
+        const data = await api.bootstrap();
+        setBootstrap(data);
+        if (session?.session_id === sessionId) {
+          const next = data.sessions[0];
+          if (next) await loadSession(next.session_id);
+          else await createSession();
+        }
+        notify("对话已删除");
+      } catch (error) {
+        notify(errorMessage(error), true);
+      } finally {
+        setDeletingResource(null);
+      }
+    },
+    [createSession, loadSession, notify, session?.session_id],
+  );
+
+  const deleteBook = useCallback(
+    async (bookId: string, title: string) => {
+      if (!window.confirm(`永久删除作品《${title}》及其全部章节、正史和创作记录？历史对话会保留但解除作品绑定。此操作无法恢复。`)) return;
+      setDeletingResource(`book:${bookId}`);
+      try {
+        const result = await api.deleteBook(bookId);
+        setBootstrap(await api.bootstrap());
+        if (session?.book_id === bookId) await loadSession(session.session_id);
+        if (viewingBookId === bookId) {
+          setViewingBookId(null);
+          setProject(null);
+          setChapter(null);
+          setView("chat");
+        }
+        notify(
+          result.unbound_session_ids.length
+            ? `作品已删除，${result.unbound_session_ids.length} 个历史对话已解除绑定`
+            : "作品已删除",
+        );
+      } catch (error) {
+        notify(errorMessage(error), true);
+      } finally {
+        setDeletingResource(null);
+      }
+    },
+    [loadSession, notify, session?.book_id, session?.session_id, viewingBookId],
   );
 
   useEffect(() => {
@@ -486,23 +538,33 @@ export default function App() {
           <div className="compact-list">
             {bootstrap?.projects.length ? (
               bootstrap.projects.map((item) => (
-                <button
-                  key={item.book_id}
-                  className={
-                    currentBookId === item.book_id
-                      ? "compact-item active"
-                      : "compact-item"
-                  }
-                  onClick={() => {
-                    setViewingBookId(item.book_id);
-                    setView("work");
-                  }}
-                >
-                  <strong>{item.title}</strong>
-                  <span>
-                    {item.genre} · {item.target_chapters} 章
-                  </span>
-                </button>
+                <div className="compact-item-shell" key={item.book_id}>
+                  <button
+                    className={
+                      currentBookId === item.book_id
+                        ? "compact-item active"
+                        : "compact-item"
+                    }
+                    onClick={() => {
+                      setViewingBookId(item.book_id);
+                      setView("work");
+                    }}
+                  >
+                    <strong>{item.title}</strong>
+                    <span>
+                      {item.genre} · {item.target_chapters} 章
+                    </span>
+                  </button>
+                  <button
+                    className="compact-delete-button"
+                    aria-label={`删除作品《${item.title}》`}
+                    title="删除作品"
+                    disabled={deletingResource !== null}
+                    onClick={() => void deleteBook(item.book_id, item.title)}
+                  >
+                    ×
+                  </button>
+                </div>
               ))
             ) : (
               <div className="empty-list">还没有作品</div>
@@ -514,23 +576,33 @@ export default function App() {
           <div className="compact-list">
             {bootstrap?.sessions.length ? (
               bootstrap.sessions.map((item) => (
-                <button
-                  key={item.session_id}
-                  className={
-                    session?.session_id === item.session_id
-                      ? "compact-item active"
-                      : "compact-item"
-                  }
-                  onClick={() => void loadSession(item.session_id)}
-                >
-                  <strong>{item.title}</strong>
-                  <span>
-                    {item.message_count} 条消息 ·{" "}
-                    {item.book_id
-                      ? `《${projectTitle(item.book_id)}》`
-                      : "未绑定作品"}
-                  </span>
-                </button>
+                <div className="compact-item-shell" key={item.session_id}>
+                  <button
+                    className={
+                      session?.session_id === item.session_id
+                        ? "compact-item active"
+                        : "compact-item"
+                    }
+                    onClick={() => void loadSession(item.session_id)}
+                  >
+                    <strong>{item.title}</strong>
+                    <span>
+                      {item.message_count} 条消息 ·{" "}
+                      {item.book_id
+                        ? `《${projectTitle(item.book_id)}》`
+                        : "未绑定作品"}
+                    </span>
+                  </button>
+                  <button
+                    className="compact-delete-button"
+                    aria-label={`删除对话“${item.title}”`}
+                    title="删除对话"
+                    disabled={deletingResource !== null}
+                    onClick={() => void deleteSession(item.session_id, item.title)}
+                  >
+                    ×
+                  </button>
+                </div>
               ))
             ) : (
               <div className="empty-list">还没有历史对话</div>
