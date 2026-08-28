@@ -7,19 +7,20 @@ from dataclasses import replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping
 
-from ...context_management import ContextCandidate, source_ref, trace_from_candidates, with_tool_results
+from ...context import (
+    AgentContextPolicy,
+    ContextCandidate,
+    default_agent_context_policies,
+    require_within_budget,
+    select_context,
+    with_tool_results,
+)
 from ...observability import get_log_context
-from ...llm import LlmEvent, LlmEventSink, LlmEventType, NOVEL_OUTPUT_TYPES, WorkerRetryPolicy, WorkerSettings, run_research_then_submit, run_with_retry
+from ...llm import LlmEvent, LlmEventSink, LlmEventType, NOVEL_OUTPUT_TYPES, WorkerRetryPolicy, WorkerSettings, run_research_then_submit
 from ..context_renderer import ChapterContextRenderer
-from ..exceptions import SerializationError
 from ..models import ChapterContext, ChapterDraft, ChapterPlan, ReviewReport
 from ..repository import StoryProjectRepository
 from ..review_tools import (
-    CanonEvidenceSearchTool,
-    ChapterSummaryTool,
-    EntityEvidenceTool,
-    FoundationQueryTool,
-    OpenForeshadowingsTool,
     ReviewSnapshot,
     build_sdk_read_tools,
 )
@@ -53,7 +54,7 @@ world_continuity、hook_consistency、structure、style。
 当前权威证据时才可报告连续性冲突。不得把工具当作扩写剧情或寻找挑错理由的手段。
 若 chapter_plan.hook_plan.resolve_hook_ids 非空，必须检查正文是否给出了每条伏笔的明确答案、
 真相或结果；只提及线索不算回收，应报告 plan_following 或 hook_consistency 问题。
-总工具调用预算为 10 次，模型最多运行 4 回合。工具预算耗尽后，必须根据已经获得的
+总工具调用预算为 6 次，研究最多运行 2 回合。工具预算耗尽后，必须根据已经获得的
 证据直接输出 ReviewReport，不得继续请求工具。
 
 只返回 JSON 对象，包含 passed、summary、issues、score、parse_failed。
@@ -72,7 +73,7 @@ REVISION_VERIFICATION_SYSTEM_PROMPT = """你是 StoryWeaver 的章节定向复�
 
 严重程度只能使用 info、warning、critical；类别只能使用既定审查类别。
 若原问题已解决且没有明显硬回归，issues 必须为空且 passed 为 true。若仍有未解决的
-硬问题，报告该问题；只有存在直接证据时才报告连续性冲突。工具预算为 4 次，最多一轮
+硬问题，报告该问题；只有存在直接证据时才报告连续性冲突。工具预算为 3 次，最多一轮
 检索；工具用完后直接交付。
 
 只返回 JSON 对象，包含 passed、summary、issues、score、parse_failed。
@@ -147,6 +148,8 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
         sdk_settings: WorkerSettings | None = None,
         event_sinks: tuple[LlmEventSink, ...] = (),
         context_snapshot_sink: object | None = None,
+        context_policy: AgentContextPolicy | None = None,
+        verification_context_policy: AgentContextPolicy | None = None,
     ) -> None:
         super().__init__(
             agent_id="novel-reviewer",
@@ -160,6 +163,11 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
         self._renderer = renderer or ChapterContextRenderer()
         self._store = store
         self._context_snapshot_sink = context_snapshot_sink
+        defaults = default_agent_context_policies()
+        self._context_policy = context_policy or defaults["reviewer"]
+        self._verification_context_policy = (
+            verification_context_policy or defaults["reviewer_verification"]
+        )
 
     async def review(
         self,
@@ -171,6 +179,11 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
             raise ValueError("Reviewer 必须注入作品存储和 book_id")
         snapshot = self._load_snapshot(context)
         prompt = self._review_prompt(context=context, draft=draft, snapshot=snapshot)
+        require_within_budget(
+            prompt,
+            budget=self._context_policy.budget.initial_dynamic_context,
+            label="Reviewer 初始上下文（含候选正文原文）",
+        )
         return await self._run_sdk_review(prompt, snapshot)
 
     async def verify_revision(
@@ -190,6 +203,11 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
             draft=draft,
             original_review=original_review,
         )
+        require_within_budget(
+            prompt,
+            budget=self._verification_context_policy.budget.initial_dynamic_context,
+            label="Reviewer Verification 初始上下文（含修订正文原文）",
+        )
         settings = replace(
             self._sdk_settings,
             worker_id="novel-reviewer-verification",
@@ -200,35 +218,8 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
             prompt,
             snapshot,
             settings=settings,
-            max_tool_calls=4,
-            max_research_turns=1,
+            context_policy=self._verification_context_policy,
         )
-
-        def convert(raw_report: dict[str, Any]) -> ReviewReport:
-            return decode_review_report(self._normalize_score(raw_report))
-
-        try:
-            return await self._generate_validated_with_agent(
-                prompt,
-                convert,
-                agent=agent,
-                runtime=runtime,
-                repair_instruction=(
-                    "上一次审查报告未通过严格 JSON 校验。请保持审查结论基于"
-                    "同一正文，只返回完整 ReviewReport JSON。顶层只能有 "
-                    "passed、summary、issues、score、parse_failed；category、"
-                    "severity、description、suggestion、related_source_ids 必须"
-                    "只存在于 issues 数组的每一项中，绝不能出现在顶层。"
-                ),
-            )
-        except SerializationError as exc:
-            return ReviewReport(
-                passed=False,
-                summary=f"Reviewer 输出解析失败：{exc}",
-                issues=(),
-                score=None,
-                parse_failed=True,
-            )
 
     async def _run_sdk_review(
         self,
@@ -236,35 +227,47 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
         snapshot: ReviewSnapshot,
         *,
         settings: WorkerSettings | None = None,
-        max_tool_calls: int = 10,
-        max_research_turns: int = 3,
+        context_policy: AgentContextPolicy | None = None,
     ) -> ReviewReport:
         active_settings = settings or self._sdk_settings
+        active_policy = context_policy or self._context_policy
+        retrieval = active_policy.retrieval
         evidence: list[dict[str, object]] = []
         async def completed(name: str, index: int, succeeded: bool, exhausted: bool, elapsed: float, error: str | None, deduplicated: bool, arguments: Mapping[str, object]) -> None:
             event = LlmEvent(LlmEventType.TOOL_COMPLETED, active_settings.worker_id, {
-                "tool_name": name, "tool_call_index": index, "tool_call_limit": max_tool_calls,
+                "tool_name": name, "tool_call_index": index, "tool_call_limit": retrieval.max_tool_calls,
                 "succeeded": succeeded, "budget_exhausted": exhausted, "elapsed_seconds": elapsed,
                 "error": error, "deduplicated": deduplicated, "tool_arguments": dict(arguments),
             })
             for sink in self._event_sinks:
                 await sink.on_event(event)
-        tools = build_sdk_read_tools(snapshot=snapshot, max_tool_calls=max_tool_calls, on_completed=completed, evidence=evidence)
-        async def operation(_context: Any) -> ReviewReport:
+        tools = build_sdk_read_tools(
+            snapshot=snapshot,
+            max_tool_calls=retrieval.max_tool_calls,
+            on_completed=completed,
+            evidence=evidence,
+            timeout_seconds=retrieval.tool_timeout_seconds,
+            result_token_limit=retrieval.per_tool_result_tokens,
+            transient_attempts=retrieval.transient_attempts,
+        )
+        try:
             output = await run_research_then_submit(
                 settings=active_settings, prompt=prompt, read_tools=tools,
                 output_type=NOVEL_OUTPUT_TYPES["novel-reviewer"], submit_tool_name="submit_review",
                 submit_description="提交最终审查报告；不会修改章节、状态或质量门禁。",
-                max_research_turns=max_research_turns, evidence=evidence, event_sinks=self._event_sinks,
+                max_research_turns=retrieval.max_research_turns,
+                evidence=evidence,
+                evidence_token_budget=retrieval.evidence_package_tokens,
+                report_retry_policy=self._sdk_retry_policy,
+                output_validator=lambda value: decode_review_report(
+                    self._normalize_score(value.model_dump())
+                ),
+                event_sinks=self._event_sinks,
                 tracing_enabled=True,
             )
-            return decode_review_report(self._normalize_score(output.model_dump()))
-        try:
-            return await run_with_retry(
-                worker_name=active_settings.worker_id,
-                operation=operation,
-                policy=self._sdk_retry_policy,
-            )
+            if not isinstance(output, ReviewReport):
+                raise TypeError("Reviewer Report 必须返回 ReviewReport")
+            return output
         finally:
             self._record_context_snapshot(
                 agent_role=active_settings.worker_id.removeprefix("novel-"),
@@ -289,22 +292,26 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
         try:
             book_version = self._book_version(snapshot.project)
             candidate = ContextCandidate(
-                source=source_ref(
-                    source_id=f"{agent_role}:initial-prompt",
-                    source_type="reviewer_initial_context",
-                    content=prompt,
-                    book_version=book_version,
-                ),
+                source_id=f"{agent_role}:initial-prompt",
+                source_type="reviewer_initial_context",
                 content=prompt,
                 reason="审查员初始上下文：计划、正文及最小正史索引",
                 protected=True,
                 priority=100,
             )
-            _, trace = trace_from_candidates(
+            _, trace = select_context(
                 agent_role=agent_role,
-                policy_version="reviewer-context-v2.1",
+                policy_version=(
+                    self._verification_context_policy.policy_version
+                    if agent_role == "reviewer-verification"
+                    else self._context_policy.policy_version
+                ),
                 book_version=book_version,
-                token_budget=max(1, len(prompt) // 2 + 16),
+                token_budget=(
+                    self._verification_context_policy.budget.initial_dynamic_context
+                    if agent_role == "reviewer-verification"
+                    else self._context_policy.budget.initial_dynamic_context
+                ),
                 candidates=(candidate,),
                 notes=("工具证据由 research 阶段追加",),
             )
@@ -346,62 +353,6 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
             project=project,
             chapter_summaries=self._store.load_chapter_summaries(context.book_id),
         )
-
-    def _tool_runtime(
-        self,
-        snapshot: ReviewSnapshot,
-    ) -> tuple[AgentRuntime, Agent[dict[str, Any]]]:
-        """为本次审查绑定隔离工具注册表，避免跨作品或跨请求读取错误快照。"""
-
-        registry = ToolRegistry()
-        registry.register(EntityEvidenceTool(snapshot))
-        registry.register(CanonEvidenceSearchTool(snapshot))
-        registry.register(ChapterSummaryTool(snapshot))
-        registry.register(FoundationQueryTool(snapshot))
-        registry.register(OpenForeshadowingsTool(snapshot))
-        executor = ToolExecutor(
-            registry,
-            permission_policy=self._runtime.tool_executor.permission_policy,
-        )
-        if isinstance(self._runtime, OpenAIAgentsRuntime):
-            runtime = self._runtime.with_tools(
-                tool_registry=registry,
-                tool_executor=executor,
-                max_tool_calls=10,
-            )
-        else:
-            runtime = AgentRuntime(
-            tool_registry=registry,
-            tool_executor=executor,
-            context_builder=self._runtime.context_builder,
-            hooks=self._runtime.hooks,
-            # canon 证据必须保持原文，不能被归档摘要改写。
-            tool_result_archive=None,
-            max_inline_tool_result_tokens=self._runtime.max_inline_tool_result_tokens,
-            max_tool_calls=10,
-            )
-        agent = Agent(
-            agent_id=self._agent.agent_id,
-            name=self._agent.name,
-            system_prompt=self._agent.system_prompt,
-            model=self._agent.model,
-            output_schema=dict,
-            output_json_schema=REVIEW_REPORT_JSON_SCHEMA,
-            allowed_tools=(
-                "get_entity_evidence",
-                "search_canon_evidence",
-                "read_chapter_summary",
-                "query_foundation",
-                "list_open_foreshadowings",
-            ),
-            config=AgentConfig(
-                max_steps=4,
-                model_timeout_seconds=self._agent.config.model_timeout_seconds,
-                temperature=self._agent.config.temperature,
-                max_structured_repairs=self._agent.config.max_structured_repairs,
-            ),
-        )
-        return runtime, agent
 
     def _review_prompt(
         self,
@@ -460,11 +411,6 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
                 "title": snapshot.project.metadata.title,
                 "genre": snapshot.project.metadata.genre,
                 "chapter_target_words": snapshot.project.metadata.chapter_target_words,
-            },
-            "stable_foundation": {
-                "premise": snapshot.project.foundation.premise,
-                "world_setting": snapshot.project.foundation.world_setting,
-                "central_conflict": snapshot.project.foundation.central_conflict,
                 "writing_rules": snapshot.project.foundation.writing_rules,
             },
             "current_story_position": {

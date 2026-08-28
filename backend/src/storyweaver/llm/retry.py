@@ -22,6 +22,8 @@ RetryOperation = Callable[["RetryContext"], Awaitable[ResultT]]
 
 
 class RetryCategory(StrEnum):
+    """重试决策类别：临时故障重投，输出与领域错误进入修复调用。"""
+
     TRANSIENT = "transient"
     OUTPUT_FORMAT = "output_format"
     DOMAIN_VALIDATION = "domain_validation"
@@ -30,6 +32,12 @@ class RetryCategory(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class WorkerRetryPolicy:
+    """单个 Worker 的有限重试预算与退避参数。
+
+    ``max_attempts`` 包含首次调用；``max_repairs`` 只限制输出格式和领域
+    校验失败后的修复次数，临时网络故障不消耗修复额度。
+    """
+
     max_attempts: int = 3
     max_repairs: int = 1
     initial_delay_seconds: float = 0.5
@@ -50,6 +58,8 @@ class WorkerRetryPolicy:
 
 @dataclass(frozen=True, slots=True)
 class RetryContext:
+    """传给每次调用的只读上下文，由调用方决定如何构造修复提示词。"""
+
     attempt: int
     max_attempts: int
     repair_error: str | None = None
@@ -63,12 +73,14 @@ def classify_retry_error(error: BaseException) -> RetryCategory:
     """按稳定错误语义区分重投、修复与立即失败。"""
 
     detail = f"{type(error).__name__}: {error}".casefold()
+    # 主动取消、请求参数、权限和余额问题不会因重复调用自行恢复。
     if isinstance(error, asyncio.CancelledError):
         return RetryCategory.NON_RETRYABLE
     if re.search(r"http\s+(?:400|401|402|403|404|405|409|422)\b", detail):
         return RetryCategory.NON_RETRYABLE
     if any(value in detail for value in ("insufficient balance", "余额不足", "api key", "用户取消")):
         return RetryCategory.NON_RETRYABLE
+    # 网络抖动、限流和服务端错误适合按退避策略重新发起相同调用。
     if isinstance(error, TimeoutError) or any(value in detail for value in (
         "timeout", "timed out", "超时", "无法连接", "connection reset",
         "connection refused", "temporarily unavailable", "http 408", "http 429",
@@ -76,6 +88,7 @@ def classify_retry_error(error: BaseException) -> RetryCategory:
         "空正文", "非空章节正文",
     )):
         return RetryCategory.TRANSIENT
+    # 这两类错误已经产生了响应，下一次应携带错误原因让模型定向修复。
     if any(value in detail for value in (
         "json", "结构化输出", "无法转换", "解析失败", "缺少字段", "未知字段",
         "输出类型不符合", "serializationerror", "modelresponseerror",
@@ -85,7 +98,8 @@ def classify_retry_error(error: BaseException) -> RetryCategory:
     if any(value in detail for value in (
         "validation", "章节号不一致", "编号不连续", "正文过长", "正文过短",
         "标题不能", "未知角色", "未知伏笔", "已解决伏笔", "直接冲突",
-        "不能学习不存在", "不得复用已有",
+        "不能学习不存在", "不得复用已有", "chapteranalysiserror",
+        "chapterplanvalidationerror", "statetransitionerror",
     )):
         return RetryCategory.DOMAIN_VALIDATION
     return RetryCategory.NON_RETRYABLE
@@ -100,6 +114,7 @@ async def run_with_retry(
     """执行有限重试；格式与领域失败将错误回传给下一次修复调用。"""
 
     configured = policy or WorkerRetryPolicy()
+    # 修复次数和临时故障次数分别计数：前者受 max_repairs 限制，后者用于退避。
     repairs = 0
     transient_retries = 0
     repair_error: str | None = None
@@ -107,12 +122,14 @@ async def run_with_retry(
         try:
             return await operation(RetryContext(attempt, configured.max_attempts, repair_error))
         except asyncio.CancelledError:
+            # 保持协程取消语义，避免用户停止任务后又悄悄发起一次模型请求。
             raise
         except Exception as exc:
             category = classify_retry_error(exc)
             can_retry = attempt < configured.max_attempts
             delay = 0.0
             if category in {RetryCategory.OUTPUT_FORMAT, RetryCategory.DOMAIN_VALIDATION}:
+                # 不在此处修改 prompt；仅把错误放入下一次 RetryContext。
                 if repairs >= configured.max_repairs:
                     can_retry = False
                 else:
@@ -121,6 +138,7 @@ async def run_with_retry(
             elif category is RetryCategory.TRANSIENT:
                 transient_retries += 1
                 if configured.initial_delay_seconds:
+                    # 临时故障不需要修复输出，只按指数退避后重新执行原调用。
                     wait = wait_exponential_jitter(
                         initial=configured.initial_delay_seconds,
                         max=configured.max_delay_seconds,

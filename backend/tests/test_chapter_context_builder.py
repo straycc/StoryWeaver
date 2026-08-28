@@ -18,7 +18,12 @@ from storyweaver.novel_creation import (
     NovelProject,
     StoryHook,
 )
-from storyweaver.context_management import ContextBudgetExceededError
+from storyweaver.context import ContextBudgetExceededError
+from storyweaver.novel_creation.serialization import loads_json
+from storyweaver.context import default_agent_context_policies
+from storyweaver.llm import WorkerSettings
+from storyweaver.novel_creation.agents.writer import WriterAgent
+from agents import ModelSettings
 
 
 def create_history_project() -> NovelProject:
@@ -199,6 +204,52 @@ class ChapterContextBuilderTests(unittest.TestCase):
 
         self.assertNotIn("hook:resolved-window", trace.selected_source_ids)
         self.assertIn("hook:resolved-window", trace.excluded_source_ids)
+
+    def test_protected_dynamic_state_only_contains_participating_characters(self) -> None:
+        project = create_history_project()
+        plan = replace(
+            create_next_plan(),
+            participating_character_ids=("lin-mo",),
+        )
+
+        context, trace = ChapterContextBuilder(token_budget=10000).build(
+            project=project,
+            plan=plan,
+        )
+
+        state_entry = next(
+            item for item in context.entries if item.source_type == "current_state"
+        )
+        state = loads_json(state_entry.content)
+        character_ids = {
+            item["character_id"] for item in state["participating_characters"]
+        }
+        self.assertEqual(character_ids, {"lin-mo"})
+        self.assertIn(state_entry.source_id, trace.protected_source_ids)
+        self.assertIn("character:stranger", trace.excluded_source_ids)
+
+    def test_writer_output_limit_is_dynamic_but_never_exceeds_policy_reserve(self) -> None:
+        context, _ = ChapterContextBuilder(token_budget=10000).build(
+            project=create_history_project(),
+            plan=create_next_plan(),
+        )
+        policy = default_agent_context_policies()["writer"]
+        writer = WriterAgent(
+            sdk_settings=WorkerSettings(
+                worker_id="novel-writer",
+                name="Writer",
+                instructions="test",
+                model=object(),
+                model_settings=ModelSettings(),
+                timeout_seconds=1,
+            ),
+            context_policy=policy,
+        )
+
+        output_limit = writer._output_token_limit(context)
+
+        self.assertGreaterEqual(output_limit, 6_144)
+        self.assertLessEqual(output_limit, policy.budget.output_reserve)
 
 
 if __name__ == "__main__":

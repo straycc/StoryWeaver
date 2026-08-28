@@ -3,13 +3,30 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Mapping
 
-from ...llm import LlmEventSink, WorkerRetryPolicy, WorkerSettings
+from ...context import (
+    AgentContextPolicy,
+    ContextCandidate,
+    default_agent_context_policies,
+    require_within_budget,
+    select_context,
+    with_tool_results,
+)
+from ...llm import (
+    LlmEvent,
+    LlmEventSink,
+    LlmEventType,
+    NOVEL_OUTPUT_TYPES,
+    WorkerRetryPolicy,
+    WorkerSettings,
+    run_research_then_submit,
+)
 from ..exceptions import ChapterAnalysisError, SerializationError, StateTransitionError
 from ..hook_manager import HookManager
-from ...observability import logging_context
+from ...observability import get_log_context, logging_context
 from ..models import ChapterDraft, ChapterPlan, NovelProject, StoryStateDelta
+from ..review_tools import ReviewSnapshot, build_sdk_read_tools
 from ..serialization import decode_story_state_delta, dumps_json, to_data
 from ..state_reducer import NovelStateReducer
 from .base import BaseNovelAgent
@@ -23,7 +40,7 @@ CHAPTER_ANALYZER_SYSTEM_PROMPT = """你是 StoryWeaver 的章节状态分析器�
 2. 只记录正文明确发生的变化，不把计划中尚未发生的内容写入状态。
 3. 新事实、角色学习和伏笔推进必须使用稳定 ID。
 4. 不修改不存在的角色、事实或伏笔；新事实不得预先失效。
-   new_facts.fact_id 不得与输入 existing_fact_index 或 reserved_fact_ids 中的任何 ID 重复；
+   new_facts.fact_id 不得与输入 existing_fact_index 或 recent_reserved_fact_ids 中的任何 ID 重复；
    已有事实仍然成立时不输出它，已有事实失效时仅写入 invalidated_fact_ids。
 5. learned_fact_ids 只能引用 current_state.current_facts 中已有的 fact_id，
    或本次 new_facts 中同时声明的 fact_id；不能只让角色学习一个未声明的新 ID。
@@ -32,6 +49,8 @@ CHAPTER_ANALYZER_SYSTEM_PROMPT = """你是 StoryWeaver 的章节状态分析器�
    不得为同一人物、物品或谜团另建名称相近的新伏笔。
 8. 输入 chapter_plan.hook_plan.resolve_hook_ids 是本章计划回收的伏笔。仅当正文已经给出
    明确答案、真相或结果时，将对应 hook_updates.status 写为 resolved；未实际兑现时不得伪造 resolved。
+9. 初始上下文只提供相关和近期正史索引。只有正文涉及的事实或伏笔不在索引中时，
+   才调用只读工具核验；工具预算为 4 次，研究最多 2 回合，不得为凑次数检索。
 
 JSON 必须包含：source_chapter、chapter_summary、character_updates、new_facts、
 invalidated_fact_ids、new_hooks、hook_updates、new_time、new_location。
@@ -74,6 +93,8 @@ class ChapterAnalyzerAgent(BaseNovelAgent[dict[str, Any]]):
         hook_manager: HookManager | None = None,
         sdk_settings: WorkerSettings | None = None,
         event_sinks: tuple[LlmEventSink, ...] = (),
+        context_policy: AgentContextPolicy | None = None,
+        context_snapshot_sink: object | None = None,
     ) -> None:
         super().__init__(
             agent_id="chapter-analyzer",
@@ -85,6 +106,8 @@ class ChapterAnalyzerAgent(BaseNovelAgent[dict[str, Any]]):
             event_sinks=event_sinks,
         )
         self._hook_manager = hook_manager or HookManager()
+        self._context_policy = context_policy or default_agent_context_policies()["analyzer"]
+        self._context_snapshot_sink = context_snapshot_sink
 
     async def analyze(
         self,
@@ -93,6 +116,34 @@ class ChapterAnalyzerAgent(BaseNovelAgent[dict[str, Any]]):
         plan: ChapterPlan,
         draft: ChapterDraft,
     ) -> StoryStateDelta:
+        participant_ids = set(plan.participating_character_ids)
+        participant_states = tuple(
+            character
+            for character in project.state.characters
+            if character.character_id in participant_ids
+        )
+        known_fact_ids = {
+            fact_id
+            for character in participant_states
+            for fact_id in character.known_fact_ids
+        }
+        relevant_current_facts = tuple(
+            fact
+            for fact in project.state.current_facts
+            if fact.subject_id in participant_ids
+            or fact.fact_id in known_fact_ids
+            or fact.importance >= 4
+        )[:30]
+        recent_historical_facts = tuple(
+            fact for fact in project.state.facts if not fact.is_current
+        )[-20:]
+        relevant_hook_ids = set(plan.relevant_hook_ids)
+        relevant_hooks = tuple(
+            hook
+            for hook in project.state.hooks
+            if hook.hook_id in relevant_hook_ids
+            or (hook.status != "resolved" and hook.importance >= 4)
+        )[:15]
         analysis_input = {
             "chapter_number": draft.chapter_number,
             "plan": plan,
@@ -101,9 +152,11 @@ class ChapterAnalyzerAgent(BaseNovelAgent[dict[str, Any]]):
                 "last_committed_chapter": project.state.last_committed_chapter,
                 "current_time": project.state.current_time,
                 "current_location": project.state.current_location,
-                "characters": project.state.characters,
-                "current_facts": project.state.current_facts,
-                "reserved_fact_ids": tuple(fact.fact_id for fact in project.state.facts),
+                "participating_characters": participant_states,
+                "current_facts": relevant_current_facts,
+                "recent_reserved_fact_ids": tuple(
+                    fact.fact_id for fact in project.state.facts[-100:]
+                ),
                 "existing_fact_index": tuple(
                     {
                         "fact_id": fact.fact_id,
@@ -113,13 +166,18 @@ class ChapterAnalyzerAgent(BaseNovelAgent[dict[str, Any]]):
                         "source_chapter": fact.source_chapter,
                         "status": "current" if fact.is_current else "superseded",
                     }
-                    for fact in project.state.facts
+                    for fact in (*relevant_current_facts, *recent_historical_facts)
                 ),
-                "hooks": project.state.hooks,
+                "hooks": relevant_hooks,
             },
         }
         serialized_input = dumps_json(to_data(analysis_input))
         analysis_prompt = "请分析以下最终章节并提取状态增量。\n\n" + serialized_input
+        require_within_budget(
+            analysis_prompt,
+            budget=self._context_policy.budget.initial_dynamic_context,
+            label="Analyzer 初始上下文（含最终正文原文）",
+        )
 
         def convert(raw_delta: dict[str, Any]) -> StoryStateDelta:
             self._reject_reused_fact_ids(raw_delta, project=project)
@@ -155,19 +213,116 @@ class ChapterAnalyzerAgent(BaseNovelAgent[dict[str, Any]]):
                 ) from exc
             return delta
 
-        return await self._generate_validated(
-            analysis_prompt,
-            convert,
-            repair_instruction=(
-                "上一次响应不是可解析的 JSON 对象，或未通过状态增量校验。"
-                "尤其要确保 learned_fact_ids 引用当前已有事实或本次 new_facts。"
-                "new_facts.fact_id 必须是输入 reserved_fact_ids 中从未出现过的新 ID；"
-                "已有事实不应重复创建。"
-                "new_hooks 最多一项，优先更新已有伏笔。"
-                "请根据校验错误重新分析，只输出一个完整 JSON 对象，"
-                "不要输出说明、Markdown 或多个候选对象。"
+        retrieval = self._context_policy.retrieval
+        evidence: list[dict[str, object]] = []
+
+        async def completed(
+            name: str,
+            index: int,
+            succeeded: bool,
+            exhausted: bool,
+            elapsed: float,
+            error: str | None,
+            deduplicated: bool,
+            arguments: Mapping[str, object],
+        ) -> None:
+            event = LlmEvent(LlmEventType.TOOL_COMPLETED, "chapter-analyzer", {
+                "tool_name": name,
+                "tool_call_index": index,
+                "tool_call_limit": retrieval.max_tool_calls,
+                "succeeded": succeeded,
+                "budget_exhausted": exhausted,
+                "elapsed_seconds": elapsed,
+                "error": error,
+                "deduplicated": deduplicated,
+                "tool_arguments": dict(arguments),
+            })
+            for sink in self._event_sinks:
+                await sink.on_event(event)
+
+        tools = build_sdk_read_tools(
+            snapshot=ReviewSnapshot(project=project, chapter_summaries=()),
+            max_tool_calls=retrieval.max_tool_calls,
+            on_completed=completed,
+            evidence=evidence,
+            timeout_seconds=retrieval.tool_timeout_seconds,
+            result_token_limit=retrieval.per_tool_result_tokens,
+            transient_attempts=retrieval.transient_attempts,
+            tool_names=(
+                "get_entity_evidence",
+                "search_canon_evidence",
+                "query_foundation",
             ),
         )
+        try:
+            output = await run_research_then_submit(
+                settings=self._sdk_settings,
+                prompt=analysis_prompt,
+                read_tools=tools,
+                output_type=NOVEL_OUTPUT_TYPES["chapter-analyzer"],
+                submit_tool_name="submit_state_delta",
+                submit_description="提交从最终正文提取的状态增量；不会修改或提交正史。",
+                max_research_turns=retrieval.max_research_turns,
+                evidence=evidence,
+                evidence_token_budget=retrieval.evidence_package_tokens,
+                report_retry_policy=self._sdk_retry_policy,
+                output_validator=lambda value: convert(value.model_dump()),
+                event_sinks=self._event_sinks,
+                tracing_enabled=True,
+            )
+            if not isinstance(output, StoryStateDelta):
+                raise TypeError("Analyzer Report 必须返回 StoryStateDelta")
+            return output
+        finally:
+            self._record_context_snapshot(
+                project=project,
+                prompt=analysis_prompt,
+                evidence=evidence,
+            )
+
+    def _record_context_snapshot(
+        self,
+        *,
+        project: NovelProject,
+        prompt: str,
+        evidence: list[dict[str, object]],
+    ) -> None:
+        """保存 Analyzer 初始索引和研究来源；不参与状态提交。"""
+
+        sink = self._context_snapshot_sink
+        if sink is None:
+            return
+        try:
+            book_version = project.state.last_committed_chapter
+            candidate = ContextCandidate(
+                source_id=f"analyzer:chapter:{book_version + 1}",
+                source_type="analyzer_initial_context",
+                content=prompt,
+                reason="最终正文原文与状态提取所需的有限正史索引",
+                protected=True,
+                priority=100,
+            )
+            _, trace = select_context(
+                agent_role="analyzer",
+                policy_version=self._context_policy.policy_version,
+                book_version=book_version,
+                token_budget=self._context_policy.budget.initial_dynamic_context,
+                candidates=(candidate,),
+                notes=("工具结果先编译为 EvidencePackage，再进入 Report",),
+            )
+            trace = with_tool_results(trace, evidence=evidence)
+            sink.save(
+                agent_role="analyzer",
+                book_id=project.metadata.book_id,
+                book_version=book_version,
+                policy_version=trace.policy_version,
+                renderer_version=trace.renderer_version,
+                rendered_context=prompt,
+                trace=trace.to_data(),
+                job_id=get_log_context().get("run_id"),
+            )
+        except Exception:
+            return
 
     @staticmethod
     def _reject_reused_fact_ids(

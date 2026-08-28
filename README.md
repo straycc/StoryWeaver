@@ -7,7 +7,7 @@ StoryWeaver 是一个面向长篇连载创作的 Agent 小说工作台。模型�
 ## 核心能力
 
 - **章节流水线**：`Planner → Writer → Reviewer → Reviser → Analyzer → StateReducer`；章节只有通过质量门禁后才会写入正史。
-- **受限自治检索**：Planner 与 Reviewer 通过只读工具按需检索正史，研究阶段与最终交付阶段隔离，工具预算由服务端硬限制。
+- **受限自治检索**：Planner、Reviewer 与 Analyzer 通过只读工具按需检索正史，研究阶段与最终交付阶段隔离，工具预算由服务端硬限制。
 - **一致性与伏笔治理**：StateReducer 原子提交事实、人物、地点和伏笔变化；HookManager 控制推进、回收、合并与新增预算。
 - **结构化恢复**：Pydantic 校验工具参数和模型输出；格式错误先做一次无工具修复，再有限重试。
 - **持久 Job + SSE**：规划、写作、重写、连续创作以 Job 运行；浏览器断开不取消后台任务。
@@ -56,6 +56,7 @@ STORYWEAVER_LLM_API_KEY=your-api-key
 # 小说创作通常建议关闭思考模式，降低延迟与 Token 消耗。
 STORYWEAVER_LLM_THINKING=disabled
 STORYWEAVER_LLM_JSON_MODE=auto
+
 ```
 
 `.env` 已被 Git 忽略，禁止提交真实 API Key。
@@ -210,11 +211,17 @@ POST /jobs/{job_id}/retry
 
 ## 质量与可靠性策略
 
-- Planner：最多 3 个研究回合、4 次只读工具调用。
-- Reviewer：最多 3 个研究回合、10 次只读工具调用；报告阶段无查询能力。
+- Planner：初始动态上下文 4K，最多 2 个研究回合、4 次只读工具调用，EvidencePackage 最多 4K。
+- Writer：初始动态上下文 6K；正文输出额度按目标字数动态计算，默认下限 6144、上限 12000 Token。
+- Reviewer：初始上下文 10K，最多 2 个研究回合、6 次只读工具调用，EvidencePackage 最多 6K；报告阶段无查询能力。
+- 定向复查：最多 1 个研究回合、3 次只读工具调用，EvidencePackage 最多 3K。
+- Analyzer：初始上下文 15K，最多 2 个研究回合、4 次只读工具调用，EvidencePackage 最多 4K。
 - 最终交付通过 Pydantic DTO 校验；格式失败时先无工具修复一次。
+- 工具参数错误、空结果、超时、临时失败、重复调用、预算耗尽和结果过大由统一只读 Tool Runtime 处理。
 - 默认门禁：审稿分数 ≥ 80；正文低于目标 0.5 倍要求扩写，1.5～1.8 倍记录观察，超过 1.8 倍触发压缩。
 - 同一本书同时仅允许一个 `book_write` Job；普通聊天不占写锁。
+
+上述 Token、工具次数和研究回合都是初始配置，应根据实际 Token 估算偏差、Evidence 使用率、截断率、修复率、质量门禁结果、延迟与成本持续调整，不应视为模型能力上限。
 
 ## 可观测性
 

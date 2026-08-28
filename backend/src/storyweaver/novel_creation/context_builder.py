@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable
 
-from ..context_management import ContextBudgetExceededError
+from ..context import AgentContextPolicy, ContextBudgetExceededError
 
 from .models import (
     ChapterContext,
@@ -31,16 +31,21 @@ class ChapterContextBuilder:
         recent_summary_limit: int = 3,
         fact_limit: int = 10,
         ordinary_hook_limit: int = 5,
+        core_hook_limit: int = 3,
         token_estimator: Callable[[str], int] | None = None,
         plan_validator: ChapterPlanValidator | None = None,
         creative_control_provider: Callable[[str], object] | None = None,
+        context_policy: AgentContextPolicy | None = None,
     ) -> None:
+        if context_policy is not None:
+            token_budget = context_policy.budget.initial_dynamic_context
         if token_budget <= 0:
             raise ValueError("token_budget 必须大于 0")
         for name, value in (
             ("recent_summary_limit", recent_summary_limit),
             ("fact_limit", fact_limit),
             ("ordinary_hook_limit", ordinary_hook_limit),
+            ("core_hook_limit", core_hook_limit),
         ):
             if value < 0:
                 raise ValueError(f"{name} 不能小于 0")
@@ -48,6 +53,8 @@ class ChapterContextBuilder:
         self.recent_summary_limit = recent_summary_limit
         self.fact_limit = fact_limit
         self.ordinary_hook_limit = ordinary_hook_limit
+        self.core_hook_limit = core_hook_limit
+        self.context_policy = context_policy
         self._estimate_content_tokens = token_estimator or self._default_token_estimator
         self._plan_validator = plan_validator or ChapterPlanValidator()
         self._creative_control_provider = creative_control_provider
@@ -191,9 +198,13 @@ class ChapterContextBuilder:
                     "last_committed_chapter": project.state.last_committed_chapter,
                     "current_time": project.state.current_time,
                     "current_location": project.state.current_location,
-                    "characters": project.state.characters,
+                    "participating_characters": tuple(
+                        character
+                        for character in project.state.characters
+                        if character.character_id in set(plan.participating_character_ids)
+                    ),
                 },
-                reason="上一章结束后的权威动态状态",
+                reason="上一章结束位置及本章参与角色的权威动态状态",
                 protected=True,
                 priority=100,
             ),
@@ -342,8 +353,12 @@ class ChapterContextBuilder:
             (hook for hook in unresolved if hook.importance < 4),
             key=lambda hook: (-hook.importance, -hook.last_advanced_chapter, hook.hook_id),
         )
+        selected_core = core_hooks[: self.core_hook_limit]
         selected_ordinary = ordinary_hooks[: self.ordinary_hook_limit]
         excluded = resolved_ids + [
+            f"hook:{hook.hook_id}"
+            for hook in core_hooks[self.core_hook_limit :]
+        ] + [
             f"hook:{hook.hook_id}"
             for hook in ordinary_hooks[self.ordinary_hook_limit :]
         ]
@@ -360,7 +375,7 @@ class ChapterContextBuilder:
                 protected=False,
                 priority=(85 + hook.importance if hook.importance >= 4 else 60 + hook.importance),
             )
-            for hook in (*core_hooks, *selected_ordinary)
+            for hook in (*selected_core, *selected_ordinary)
         )
         return entries, tuple(excluded)
 

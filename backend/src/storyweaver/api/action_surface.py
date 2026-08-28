@@ -238,16 +238,15 @@ class MainAgentActionSurface:
                 current_job_id=current_job_id,
             )
             context_trace = package.trace_data()
-            context_trace["v2"] = package.trace_v2_data()
             if self._context_snapshots is not None:
                 self._context_snapshots.save(
                     agent_role="main_agent",
                     book_id=session.book_id,
-                    book_version=package.trace_v2.book_version,
-                    policy_version=package.trace_v2.policy_version,
-                    renderer_version=package.trace_v2.renderer_version,
+                    book_version=package.trace.book_version,
+                    policy_version=package.trace.policy_version,
+                    renderer_version=package.trace.renderer_version,
                     rendered_context=package.rendered_context,
-                    trace=package.trace_v2_data(),
+                    trace=package.trace_data(),
                     job_id=current_job_id,
                 )
             decision = await self._agent.decide(

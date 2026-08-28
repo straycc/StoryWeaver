@@ -1,4 +1,4 @@
-"""角色剧场 V2 的 Director/Character 专属 Context 视图。"""
+"""角色剧场的 Director/Character 专属 Context 视图。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 from dataclasses import asdict
 from typing import Any
 
-from ..context_management.v2 import ContextCandidate, source_ref, trace_from_candidates
+from ..context import ContextCandidate, select_context
 from .models import SimulationCharacter, SimulationSession, SimulationTurn
 
 
@@ -74,8 +74,8 @@ class RoleplayContextBuilder:
         ]
         return [
             ContextCandidate(
-                source=source_ref(source_id=f"simulation:{simulation.simulation_id}:{ident}", source_type="simulation",
-                                  content=content, book_version=simulation.base_book_version),
+                source_id=f"simulation:{simulation.simulation_id}:{ident}",
+                source_type="simulation",
                 content=content, reason=reason, protected=True, priority=100, digest=content[:1200],
             )
             for ident, content, reason in items
@@ -95,15 +95,15 @@ class RoleplayContextBuilder:
             }
             content = json.dumps(public, ensure_ascii=False)
             values.append(ContextCandidate(
-                source=source_ref(source_id=f"simulation-turn:{turn.turn_number}", source_type="simulation_turn",
-                                  content=content, book_version=0),
+                source_id=f"simulation-turn:{turn.turn_number}",
+                source_type="simulation_turn",
                 content=content, reason="最近已提交回合", protected=False, priority=80,
             ))
         return values
 
     def _render(self, *, simulation: SimulationSession, candidates: list[ContextCandidate], agent_role: str,
                 policy_version: str, notes: tuple[str, ...]) -> tuple[str, dict[str, Any]]:
-        selected, trace = trace_from_candidates(
+        selected, trace = select_context(
             agent_role=agent_role, policy_version=policy_version, book_version=simulation.base_book_version,
             token_budget=5000, candidates=tuple(candidates),
             notes=(f"simulation_id={simulation.simulation_id}", f"base_chapter={simulation.base_chapter_number}", *notes),

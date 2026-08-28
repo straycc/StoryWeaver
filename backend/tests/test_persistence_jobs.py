@@ -13,6 +13,7 @@ from storyweaver.novel_creation import (
     NovelStateReducer,
     ReviewReport,
 )
+from storyweaver.novel_creation.repository import ChapterRunCheckpoint
 from storyweaver.persistence import (
     Database,
     DatabaseSettings,
@@ -181,6 +182,68 @@ class PersistenceJobsTests(unittest.TestCase):
         self.assertEqual(run.artifacts_json["candidate_metadata"]["proposal_id"], proposal.proposal_id)
         self.assertEqual(run.artifacts_json["candidate_metadata"]["chapter_number"], 1)
         self.assertEqual(run.artifacts_json["candidate_metadata"]["reason"], "测试候选稿")
+
+    def test_chapter_checkpoint_round_trip_and_plan_revision_clears_it(self) -> None:
+        """稳定 Worker 产物应可恢复；计划变更后必须失效。"""
+
+        store = PostgresStoryProjectRepository(self.database)
+        store.create_project(
+            metadata=create_metadata(),
+            foundation=create_foundation(),
+            initial_state=create_initial_state(),
+        )
+        proposal = ChapterPlanProposal(
+            proposal_id="proposal-checkpoint",
+            book_id=BOOK_ID,
+            chapter_number=1,
+            base_chapter_number=0,
+            base_current_time="深夜十一点",
+            version=1,
+            status="pending",
+            plan=create_chapter_plan(),
+            user_instruction=None,
+            feedback_history=(),
+            selected_memory_ids=(),
+            selected_memory_descriptions=(),
+            created_at="2026-08-23T00:00:00+00:00",
+            updated_at="2026-08-23T00:00:00+00:00",
+        )
+        store.save_plan_proposal(proposal)
+        draft = create_chapter_draft()
+        trace = ContextTrace(
+            chapter_number=1,
+            selected_source_ids=("plan:1",),
+            excluded_source_ids=(),
+            protected_source_ids=("plan:1",),
+            budget=100,
+            notes=(),
+        )
+        store.save_chapter_checkpoint(
+            proposal,
+            ChapterRunCheckpoint(
+                stage="draft_ready",
+                draft_history=(draft,),
+                review_history=(),
+                previous_review=None,
+                revision_count=0,
+                context_trace=trace,
+            ),
+        )
+        checkpoint = store.load_chapter_checkpoint(BOOK_ID, proposal.proposal_id)
+        self.assertIsNotNone(checkpoint)
+        assert checkpoint is not None
+        self.assertEqual(checkpoint.stage, "draft_ready")
+        self.assertEqual(checkpoint.draft_history, (draft,))
+
+        store.save_plan_proposal(
+            replace(
+                proposal,
+                version=2,
+                feedback_history=("调整本章节奏",),
+                updated_at="2026-08-23T00:05:00+00:00",
+            )
+        )
+        self.assertIsNone(store.load_chapter_checkpoint(BOOK_ID, proposal.proposal_id))
 
     def test_session_list_projection_tracks_messages_and_binding(self) -> None:
         sessions = PostgresChatSessionRepository(self.database)

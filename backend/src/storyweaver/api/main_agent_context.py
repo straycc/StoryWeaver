@@ -7,19 +7,17 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ..application.models import ChatSession
 from ..application.workspace import ChatWorkspaceApplication
-from ..context_management import (
-    ContextAssemblyTrace,
+from ..context import (
+    ChatContextPolicy,
     ContextCandidate,
     ContextItem,
-    ContextPolicy,
-    ContextTraceV2,
-    source_ref,
-    trace_from_candidates,
+    ContextTrace,
+    select_context,
 )
 from ..persistence import ActionProposalRepository, CreativeControlRepository, JobRepository
 from ..memory.services import LongTermMemoryRetriever
@@ -31,14 +29,10 @@ class MainAgentContextPackage:
 
     current_request: str
     rendered_context: str
-    trace: ContextAssemblyTrace
-    trace_v2: ContextTraceV2
+    trace: ContextTrace
 
     def trace_data(self) -> dict[str, Any]:
-        return asdict(self.trace)
-
-    def trace_v2_data(self) -> dict[str, Any]:
-        return self.trace_v2.to_data()
+        return self.trace.to_data()
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,13 +128,13 @@ class MainAgentContextBuilder:
         creative_controls: CreativeControlRepository,
         workflow: WorkflowContextReader,
         memory_retriever: LongTermMemoryRetriever | None = None,
-        policy: ContextPolicy | None = None,
+        policy: ChatContextPolicy | None = None,
     ) -> None:
         self._workspace = workspace
         self._creative_controls = creative_controls
         self._workflow = workflow
         self._memory_retriever = memory_retriever
-        self._policy = policy or ContextPolicy(token_budget=4000, recent_message_limit=12)
+        self._policy = policy or ChatContextPolicy(token_budget=4000, recent_message_limit=12)
 
     async def build(
         self,
@@ -153,7 +147,6 @@ class MainAgentContextBuilder:
         if current_sequence < 1:
             raise ValueError("current_sequence 必须为正数")
         items: list[ContextItem] = []
-        excluded: list[str] = []
         notes = ["Main Agent 动态上下文；固定 Instructions、Schema 与输出预留不计入本预算"]
 
         self._append(
@@ -193,77 +186,36 @@ class MainAgentContextBuilder:
 
         book_version = self._book_version(session.book_id)
         candidates = tuple(
-            ContextCandidate(
-                source=source_ref(
-                    source_id=item.source_id,
-                    source_type=item.source_type,
-                    content=item.content,
-                    book_version=book_version,
-                    revision=(str(self._summary_sequence(session)) if item.source_type == "conversation_summary" else None),
-                ),
-                content=item.content,
-                reason=item.reason,
-                protected=item.protected,
-                priority=item.priority,
-                digest=self._protected_digest(item),
-            )
-            for item in items
+            replace(item, digest=self._protected_digest(item)) for item in items
         )
-        selected_candidates, trace_v2 = trace_from_candidates(
+        selected_candidates, trace = select_context(
             agent_role="main_agent",
-            policy_version="main-agent-context-v2.1",
+            policy_version="main-agent-context-v1",
             book_version=book_version,
             token_budget=self._policy.token_budget,
             candidates=candidates,
             notes=tuple(notes),
+            selected_memory_ids=retrieved_memory_ids,
+            summary_sequence=self._summary_sequence(session),
         )
-        # 必须使用 Budgeter 实际返回的 content。若 protected 来源切换为
-        # Digest，不能再回头从原始 ContextItem 取文本，否则 Prompt 与 Trace
-        # 的 hash 会失真。
-        originals = {item.source_id: item for item in items}
-        selected = [
-            ContextItem(
-                source_id=candidate.source.source_id,
-                source_type=candidate.source.source_type,
-                content=candidate.content,
-                protected=candidate.protected,
-                priority=candidate.priority,
-                estimated_tokens=max(1, (len(candidate.content) + 3) // 4),
-                reason=candidate.reason,
-            )
-            for candidate in selected_candidates
-        ]
+        selected = list(selected_candidates)
         selected_ids = {item.source_id for item in selected}
         selected_memory_ids = tuple(
             memory_id
             for memory_id in retrieved_memory_ids
             if f"conversation-memory:{memory_id}" in selected_ids
         )
-        excluded = [item.source_id for item in items if item.source_id not in selected_ids]
-        compressed_ids = tuple(
-            candidate.source.source_id
-            for candidate in selected_candidates
-            if candidate.content != originals[candidate.source.source_id].content
-        )
-        used = trace_v2.estimated_tokens
+        used = trace.estimated_tokens
         notes.append(f"选择 {len(selected)} 个来源，估算 {used}/{self._policy.token_budget} Token")
-        trace = ContextAssemblyTrace(
-            budget=self._policy.token_budget,
-            estimated_tokens=used,
-            selected_source_ids=tuple(item.source_id for item in selected),
-            excluded_source_ids=tuple(excluded),
-            protected_source_ids=tuple(item.source_id for item in selected if item.protected),
-            compressed_source_ids=compressed_ids,
-            selected_memory_ids=selected_memory_ids,
-            summary_sequence=self._summary_sequence(session),
+        trace = replace(
+            trace,
             notes=tuple(notes),
-            source_reasons=tuple((item.source_id, item.reason) for item in selected)
-            + tuple((source_id, "超过动态上下文预算") for source_id in excluded),
+            selected_memory_ids=selected_memory_ids,
         )
         rendered = "\n\n".join(
             f"[{item.source_type}]\n{item.content}" for item in selected
         )
-        return MainAgentContextPackage(current_request, rendered, trace, trace_v2)
+        return MainAgentContextPackage(current_request, rendered, trace)
 
     async def _append_conversation_memories(
         self,
@@ -378,8 +330,14 @@ class MainAgentContextBuilder:
         normalized = content.strip()
         if not normalized:
             return
-        items.append(ContextItem(source_id, source_type, normalized, protected, priority,
-                                 max(1, (len(normalized) + 3) // 4), reason))
+        items.append(ContextItem(
+            source_id=source_id,
+            source_type=source_type,
+            content=normalized,
+            reason=reason,
+            protected=protected,
+            priority=priority,
+        ))
 
     def _summary_sequence(self, session: ChatSession) -> int | None:
         summary = self._workspace.sessions.latest_summary(session.session_id)

@@ -57,10 +57,16 @@ class BaseNovelAgent(Generic[OutputT]):
         converter: Callable[[OutputT], ValidatedT],
         *,
         repair_instruction: str | None = None,
+        sdk_settings: WorkerSettings | None = None,
     ) -> ValidatedT:
         """将模型调用、结构转换和领域校验纳入同一个有限重试边界。"""
 
-        return await self._generate_validated_with_sdk(prompt, converter, repair_instruction=repair_instruction)
+        return await self._generate_validated_with_sdk(
+            prompt,
+            converter,
+            repair_instruction=repair_instruction,
+            sdk_settings=sdk_settings,
+        )
 
     async def _generate_validated_with_sdk(
         self,
@@ -68,10 +74,12 @@ class BaseNovelAgent(Generic[OutputT]):
         converter: Callable[[OutputT], ValidatedT],
         *,
         repair_instruction: str | None,
+        sdk_settings: WorkerSettings | None = None,
     ) -> ValidatedT:
         """无工具 Worker 直接使用 SDK，并在领域校验失败后重投一次。"""
 
         output_type = NOVEL_OUTPUT_TYPES[self._agent_id]
+        active_settings = sdk_settings or self._sdk_settings
         repair_raw_output: str | None = None
 
         async def operation(context: RetryContext) -> ValidatedT:
@@ -92,7 +100,7 @@ class BaseNovelAgent(Generic[OutputT]):
                     await sink.on_event(event)
             try:
                 output = await run_structured_worker(
-                    settings=self._sdk_settings,
+                    settings=active_settings,
                     prompt=actual_prompt,
                     output_type=output_type,
                     event_sinks=self._event_sinks,

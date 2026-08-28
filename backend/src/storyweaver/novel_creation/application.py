@@ -11,6 +11,7 @@ from pathlib import Path
 
 from agents import ModelSettings
 
+from ..context import AgentContextPolicy, default_agent_context_policies
 from ..llm.errors import ConfigurationError
 from ..observability import ModelFailureDiagnosticWriter
 from ..llm import OpenAICompatibleProviderSettings, WorkerSettings
@@ -135,6 +136,34 @@ class NovelApplicationSettings:
     reviser_temperature: float = 0.6
     analyzer_temperature: float = 0.1
     context_token_budget: int = 6000
+    model_context_window: int = 1_000_000
+    context_operational_window: int = 32_000
+    context_safety_reserve: int = 4_000
+    context_fixed_token_budget: int = 2_000
+    planner_context_token_budget: int = 4_000
+    reviewer_context_token_budget: int = 10_000
+    reviser_context_token_budget: int = 12_000
+    analyzer_context_token_budget: int = 15_000
+    planner_evidence_token_budget: int = 4_000
+    reviewer_evidence_token_budget: int = 6_000
+    verification_evidence_token_budget: int = 3_000
+    analyzer_evidence_token_budget: int = 4_000
+    context_tool_timeout_seconds: float = 8.0
+    planner_tool_result_token_limit: int = 900
+    reviewer_tool_result_token_limit: int = 1_000
+    planner_max_tool_calls: int = 4
+    planner_max_research_turns: int = 2
+    reviewer_max_tool_calls: int = 6
+    reviewer_max_research_turns: int = 2
+    verification_max_tool_calls: int = 3
+    analyzer_max_tool_calls: int = 4
+    analyzer_max_research_turns: int = 2
+    analyzer_tool_result_token_limit: int = 900
+    planner_output_token_limit: int = 2_000
+    reviewer_output_token_limit: int = 3_000
+    writer_output_token_limit: int = 12_000
+    reviser_output_token_limit: int = 6_144
+    analyzer_output_token_limit: int = 6_144
     review_policy: str = "strict"
     review_minimum_score: int = 80
     review_minimum_target_ratio: float = 0.5
@@ -182,8 +211,48 @@ class NovelApplicationSettings:
             value = getattr(self, field_name)
             if not 0 <= value <= 2:
                 raise ConfigurationError(f"{field_name} 必须在 0 到 2 之间")
-        if self.context_token_budget <= 0:
-            raise ConfigurationError("Context Token 预算必须大于 0")
+        positive_context_values = (
+            "context_token_budget",
+            "model_context_window",
+            "context_operational_window",
+            "context_safety_reserve",
+            "context_fixed_token_budget",
+            "planner_context_token_budget",
+            "reviewer_context_token_budget",
+            "reviser_context_token_budget",
+            "analyzer_context_token_budget",
+            "planner_evidence_token_budget",
+            "reviewer_evidence_token_budget",
+            "verification_evidence_token_budget",
+            "analyzer_evidence_token_budget",
+            "planner_tool_result_token_limit",
+            "reviewer_tool_result_token_limit",
+            "planner_max_tool_calls",
+            "planner_max_research_turns",
+            "reviewer_max_tool_calls",
+            "reviewer_max_research_turns",
+            "verification_max_tool_calls",
+            "analyzer_max_tool_calls",
+            "analyzer_max_research_turns",
+            "analyzer_tool_result_token_limit",
+            "planner_output_token_limit",
+            "reviewer_output_token_limit",
+            "writer_output_token_limit",
+            "reviser_output_token_limit",
+            "analyzer_output_token_limit",
+        )
+        if any(getattr(self, name) <= 0 for name in positive_context_values):
+            raise ConfigurationError("Context、检索及输出预算必须大于 0")
+        if self.context_tool_timeout_seconds <= 0:
+            raise ConfigurationError("Context Tool 超时时间必须大于 0")
+        if self.writer_output_token_limit < 6_144:
+            raise ConfigurationError("Writer 输出上限不能小于 6144 Token")
+        if self.context_operational_window > self.model_context_window:
+            raise ConfigurationError("Context operational window 不能超过模型窗口")
+        try:
+            _build_agent_context_policies(self)
+        except ValueError as exc:
+            raise ConfigurationError(f"Context Policy 配置无效：{exc}") from exc
         if self.review_policy not in WriteNextChapterPipeline.REVIEW_POLICIES:
             raise ConfigurationError(
                 "STORYWEAVER_REVIEW_POLICY 只支持 strict 或 auto"
@@ -237,6 +306,34 @@ class NovelApplicationSettings:
                 "STORYWEAVER_CONTEXT_TOKEN_BUDGET",
                 6000,
             ),
+            model_context_window=_read_int("STORYWEAVER_MODEL_CONTEXT_WINDOW", 1_000_000),
+            context_operational_window=_read_int("STORYWEAVER_CONTEXT_OPERATIONAL_WINDOW", 32_000),
+            context_safety_reserve=_read_int("STORYWEAVER_CONTEXT_SAFETY_RESERVE", 4_000),
+            context_fixed_token_budget=_read_int("STORYWEAVER_CONTEXT_FIXED_BUDGET", 2_000),
+            planner_context_token_budget=_read_int("STORYWEAVER_PLANNER_CONTEXT_BUDGET", 4_000),
+            reviewer_context_token_budget=_read_int("STORYWEAVER_REVIEWER_CONTEXT_BUDGET", 10_000),
+            reviser_context_token_budget=_read_int("STORYWEAVER_REVISER_CONTEXT_BUDGET", 12_000),
+            analyzer_context_token_budget=_read_int("STORYWEAVER_ANALYZER_CONTEXT_BUDGET", 15_000),
+            planner_evidence_token_budget=_read_int("STORYWEAVER_PLANNER_EVIDENCE_BUDGET", 4_000),
+            reviewer_evidence_token_budget=_read_int("STORYWEAVER_REVIEWER_EVIDENCE_BUDGET", 6_000),
+            verification_evidence_token_budget=_read_int("STORYWEAVER_VERIFICATION_EVIDENCE_BUDGET", 3_000),
+            analyzer_evidence_token_budget=_read_int("STORYWEAVER_ANALYZER_EVIDENCE_BUDGET", 4_000),
+            context_tool_timeout_seconds=_read_float("STORYWEAVER_CONTEXT_TOOL_TIMEOUT", 8.0),
+            planner_tool_result_token_limit=_read_int("STORYWEAVER_PLANNER_TOOL_RESULT_LIMIT", 900),
+            reviewer_tool_result_token_limit=_read_int("STORYWEAVER_REVIEWER_TOOL_RESULT_LIMIT", 1_000),
+            planner_max_tool_calls=_read_int("STORYWEAVER_PLANNER_MAX_TOOL_CALLS", 4),
+            planner_max_research_turns=_read_int("STORYWEAVER_PLANNER_RESEARCH_TURNS", 2),
+            reviewer_max_tool_calls=_read_int("STORYWEAVER_REVIEWER_MAX_TOOL_CALLS", 6),
+            reviewer_max_research_turns=_read_int("STORYWEAVER_REVIEWER_RESEARCH_TURNS", 2),
+            verification_max_tool_calls=_read_int("STORYWEAVER_VERIFICATION_MAX_TOOL_CALLS", 3),
+            analyzer_max_tool_calls=_read_int("STORYWEAVER_ANALYZER_MAX_TOOL_CALLS", 4),
+            analyzer_max_research_turns=_read_int("STORYWEAVER_ANALYZER_RESEARCH_TURNS", 2),
+            analyzer_tool_result_token_limit=_read_int("STORYWEAVER_ANALYZER_TOOL_RESULT_LIMIT", 900),
+            planner_output_token_limit=_read_int("STORYWEAVER_PLANNER_OUTPUT_LIMIT", 2_000),
+            reviewer_output_token_limit=_read_int("STORYWEAVER_REVIEWER_OUTPUT_LIMIT", 3_000),
+            writer_output_token_limit=_read_int("STORYWEAVER_WRITER_OUTPUT_LIMIT", 12_000),
+            reviser_output_token_limit=_read_int("STORYWEAVER_REVISER_OUTPUT_LIMIT", 6_144),
+            analyzer_output_token_limit=_read_int("STORYWEAVER_ANALYZER_OUTPUT_LIMIT", 6_144),
             review_policy=os.getenv("STORYWEAVER_REVIEW_POLICY", "strict").strip(),
             review_minimum_score=_read_int(
                 "STORYWEAVER_REVIEW_MINIMUM_SCORE",
@@ -458,6 +555,120 @@ class NovelService:
         return self.store.list_projects()
 
 
+def _build_agent_context_policies(
+    settings: NovelApplicationSettings,
+) -> dict[str, AgentContextPolicy]:
+    """把环境配置投影为各 Worker 的统一 Context Policy。"""
+
+    policies = default_agent_context_policies(
+        operational_window=settings.context_operational_window,
+        safety_reserve=settings.context_safety_reserve,
+        fixed_context=settings.context_fixed_token_budget,
+    )
+
+    def update_budget(role: str, *, initial: int, output: int | None = None, evidence: int | None = None) -> None:
+        policy = policies[role]
+        policies[role] = replace(
+            policy,
+            budget=replace(
+                policy.budget,
+                initial_dynamic_context=initial,
+                output_reserve=(output if output is not None else policy.budget.output_reserve),
+                runtime_tool_context=(evidence if evidence is not None else policy.budget.runtime_tool_context),
+                evidence_package=(evidence if evidence is not None else policy.budget.evidence_package),
+            ),
+            retrieval=(
+                replace(policy.retrieval, evidence_package_tokens=evidence)
+                if evidence is not None
+                else policy.retrieval
+            ),
+        )
+
+    update_budget(
+        "planner",
+        initial=settings.planner_context_token_budget,
+        output=settings.planner_output_token_limit,
+        evidence=settings.planner_evidence_token_budget,
+    )
+    update_budget(
+        "writer",
+        initial=settings.context_token_budget,
+        output=settings.writer_output_token_limit,
+    )
+    update_budget(
+        "reviewer",
+        initial=settings.reviewer_context_token_budget,
+        output=settings.reviewer_output_token_limit,
+        evidence=settings.reviewer_evidence_token_budget,
+    )
+    update_budget(
+        "reviewer_verification",
+        initial=settings.reviewer_context_token_budget,
+        output=settings.reviewer_output_token_limit,
+        evidence=settings.verification_evidence_token_budget,
+    )
+    update_budget(
+        "reviser",
+        initial=settings.reviser_context_token_budget,
+        output=settings.reviser_output_token_limit,
+    )
+    update_budget(
+        "analyzer",
+        initial=settings.analyzer_context_token_budget,
+        output=settings.analyzer_output_token_limit,
+        evidence=settings.analyzer_evidence_token_budget,
+    )
+
+    planner = policies["planner"]
+    policies["planner"] = replace(
+        planner,
+        retrieval=replace(
+            planner.retrieval,
+            max_tool_calls=settings.planner_max_tool_calls,
+            max_research_turns=settings.planner_max_research_turns,
+            tool_timeout_seconds=settings.context_tool_timeout_seconds,
+            per_tool_result_tokens=settings.planner_tool_result_token_limit,
+            evidence_package_tokens=settings.planner_evidence_token_budget,
+        ),
+    )
+    reviewer = policies["reviewer"]
+    policies["reviewer"] = replace(
+        reviewer,
+        retrieval=replace(
+            reviewer.retrieval,
+            max_tool_calls=settings.reviewer_max_tool_calls,
+            max_research_turns=settings.reviewer_max_research_turns,
+            tool_timeout_seconds=settings.context_tool_timeout_seconds,
+            per_tool_result_tokens=settings.reviewer_tool_result_token_limit,
+            evidence_package_tokens=settings.reviewer_evidence_token_budget,
+        ),
+    )
+    verification = policies["reviewer_verification"]
+    policies["reviewer_verification"] = replace(
+        verification,
+        retrieval=replace(
+            verification.retrieval,
+            max_tool_calls=settings.verification_max_tool_calls,
+            tool_timeout_seconds=settings.context_tool_timeout_seconds,
+            per_tool_result_tokens=settings.reviewer_tool_result_token_limit,
+            evidence_package_tokens=settings.verification_evidence_token_budget,
+        ),
+    )
+    analyzer = policies["analyzer"]
+    policies["analyzer"] = replace(
+        analyzer,
+        retrieval=replace(
+            analyzer.retrieval,
+            max_tool_calls=settings.analyzer_max_tool_calls,
+            max_research_turns=settings.analyzer_max_research_turns,
+            tool_timeout_seconds=settings.context_tool_timeout_seconds,
+            per_tool_result_tokens=settings.analyzer_tool_result_token_limit,
+            evidence_package_tokens=settings.analyzer_evidence_token_budget,
+        ),
+    )
+    return policies
+
+
 def build_novel_service(
     settings: NovelApplicationSettings,
     *,
@@ -469,6 +680,7 @@ def build_novel_service(
     """使用一个共享 Runtime 组装真实模型小说创作服务。"""
 
     configure_local_sdk_tracing(settings.agent_trace_directory)
+    context_policies = _build_agent_context_policies(settings)
     diagnostic_writer = ModelFailureDiagnosticWriter(settings.model_diagnostics_directory)
     hooks = (observer,) if observer is not None else ()
     # 生产小说 Worker 全部直接使用 SDK，并共用同一 Provider 配置。
@@ -487,6 +699,7 @@ def build_novel_service(
         instructions: str,
         temperature: float,
         timeout_seconds: float | None = None,
+        output_token_limit: int | None = None,
     ) -> WorkerSettings | None:
         extra_body: dict[str, object] = {}
         if settings.thinking is not None:
@@ -500,6 +713,7 @@ def build_novel_service(
             model=sdk_model,
             model_settings=ModelSettings(
                 temperature=temperature,
+                max_tokens=output_token_limit,
                 timeout=timeout_seconds or settings.timeout_seconds,
                 extra_body=extra_body or None,
             ),
@@ -521,8 +735,10 @@ def build_novel_service(
         sdk_settings=sdk_worker_settings(
             worker_id="novel-planner", name="章节规划师",
             instructions=PLANNER_SYSTEM_PROMPT, temperature=settings.planner_temperature,
+            output_token_limit=settings.planner_output_token_limit,
         ),
         event_sinks=hooks,
+        context_policy=context_policies["planner"],
     )
     writer = WriterAgent(
         sdk_settings=sdk_worker_settings(
@@ -530,8 +746,10 @@ def build_novel_service(
             name="小说正文作者",
             instructions=WRITER_SYSTEM_PROMPT,
             temperature=settings.writer_temperature,
+            output_token_limit=settings.writer_output_token_limit,
         ),
         event_sinks=hooks,
+        context_policy=context_policies["writer"],
     )
     reviewer = ReviewerAgent(
         store=store,
@@ -540,8 +758,11 @@ def build_novel_service(
             worker_id="novel-reviewer", name="章节审查员",
             instructions=REVIEWER_SYSTEM_PROMPT, temperature=settings.reviewer_temperature,
             timeout_seconds=settings.reviewer_turn_timeout_seconds,
+            output_token_limit=settings.reviewer_output_token_limit,
         ),
         event_sinks=hooks,
+        context_policy=context_policies["reviewer"],
+        verification_context_policy=context_policies["reviewer_verification"],
     )
     reviser = ReviserAgent(
         sdk_settings=sdk_worker_settings(
@@ -549,8 +770,11 @@ def build_novel_service(
             name="章节修订者",
             instructions=REVISER_SYSTEM_PROMPT,
             temperature=settings.reviser_temperature,
+            output_token_limit=settings.reviser_output_token_limit,
         ),
         event_sinks=hooks,
+        context_policy=context_policies["reviser"],
+        context_snapshot_sink=context_snapshot_sink,
     )
     analyzer = ChapterAnalyzerAgent(
         sdk_settings=sdk_worker_settings(
@@ -558,8 +782,11 @@ def build_novel_service(
             name="章节状态分析器",
             instructions=CHAPTER_ANALYZER_SYSTEM_PROMPT,
             temperature=settings.analyzer_temperature,
+            output_token_limit=settings.analyzer_output_token_limit,
         ),
         event_sinks=hooks,
+        context_policy=context_policies["analyzer"],
+        context_snapshot_sink=context_snapshot_sink,
     )
 
     return NovelService(
@@ -572,7 +799,7 @@ def build_novel_service(
             store=store,
             planner=planner,
             context_builder=ChapterContextBuilder(
-                token_budget=settings.context_token_budget,
+                context_policy=context_policies["writer"],
                 creative_control_provider=creative_control_provider if callable(creative_control_provider) else None,
             ),
             writer=writer,

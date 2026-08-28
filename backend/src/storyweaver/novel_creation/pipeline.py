@@ -13,7 +13,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from ..observability import get_log_context, logging_context
-from ..context_management import trace_from_selected_entries
+from ..context import trace_from_selected_entries
 
 from .context_builder import ChapterContextBuilder
 from .context_renderer import ChapterContextRenderer
@@ -34,7 +34,7 @@ from .models import (
     StoryState,
     StoryStateDelta,
 )
-from .repository import StoryProjectRepository
+from .repository import ChapterRunCheckpoint, StoryProjectRepository
 from .quality_gate import (
     ReviewDecision,
     ReviewGateResult,
@@ -373,48 +373,103 @@ class WriteNextChapterPipeline:
             len(context.entries),
             f"{context.estimated_tokens:,}",
         )
-        self._record_writer_context_snapshot(
-            project=project,
-            context=context,
-            context_trace=context_trace,
+        checkpoint = self._store.load_chapter_checkpoint(
+            proposal.book_id,
+            proposal.proposal_id,
         )
+        if checkpoint is None:
+            self._record_writer_context_snapshot(
+                project=project,
+                context=context,
+                context_trace=context_trace,
+            )
+            draft = await self._writer.write(context)
+            if not isinstance(draft, ChapterDraft):
+                raise ChapterPipelineError("Writer 必须返回 ChapterDraft")
+            draft = self._draft_validator.validate_and_normalize(
+                context=context,
+                draft=draft,
+            )
+            self._log_stage_summary(
+                "novel-writer",
+                "正文结果 | 《%s》 · %d 字",
+                draft.title,
+                draft.word_count,
+            )
+            draft_history = [draft]
+            review_history: list[ReviewReport] = []
+            previous_review: ReviewReport | None = None
+            revision_count = 0
+            self._save_checkpoint(
+                proposal=proposal,
+                stage="draft_ready",
+                draft_history=draft_history,
+                review_history=review_history,
+                previous_review=previous_review,
+                revision_count=revision_count,
+                context_trace=context_trace,
+            )
+            checkpoint_stage = "draft_ready"
+        else:
+            draft_history = list(checkpoint.draft_history)
+            review_history = list(checkpoint.review_history)
+            previous_review = checkpoint.previous_review
+            revision_count = checkpoint.revision_count
+            context_trace = checkpoint.context_trace
+            checkpoint_stage = checkpoint.stage
+            self._log_stage_summary(
+                "pipeline",
+                "恢复章节检查点 | %s · 已复用正文 %d 版、审查 %d 次",
+                checkpoint_stage,
+                len(draft_history),
+                len(review_history),
+            )
 
-        draft = await self._writer.write(context)
-        if not isinstance(draft, ChapterDraft):
-            raise ChapterPipelineError("Writer 必须返回 ChapterDraft")
-        draft = self._draft_validator.validate_and_normalize(
-            context=context,
-            draft=draft,
-        )
-        self._log_stage_summary(
-            "novel-writer",
-            "正文结果 | 《%s》 · %d 字",
-            draft.title,
-            draft.word_count,
-        )
-
-        draft_history = [draft]
-        review_history: list[ReviewReport] = []
-        previous_review: ReviewReport | None = None
-        revision_count = 0
+        draft = draft_history[0]
         gate_result: ReviewGateResult | None = None
 
-        while True:
+        if checkpoint_stage == "delta_ready":
+            if not review_history:
+                raise ChapterPipelineError("状态增量检查点缺少审查报告")
             final_draft = draft_history[-1]
-            if previous_review is None:
-                final_review = await self._reviewer.review(
-                    context=context,
-                    draft=final_draft,
+            gate_result = active_quality_gate.evaluate(
+                review=review_history[-1],
+                actual_words=final_draft.word_count,
+                target_words=project.metadata.chapter_target_words,
+                revision_round=revision_count,
+                previous_review=previous_review,
+            )
+
+        while checkpoint_stage != "delta_ready":
+            final_draft = draft_history[-1]
+            if checkpoint_stage in {"draft_ready", "revision_ready"}:
+                if previous_review is None:
+                    final_review = await self._reviewer.review(
+                        context=context,
+                        draft=final_draft,
+                    )
+                else:
+                    final_review = await self._reviewer.verify_revision(
+                        context=context,
+                        draft=final_draft,
+                        original_review=previous_review,
+                    )
+                if not isinstance(final_review, ReviewReport):
+                    raise ChapterPipelineError("Reviewer 必须返回 ReviewReport")
+                review_history.append(final_review)
+                self._save_checkpoint(
+                    proposal=proposal,
+                    stage="review_ready",
+                    draft_history=draft_history,
+                    review_history=review_history,
+                    previous_review=previous_review,
+                    revision_count=revision_count,
+                    context_trace=context_trace,
                 )
-            else:
-                final_review = await self._reviewer.verify_revision(
-                    context=context,
-                    draft=final_draft,
-                    original_review=previous_review,
-                )
-            if not isinstance(final_review, ReviewReport):
-                raise ChapterPipelineError("Reviewer 必须返回 ReviewReport")
-            review_history.append(final_review)
+                checkpoint_stage = "review_ready"
+            if not review_history:
+                raise ChapterPipelineError("章节检查点缺少审查报告")
+            final_review = review_history[-1]
             gate_result = active_quality_gate.evaluate(
                 review=final_review,
                 actual_words=final_draft.word_count,
@@ -476,6 +531,16 @@ class WriteNextChapterPipeline:
             # 复查只需要知道实际交给 Reviser 的硬问题，避免把风格观察项
             # 误当成下一轮必须复现的阻断问题。
             previous_review = revision_review
+            self._save_checkpoint(
+                proposal=proposal,
+                stage="revision_ready",
+                draft_history=draft_history,
+                review_history=review_history,
+                previous_review=previous_review,
+                revision_count=revision_count,
+                context_trace=context_trace,
+            )
+            checkpoint_stage = "revision_ready"
 
         if gate_result is None:  # pragma: no cover - while 必须产生门禁结果
             raise AssertionError("Review Loop 未产生 QualityGate 结果")
@@ -524,20 +589,36 @@ class WriteNextChapterPipeline:
                 review_history=tuple(review_history),
             )
 
-        delta = await self._analyzer.analyze(
-            project=project,
-            plan=proposal.plan,
-            draft=final_draft,
-        )
-        if not isinstance(delta, StoryStateDelta):
-            raise ChapterPipelineError("ChapterAnalyzer 必须返回 StoryStateDelta")
-        self._log_stage_summary(
-            "chapter-analyzer",
-            "状态结果 | 新事实 %d · 新伏笔 %d · 人物更新 %d",
-            len(delta.new_facts),
-            len(delta.new_hooks),
-            len(delta.character_updates),
-        )
+        if checkpoint_stage == "delta_ready":
+            if checkpoint is None or checkpoint.state_delta is None:
+                raise ChapterPipelineError("状态增量检查点缺少状态增量")
+            delta = checkpoint.state_delta
+            self._log_stage_summary("pipeline", "恢复章节检查点 | 复用状态分析结果")
+        else:
+            delta = await self._analyzer.analyze(
+                project=project,
+                plan=proposal.plan,
+                draft=final_draft,
+            )
+            if not isinstance(delta, StoryStateDelta):
+                raise ChapterPipelineError("ChapterAnalyzer 必须返回 StoryStateDelta")
+            self._log_stage_summary(
+                "chapter-analyzer",
+                "状态结果 | 新事实 %d · 新伏笔 %d · 人物更新 %d",
+                len(delta.new_facts),
+                len(delta.new_hooks),
+                len(delta.character_updates),
+            )
+            self._save_checkpoint(
+                proposal=proposal,
+                stage="delta_ready",
+                draft_history=draft_history,
+                review_history=review_history,
+                previous_review=previous_review,
+                revision_count=revision_count,
+                context_trace=context_trace,
+                state_delta=delta,
+            )
         new_state = self._state_reducer.apply(project.state, delta)
         status = (
             "ready_for_review"
@@ -623,7 +704,7 @@ class WriteNextChapterPipeline:
             )
             trace = trace_from_selected_entries(
                 agent_role="writer",
-                policy_version="writer-context-v2.1",
+                policy_version="context-policy-v1",
                 book_version=book_version,
                 token_budget=getattr(context_trace, "budget", context.estimated_tokens),
                 entries=context.entries,
@@ -644,6 +725,33 @@ class WriteNextChapterPipeline:
             )
         except Exception:
             _LOGGER.warning("Writer Context Snapshot 写入失败", exc_info=True)
+
+    def _save_checkpoint(
+        self,
+        *,
+        proposal: ChapterPlanProposal,
+        stage: str,
+        draft_history: list[ChapterDraft],
+        review_history: list[ReviewReport],
+        previous_review: ReviewReport | None,
+        revision_count: int,
+        context_trace: ContextTrace,
+        state_delta: StoryStateDelta | None = None,
+    ) -> None:
+        """在每个稳定 Worker 边界保存检查点，失败时不掩盖存储问题。"""
+
+        self._store.save_chapter_checkpoint(
+            proposal,
+            ChapterRunCheckpoint(
+                stage=stage,
+                draft_history=tuple(draft_history),
+                review_history=tuple(review_history),
+                previous_review=previous_review,
+                revision_count=revision_count,
+                context_trace=context_trace,
+                state_delta=state_delta,
+            ),
+        )
 
     @staticmethod
     def _log_stage_summary(agent_id: str, message: str, *args: object) -> None:

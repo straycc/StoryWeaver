@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from ...context_management import ContextCandidate, source_ref, trace_from_candidates, with_tool_results
+from ...context import (
+    AgentContextPolicy,
+    ContextCandidate,
+    default_agent_context_policies,
+    require_within_budget,
+    select_context,
+    with_tool_results,
+)
 from ...observability import get_log_context
 from ...llm import (
     LlmEvent,
@@ -14,18 +21,12 @@ from ...llm import (
     WorkerRetryPolicy,
     WorkerSettings,
     run_research_then_submit,
-    run_with_retry,
 )
 from ..exceptions import ChapterPlanValidationError, SerializationError
 from ..hook_manager import HookManager
 from ..models import BatchPlanningContext, ChapterPlan, NovelProject
 from ..repository import StoryProjectRepository
 from ..review_tools import (
-    CanonEvidenceSearchTool,
-    ChapterSummaryTool,
-    EntityEvidenceTool,
-    FoundationQueryTool,
-    OpenForeshadowingsTool,
     ReviewSnapshot,
     build_sdk_read_tools,
 )
@@ -77,6 +78,7 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
         sdk_settings: WorkerSettings | None = None,
         event_sinks: tuple[LlmEventSink, ...] = (),
         context_snapshot_sink: object | None = None,
+        context_policy: AgentContextPolicy | None = None,
     ) -> None:
         super().__init__(
             agent_id="novel-planner",
@@ -91,6 +93,7 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
         self._hook_manager = hook_manager or HookManager()
         self._store = store
         self._context_snapshot_sink = context_snapshot_sink
+        self._context_policy = context_policy or default_agent_context_policies()["planner"]
 
     async def plan(
         self,
@@ -128,39 +131,53 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
             raise ValueError("Planner 必须注入 StoryProjectRepository")
         snapshot = self._load_snapshot(project)
         prompt = self._tool_prompt(snapshot=snapshot, user_instruction=user_instruction, batch_context=batch_context)
+        require_within_budget(
+            prompt,
+            budget=self._context_policy.budget.initial_dynamic_context,
+            label="Planner 初始上下文",
+        )
         return await self._run_sdk_plan(prompt, snapshot, convert)
 
     async def _run_sdk_plan(self, prompt: str, snapshot: ReviewSnapshot, convert: Any) -> ChapterPlan:
         """SDK 两阶段规划；报告修复不重新运行研究工具。"""
         evidence: list[dict[str, object]] = []
+        retrieval = self._context_policy.retrieval
 
         async def completed(name: str, index: int, succeeded: bool, exhausted: bool, elapsed: float, error: str | None, deduplicated: bool, arguments: Mapping[str, object]) -> None:
             event = LlmEvent(LlmEventType.TOOL_COMPLETED, "novel-planner", {
-                "tool_name": name, "tool_call_index": index, "tool_call_limit": 4,
+                "tool_name": name, "tool_call_index": index, "tool_call_limit": retrieval.max_tool_calls,
                 "succeeded": succeeded, "budget_exhausted": exhausted, "elapsed_seconds": elapsed,
                 "error": error, "deduplicated": deduplicated, "tool_arguments": dict(arguments),
             })
             for sink in self._event_sinks:
                 await sink.on_event(event)
 
-        tools = build_sdk_read_tools(snapshot=snapshot, max_tool_calls=4, on_completed=completed, evidence=evidence)
+        tools = build_sdk_read_tools(
+            snapshot=snapshot,
+            max_tool_calls=retrieval.max_tool_calls,
+            on_completed=completed,
+            evidence=evidence,
+            timeout_seconds=retrieval.tool_timeout_seconds,
+            result_token_limit=retrieval.per_tool_result_tokens,
+            transient_attempts=retrieval.transient_attempts,
+        )
 
-        async def operation(_context: Any) -> ChapterPlan:
+        try:
             output = await run_research_then_submit(
                 settings=self._sdk_settings, prompt=prompt, read_tools=tools,
                 output_type=NOVEL_OUTPUT_TYPES["novel-planner"], submit_tool_name="submit_plan",
                 submit_description="提交最终章节计划；不会确认计划或修改正史。",
-                max_research_turns=2, evidence=evidence, event_sinks=self._event_sinks,
+                max_research_turns=retrieval.max_research_turns,
+                evidence=evidence,
+                evidence_token_budget=retrieval.evidence_package_tokens,
+                report_retry_policy=self._sdk_retry_policy,
+                output_validator=lambda value: convert(value.model_dump()),
+                event_sinks=self._event_sinks,
                 tracing_enabled=True,
             )
-            return convert(output.model_dump())
-
-        try:
-            return await run_with_retry(
-                worker_name="novel-planner",
-                operation=operation,
-                policy=self._sdk_retry_policy,
-            )
+            if not isinstance(output, ChapterPlan):
+                raise TypeError("Planner Report 必须返回 ChapterPlan")
+            return output
         finally:
             self._record_context_snapshot(prompt=prompt, snapshot=snapshot, evidence=evidence)
 
@@ -179,22 +196,18 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
         try:
             book_version = self._book_version(snapshot.project)
             candidate = ContextCandidate(
-                source=source_ref(
-                    source_id="planner:initial-prompt",
-                    source_type="planner_initial_context",
-                    content=prompt,
-                    book_version=book_version,
-                ),
+                source_id="planner:initial-prompt",
+                source_type="planner_initial_context",
                 content=prompt,
                 reason="规划师可见的初始索引与用户指令",
                 protected=True,
                 priority=100,
             )
-            _, trace = trace_from_candidates(
+            _, trace = select_context(
                 agent_role="planner",
-                policy_version="planner-context-v2.1",
+                policy_version=self._context_policy.policy_version,
                 book_version=book_version,
-                token_budget=max(1, len(prompt) // 2 + 16),
+                token_budget=self._context_policy.budget.initial_dynamic_context,
                 candidates=(candidate,),
                 notes=("工具证据由 research 阶段追加",),
             )
@@ -231,101 +244,6 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
             chapter_summaries=self._store.load_chapter_summaries(stored.metadata.book_id),
         )
 
-    def _tool_runtime(
-        self,
-        snapshot: ReviewSnapshot,
-    ) -> tuple[AgentRuntime, Agent[dict[str, Any]]]:
-        """为本次规划建立隔离的只读工具会话。"""
-
-        registry = ToolRegistry()
-        registry.register(EntityEvidenceTool(snapshot))
-        registry.register(CanonEvidenceSearchTool(snapshot))
-        registry.register(ChapterSummaryTool(snapshot))
-        registry.register(FoundationQueryTool(snapshot))
-        registry.register(OpenForeshadowingsTool(snapshot))
-        executor = ToolExecutor(
-            registry,
-            permission_policy=self._runtime.tool_executor.permission_policy,
-        )
-        if isinstance(self._runtime, OpenAIAgentsRuntime):
-            runtime = self._runtime.with_tools(
-                tool_registry=registry,
-                tool_executor=executor,
-                max_tool_calls=4,
-            )
-        else:
-            runtime = AgentRuntime(
-            tool_registry=registry,
-            tool_executor=executor,
-            context_builder=self._runtime.context_builder,
-            hooks=self._runtime.hooks,
-            tool_result_archive=None,
-            max_inline_tool_result_tokens=self._runtime.max_inline_tool_result_tokens,
-            max_tool_calls=4,
-            )
-        agent = Agent(
-            agent_id=self._agent.agent_id,
-            name=self._agent.name,
-            system_prompt=self._agent.system_prompt,
-            model=self._agent.model,
-            output_schema=dict,
-            allowed_tools=(
-                "get_entity_evidence",
-                "search_canon_evidence",
-                "read_chapter_summary",
-                "query_foundation",
-                "list_open_foreshadowings",
-            ),
-            config=AgentConfig(
-                max_steps=3,
-                model_timeout_seconds=self._agent.config.model_timeout_seconds,
-                temperature=self._agent.config.temperature,
-                max_structured_repairs=self._agent.config.max_structured_repairs,
-            ),
-        )
-        return runtime, agent
-
-    def _build_prompt(
-        self,
-        *,
-        project: NovelProject,
-        user_instruction: str | None,
-        batch_context: BatchPlanningContext | None = None,
-    ) -> str:
-        next_chapter = project.state.last_committed_chapter + 1
-        active_outline = tuple(
-            node
-            for node in project.foundation.outline
-            if node.chapter_start <= next_chapter <= node.chapter_end
-        )
-        active_state = {
-            "last_committed_chapter": project.state.last_committed_chapter,
-            "current_time": project.state.current_time,
-            "current_location": project.state.current_location,
-            "characters": project.state.characters,
-            "current_facts": project.state.current_facts,
-            "hooks": project.state.hooks,
-        }
-        planning_input = {
-            "next_chapter_number": next_chapter,
-            "book": project.metadata,
-            "premise": project.foundation.premise,
-            "world_setting": project.foundation.world_setting,
-            "central_conflict": project.foundation.central_conflict,
-            "ending_direction": project.foundation.ending_direction,
-            "characters": project.foundation.characters,
-            "active_outline": active_outline,
-            "writing_rules": project.foundation.writing_rules,
-            "current_state": active_state,
-            "hook_governance": self._hook_manager.planning_guidance(project=project),
-            "user_instruction": user_instruction if batch_context is None else None,
-            "batch_execution": self._batch_execution_data(batch_context),
-        }
-        return (
-            "请根据以下项目资料规划下一章。不要生成正文。\n\n"
-            + dumps_json(to_data(planning_input))
-        )
-
     def _tool_prompt(
         self,
         *,
@@ -342,10 +260,19 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
             for node in project.foundation.outline
             if node.chapter_start <= next_chapter <= node.chapter_end
         )
-        fact_index = sorted(
-            project.state.current_facts,
-            key=lambda item: (-item.importance, -item.source_chapter, item.fact_id),
-        )[:5]
+        fact_index = [
+            {
+                "fact_id": item.fact_id,
+                "subject_id": item.subject_id,
+                "predicate": item.predicate,
+                "source_chapter": item.source_chapter,
+                "importance": item.importance,
+            }
+            for item in sorted(
+                project.state.current_facts,
+                key=lambda item: (-item.importance, -item.source_chapter, item.fact_id),
+            )[:5]
+        ]
         payload = {
             "next_chapter_number": next_chapter,
             "book_constraints": {

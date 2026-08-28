@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from math import ceil
 from typing import Any
 
+from ...context import AgentContextPolicy, default_agent_context_policies
 from ...llm import LlmEventSink, WorkerRetryPolicy, WorkerSettings
 from ..context_renderer import ChapterContextRenderer
 from ..exceptions import ChapterDraftValidationError, SerializationError
 from ..models import ChapterContext, ChapterDraft
-from ..serialization import decode_chapter_draft
+from ..serialization import decode_chapter_draft, loads_json
 from ..validation import ChapterDraftValidator
 from .base import BaseNovelAgent
 
@@ -42,6 +45,7 @@ class WriterAgent(BaseNovelAgent[dict[str, Any]]):
         retry_policy: WorkerRetryPolicy | None = None,
         sdk_settings: WorkerSettings | None = None,
         event_sinks: tuple[LlmEventSink, ...] = (),
+        context_policy: AgentContextPolicy | None = None,
     ) -> None:
         super().__init__(
             agent_id="novel-writer",
@@ -54,8 +58,15 @@ class WriterAgent(BaseNovelAgent[dict[str, Any]]):
         )
         self._renderer = renderer or ChapterContextRenderer()
         self._validator = validator or ChapterDraftValidator()
+        self._context_policy = context_policy or default_agent_context_policies()["writer"]
 
     async def write(self, context: ChapterContext) -> ChapterDraft:
+        if context.estimated_tokens > self._context_policy.budget.initial_dynamic_context:
+            raise ValueError(
+                "Writer 初始动态上下文超过 Policy 预算："
+                f"{context.estimated_tokens}/"
+                f"{self._context_policy.budget.initial_dynamic_context} Token"
+            )
         def convert(raw_draft: dict[str, Any]) -> ChapterDraft:
             normalized_draft = self._with_computed_word_count(raw_draft)
             try:
@@ -69,6 +80,14 @@ class WriterAgent(BaseNovelAgent[dict[str, Any]]):
                 draft=draft,
             )
 
+        output_limit = self._output_token_limit(context)
+        active_settings = replace(
+            self._sdk_settings,
+            model_settings=replace(
+                self._sdk_settings.model_settings,
+                max_tokens=output_limit,
+            ),
+        )
         return await self._generate_validated(
             self._renderer.render(context),
             convert,
@@ -76,6 +95,27 @@ class WriterAgent(BaseNovelAgent[dict[str, Any]]):
                 "上一次章节正文未通过校验。请使用完全相同的章节计划和上下文重写，"
                 "针对校验错误修正 JSON、章节号、标题或正文长度，不要改变本章目标。"
             ),
+            sdk_settings=active_settings,
+        )
+
+    def _output_token_limit(self, context: ChapterContext) -> int:
+        """按目标字数计算正文输出额度，并受 Policy 最坏情况预留约束。"""
+
+        target_words = 0
+        constraints = next(
+            (item for item in context.entries if item.source_type == "book_constraints"),
+            None,
+        )
+        if constraints is not None:
+            value = loads_json(constraints.content)
+            if isinstance(value, dict):
+                raw_target = value.get("chapter_target_words")
+                if isinstance(raw_target, int) and not isinstance(raw_target, bool):
+                    target_words = raw_target
+        estimated = ceil(target_words * 1.8 * 1.5) + 1_024
+        return min(
+            self._context_policy.budget.output_reserve,
+            max(6_144, estimated),
         )
 
     def _with_computed_word_count(self, raw_draft: dict[str, Any]) -> dict[str, Any]:

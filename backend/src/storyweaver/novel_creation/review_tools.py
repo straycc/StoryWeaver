@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-import asyncio
-import json
-import time
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, Mapping
 
 from agents.tool import FunctionTool
 from pydantic import BaseModel, ConfigDict, Field
+
+from ..llm.tool_runtime import ReadToolSpec, ToolRuntimePolicy, build_read_tools
 
 from .models import ChapterSummary, NovelProject
 
@@ -499,115 +498,42 @@ def build_sdk_read_tools(
     max_tool_calls: int,
     on_completed: Callable[[str, int, bool, bool, float, str | None, bool, Mapping[str, object]], Awaitable[None]] | None = None,
     evidence: list[dict[str, object]] | None = None,
+    timeout_seconds: float = 8.0,
+    result_token_limit: int = 800,
+    transient_attempts: int = 2,
+    tool_names: tuple[str, ...] | None = None,
 ) -> list[FunctionTool]:
-    """从一次性正史快照构造 SDK 只读工具。
+    """从正史快照构造领域工具，并交给统一只读 Tool Runtime 治理。"""
 
-    预算在工具开始前以锁原子预占；同一回合并发调用也不能越过上限。
-    ``on_completed`` 只用于业务日志投影，不参与工具结果或权限决策。
-    """
-
-    if max_tool_calls < 1:
-        raise ValueError("max_tool_calls 必须大于 0")
-    implementations: dict[str, object] = {
+    implementations = {
         "get_entity_evidence": EntityEvidenceTool(snapshot),
         "search_canon_evidence": CanonEvidenceSearchTool(snapshot),
         "read_chapter_summary": ChapterSummaryTool(snapshot),
         "query_foundation": FoundationQueryTool(snapshot),
         "list_open_foreshadowings": OpenForeshadowingsTool(snapshot),
     }
-    lock = asyncio.Lock()
-    counter = 0
-    completed_results: dict[str, str] = {}
-    in_flight: dict[str, asyncio.Future[str]] = {}
-
-    def build(name: str, implementation: object) -> FunctionTool:
-        async def invoke(_context: Any, arguments: str) -> str:
-            nonlocal counter
-            started_at = time.perf_counter()
-            cache_key: str | None = None
-            try:
-                raw_arguments = json.loads(arguments)
-                cache_key = f"{name}:{json.dumps(raw_arguments, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
-            except Exception:
-                # 无法解析的参数仍按真实调用处理，并由下方统一返回错误摘要。
-                raw_arguments = None
-            duplicate_result: str | None = None
-            duplicate_future: asyncio.Future[str] | None = None
-            own_future: asyncio.Future[str] | None = None
-            async with lock:
-                if cache_key is not None and cache_key in completed_results:
-                    duplicate_result = completed_results[cache_key]
-                    call_index = counter
-                elif cache_key is not None and cache_key in in_flight:
-                    duplicate_future = in_flight[cache_key]
-                    call_index = counter
-                else:
-                    if counter >= max_tool_calls:
-                        if on_completed is not None:
-                            await on_completed(name, counter, True, True, 0.0, None, False, raw_arguments if isinstance(raw_arguments, dict) else {})
-                        return json.dumps(
-                            {"error": "工具调用预算已耗尽"}, ensure_ascii=False
-                        )
-                    counter += 1
-                    call_index = counter
-                    if cache_key is not None:
-                        own_future = asyncio.get_running_loop().create_future()
-                        in_flight[cache_key] = own_future
-            if duplicate_result is not None or duplicate_future is not None:
-                result_text = duplicate_result if duplicate_result is not None else await duplicate_future
-                if on_completed is not None:
-                    await on_completed(name, call_index, True, False, time.perf_counter() - started_at, None, True, raw_arguments if isinstance(raw_arguments, dict) else {})
-                return result_text
-            try:
-                if raw_arguments is None:
-                    raise ValueError("工具参数不是合法 JSON")
-                validated = TOOL_INPUT_MODELS[name].model_validate(raw_arguments)
-                result = await implementation.execute(validated.model_dump())
-                if evidence is not None:
-                    evidence.append({
-                        "tool_name": name,
-                        "arguments": validated.model_dump(),
-                        "raw_arguments": arguments,
-                        "result": result,
-                        "succeeded": True,
-                        "truncated": bool(result.get("truncated", False)) if isinstance(result, Mapping) else False,
-                    })
-                serialized = json.dumps(result, ensure_ascii=False, default=str)
-                if cache_key is not None:
-                    async with lock:
-                        completed_results[cache_key] = serialized
-                        in_flight.pop(cache_key, None)
-                        if own_future is not None and not own_future.done():
-                            own_future.set_result(serialized)
-                if on_completed is not None:
-                    await on_completed(name, call_index, True, False, time.perf_counter() - started_at, None, False, validated.model_dump())
-                return serialized
-            except Exception as exc:
-                detail = f"{type(exc).__name__}: {exc}"
-                if evidence is not None:
-                    evidence.append({
-                        "tool_name": name,
-                        "arguments": raw_arguments if isinstance(raw_arguments, dict) else {},
-                        "raw_arguments": arguments,
-                        "result": {"error": detail},
-                        "succeeded": False,
-                        "truncated": False,
-                    })
-                if cache_key is not None:
-                    async with lock:
-                        in_flight.pop(cache_key, None)
-                        if own_future is not None and not own_future.done():
-                            own_future.set_result(json.dumps({"error": detail}, ensure_ascii=False))
-                if on_completed is not None:
-                    await on_completed(name, call_index, False, False, time.perf_counter() - started_at, detail, False, raw_arguments if isinstance(raw_arguments, dict) else {})
-                return json.dumps({"error": detail}, ensure_ascii=False)
-
-        return FunctionTool(
+    selected_names = tool_names or tuple(implementations)
+    unknown_names = set(selected_names) - set(implementations)
+    if unknown_names:
+        raise ValueError(f"未知只读工具：{', '.join(sorted(unknown_names))}")
+    specs = tuple(
+        ReadToolSpec(
             name=name,
             description=_TOOL_DESCRIPTIONS[name],
-            params_json_schema=_input_schema(TOOL_INPUT_MODELS[name]),
-            on_invoke_tool=invoke,
-            strict_json_schema=False,
+            input_model=TOOL_INPUT_MODELS[name],
+            execute=implementation.execute,
         )
-
-    return [build(name, implementation) for name, implementation in implementations.items()]
+        for name in selected_names
+        for implementation in (implementations[name],)
+    )
+    return build_read_tools(
+        specs=specs,
+        policy=ToolRuntimePolicy(
+            max_tool_calls=max_tool_calls,
+            timeout_seconds=timeout_seconds,
+            result_token_limit=result_token_limit,
+            transient_attempts=transient_attempts,
+        ),
+        on_completed=on_completed,
+        evidence=evidence,
+    )

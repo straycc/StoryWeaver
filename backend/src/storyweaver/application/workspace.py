@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import re
 from collections.abc import Awaitable, Callable
 from typing import Any, Mapping
@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from agents import ModelSettings
 from ..llm import LlmMessage, LlmMessageRole
-from ..context_management import ContextPolicy, SessionContextManager
+from ..context import ChatContextPolicy, SessionContextManager
 from ..llm import OpenAICompatibleProviderSettings, WorkerSettings, run_text_worker
 from ..memory import (
     LongTermMemoryStore,
@@ -1155,7 +1155,7 @@ class ChatWorkspaceApplication:
                 book_context=book_context,
             )
             messages = list(package.messages)
-            trace_data = asdict(package.trace)
+            trace_data = package.trace.to_data()
         else:
             # 兼容直接构造应用服务的旧测试与嵌入调用。
             binding_sequence = self.sessions.current_binding_sequence(
@@ -1649,7 +1649,7 @@ def build_chat_workspace(
         sessions=sessions,
         generate_text=generate_context_text,
         memory_retriever=memory_retriever,
-        policy=ContextPolicy(token_budget=settings.context_token_budget),
+        policy=ChatContextPolicy(token_budget=settings.context_token_budget),
     )
     return ChatWorkspaceApplication(
         sessions=sessions,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from ..llm import LlmMessage, LlmMessageRole
@@ -11,7 +12,17 @@ from ..memory.long_term import LongTermMemoryType
 from ..memory.services import LongTermMemoryRetriever, _json_value, _response_text
 from ..application.models import ChatMessage, ChatSession, TranscriptEvent
 from ..application.ports import ChatSessionRepository
-from .models import ContextAssemblyTrace, ContextItem, ContextPackage, ContextPolicy
+from .policy import ChatContextPolicy
+from .selection import ContextCandidate, ContextTrace, SelectedSource
+
+
+@dataclass(frozen=True, slots=True)
+class ChatContextPackage:
+    """最终交给 Chat Agent 的消息和轻量 Trace。"""
+
+    messages: tuple[LlmMessage, ...]
+    items: tuple[ContextCandidate, ...]
+    trace: ContextTrace
 
 
 _SUMMARY_FIELDS = (
@@ -33,12 +44,12 @@ class SessionContextManager:
         sessions: ChatSessionRepository,
         generate_text: Callable[[str], Awaitable[str]],
         memory_retriever: LongTermMemoryRetriever,
-        policy: ContextPolicy | None = None,
+        policy: ChatContextPolicy | None = None,
     ) -> None:
         self.sessions = sessions
         self.generate_text = generate_text
         self.memory_retriever = memory_retriever
-        self.policy = policy or ContextPolicy()
+        self.policy = policy or ChatContextPolicy()
 
     async def build(
         self,
@@ -46,7 +57,7 @@ class SessionContextManager:
         session: ChatSession,
         system_prompt: str,
         book_context: str | None = None,
-    ) -> ContextPackage:
+    ) -> ChatContextPackage:
         binding_sequence = self.sessions.current_binding_sequence(session.session_id)
         chat_messages = tuple(
             item
@@ -75,7 +86,7 @@ class SessionContextManager:
         recent = [item for item in chat_messages if item.sequence > covered]
         recent = recent[-self.policy.recent_message_limit :]
 
-        items: list[ContextItem] = []
+        items: list[ContextCandidate] = []
         selected_messages: list[LlmMessage] = []
         excluded: list[str] = []
         compressed: list[str] = []
@@ -206,12 +217,23 @@ class SessionContextManager:
         final_messages = tuple(pair[1] for pair in pairs)
         used = sum(item.estimated_tokens for item in final_items)
         notes.append(f"选择 {len(final_items)} 个来源，估算 {used}/{self.policy.token_budget} Token")
-        trace = ContextAssemblyTrace(
+        trace = ContextTrace(
+            agent_role="chat",
+            policy_version="chat-context-v1",
+            book_version=None,
+            renderer_version="chat-messages-v1",
             budget=self.policy.token_budget,
             estimated_tokens=used,
-            selected_source_ids=tuple(item.source_id for item in final_items),
+            selected_sources=tuple(
+                SelectedSource(
+                    source_id=item.source_id,
+                    source_type=item.source_type,
+                    estimated_tokens=item.estimated_tokens,
+                    protected=item.protected,
+                )
+                for item in final_items
+            ),
             excluded_source_ids=tuple(excluded),
-            protected_source_ids=tuple(item.source_id for item in final_items if item.protected),
             compressed_source_ids=tuple(compressed),
             selected_memory_ids=tuple(item.memory_id for item in memories),
             summary_sequence=summary.sequence if summary else None,
@@ -222,7 +244,7 @@ class SessionContextManager:
             + tuple((source_id, "超过预算或优先级较低") for source_id in excluded)
             + tuple((source_id, "原始内容已压缩为摘要或引用") for source_id in compressed),
         )
-        return ContextPackage(final_messages, final_items, trace)
+        return ChatContextPackage(final_messages, final_items, trace)
 
     async def refresh_summary(
         self,
@@ -377,7 +399,7 @@ class SessionContextManager:
 
     def _append_item(
         self,
-        items: list[ContextItem],
+        items: list[ContextCandidate],
         messages: list[LlmMessage],
         *,
         source_id: str,
@@ -388,13 +410,12 @@ class SessionContextManager:
         priority: int,
         reason: str,
     ) -> None:
-        item = ContextItem(
+        item = ContextCandidate(
             source_id=source_id,
             source_type=source_type,
             content=content,
             protected=protected,
             priority=priority,
-            estimated_tokens=self._estimate_tokens(content) + 8,
             reason=reason,
         )
         items.append(item)

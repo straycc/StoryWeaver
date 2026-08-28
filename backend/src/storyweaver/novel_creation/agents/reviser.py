@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...context import (
+    AgentContextPolicy,
+    ContextCandidate,
+    default_agent_context_policies,
+    require_within_budget,
+    select_context,
+)
 from ...llm import LlmEventSink, WorkerRetryPolicy, WorkerSettings
+from ...observability import get_log_context
 from ..context_renderer import ChapterContextRenderer
 from ..exceptions import ChapterReviewError, SerializationError
 from ..models import ChapterContext, ChapterDraft, ReviewReport
@@ -35,6 +43,8 @@ class ReviserAgent(BaseNovelAgent[dict[str, Any]]):
         retry_policy: WorkerRetryPolicy | None = None,
         sdk_settings: WorkerSettings | None = None,
         event_sinks: tuple[LlmEventSink, ...] = (),
+        context_policy: AgentContextPolicy | None = None,
+        context_snapshot_sink: object | None = None,
     ) -> None:
         super().__init__(
             agent_id="novel-reviser",
@@ -47,6 +57,8 @@ class ReviserAgent(BaseNovelAgent[dict[str, Any]]):
         )
         self._renderer = renderer or ChapterContextRenderer()
         self._validator = validator or ChapterDraftValidator()
+        self._context_policy = context_policy or default_agent_context_policies()["reviser"]
+        self._context_snapshot_sink = context_snapshot_sink
 
     async def revise(
         self,
@@ -59,13 +71,47 @@ class ReviserAgent(BaseNovelAgent[dict[str, Any]]):
             raise ChapterReviewError("不能根据解析失败的审查报告修订正文")
         if not review.issues:
             raise ChapterReviewError("审查报告没有可执行的修订问题")
+        actionable_issues = tuple(
+            issue for issue in review.issues if issue.severity != "info"
+        ) or review.issues
+        related_source_ids = {
+            source_id
+            for issue in actionable_issues
+            for source_id in issue.related_source_ids
+        }
+        always_include = {
+            "chapter_plan",
+            "book_constraints",
+            "writing_rules",
+            "user_instruction",
+            "creative_control",
+        }
+        revision_entries = tuple(
+            entry
+            for entry in context.entries
+            if entry.source_type in always_include
+            or entry.source_id in related_source_ids
+        )
+        rendered_context = self._renderer.render_entries(
+            ChapterContext(
+                chapter_number=context.chapter_number,
+                entries=revision_entries,
+                estimated_tokens=sum(max(1, (len(item.content) + 1) // 2) + 8 for item in revision_entries),
+                book_id=context.book_id,
+            )
+        )
         prompt = (
             "请根据审查报告修订以下章节。\n\n"
-            + self._renderer.render_entries(context)
+            + rendered_context
             + "\n\n## 原稿\n"
             + dumps_json(to_data(draft))
-            + "\n## 审查报告\n"
-            + dumps_json(to_data(review))
+            + "\n## 可执行审查问题\n"
+            + dumps_json(to_data(actionable_issues))
+        )
+        require_within_budget(
+            prompt,
+            budget=self._context_policy.budget.initial_dynamic_context,
+            label="Reviser 初始上下文",
         )
 
         def convert(raw_draft: dict[str, Any]) -> ChapterDraft:
@@ -81,14 +127,58 @@ class ReviserAgent(BaseNovelAgent[dict[str, Any]]):
                 draft=revised,
             )
 
-        return await self._generate_validated(
-            prompt,
-            convert,
-            repair_instruction=(
-                "上一次修订稿未通过校验。请继续遵守原章节计划和审查意见，"
-                "只修正失败项并返回完整 ChapterDraft JSON。"
-            ),
-        )
+        try:
+            return await self._generate_validated(
+                prompt,
+                convert,
+                repair_instruction=(
+                    "上一次修订稿未通过校验。请继续遵守原章节计划和审查意见，"
+                    "只修正失败项并返回完整 ChapterDraft JSON。"
+                ),
+            )
+        finally:
+            self._record_context_snapshot(context=context, prompt=prompt)
+
+    def _record_context_snapshot(
+        self,
+        *,
+        context: ChapterContext,
+        prompt: str,
+    ) -> None:
+        """保存 Reviser 的隔离输入；观测失败不改变修订结果。"""
+
+        sink = self._context_snapshot_sink
+        if sink is None:
+            return
+        try:
+            book_version = context.chapter_number - 1
+            candidate = ContextCandidate(
+                source_id=f"reviser:chapter:{context.chapter_number}",
+                source_type="reviser_initial_context",
+                content=prompt,
+                reason="原稿、可执行审查问题及其引用的硬约束",
+                protected=True,
+                priority=100,
+            )
+            _, trace = select_context(
+                agent_role="reviser",
+                policy_version=self._context_policy.policy_version,
+                book_version=book_version,
+                token_budget=self._context_policy.budget.initial_dynamic_context,
+                candidates=(candidate,),
+            )
+            sink.save(
+                agent_role="reviser",
+                book_id=context.book_id,
+                book_version=book_version,
+                policy_version=trace.policy_version,
+                renderer_version=trace.renderer_version,
+                rendered_context=prompt,
+                trace=trace.to_data(),
+                job_id=get_log_context().get("run_id"),
+            )
+        except Exception:
+            return
 
     def _with_computed_word_count(self, raw_draft: dict[str, Any]) -> dict[str, Any]:
         """模型输出不含冗余字数，由正文内容确定性计算。"""

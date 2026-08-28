@@ -36,6 +36,10 @@ from ..novel_creation.models import (
     StoryState,
     StoryStateDelta,
 )
+from ..novel_creation.repository import (
+    CHAPTER_CHECKPOINT_STAGES,
+    ChapterRunCheckpoint,
+)
 from ..novel_creation.serialization import (
     decode_book_metadata,
     decode_chapter_candidate_metadata,
@@ -217,9 +221,20 @@ class PostgresStoryProjectRepository:
                             raise ProjectPersistenceError("候选计划 created_at 不允许改变")
                         if proposal.version < current.version:
                             raise ProjectPersistenceError("不能用较旧版本覆盖候选计划")
+                        # 计划内容或版本发生变化时，旧 Worker 产物不再可复用。
+                        plan_changed = (
+                            proposal.version != current.version
+                            or proposal.plan != current.plan
+                            or proposal.user_instruction != current.user_instruction
+                            or proposal.feedback_history != current.feedback_history
+                        )
                         row.version = proposal.version
                         row.chapter_number = proposal.chapter_number
-                        row.status = proposal.status
+                        if plan_changed:
+                            row.status = proposal.status
+                            row.artifacts_json = {}
+                        elif row.status not in CHAPTER_CHECKPOINT_STAGES:
+                            row.status = proposal.status
                         row.updated_at = proposal.updated_at
                         row.plan_json = encoded
                         history = list(row.plan_history_json or [])
@@ -250,6 +265,85 @@ class PostgresStoryProjectRepository:
         if row is None or row.book_id != book_id or row.run_type != "create" or row.plan_json is None:
             raise ProjectPersistenceError(f"候选章节计划不存在：{proposal_id}")
         return decode_chapter_plan_proposal(row.plan_json)
+
+    def save_chapter_checkpoint(
+        self,
+        proposal: ChapterPlanProposal,
+        checkpoint: ChapterRunCheckpoint,
+    ) -> None:
+        """原子更新章节运行的最近稳定 Worker 产物。"""
+
+        with self.database.session() as session:
+            with session.begin():
+                row = session.get(ChapterRunRow, proposal.proposal_id, with_for_update=True)
+                if row is None or row.book_id != proposal.book_id or row.run_type != "create":
+                    raise ProjectPersistenceError("章节检查点对应的候选计划不存在")
+                if row.plan_json is None:
+                    raise ProjectPersistenceError("章节检查点缺少候选计划")
+                stored = decode_chapter_plan_proposal(row.plan_json)
+                if stored.version != proposal.version or stored.plan != proposal.plan:
+                    raise ProjectPersistenceError("候选计划已变化，不能写入旧检查点")
+                artifacts = dict(row.artifacts_json or {})
+                artifacts["checkpoint"] = {
+                    "stage": checkpoint.stage,
+                    "draft_history": _data_list(checkpoint.draft_history),
+                    "review_history": _data_list(checkpoint.review_history),
+                    "previous_review": _data(checkpoint.previous_review)
+                    if checkpoint.previous_review is not None
+                    else None,
+                    "revision_count": checkpoint.revision_count,
+                    "context_trace": _data(checkpoint.context_trace),
+                    "state_delta": _data(checkpoint.state_delta)
+                    if checkpoint.state_delta is not None
+                    else None,
+                }
+                row.status = checkpoint.stage
+                row.updated_at = self._utc_now()
+                row.artifacts_json = artifacts
+
+    def load_chapter_checkpoint(
+        self,
+        book_id: str,
+        proposal_id: str,
+    ) -> ChapterRunCheckpoint | None:
+        with self.database.session() as session:
+            row = session.get(ChapterRunRow, proposal_id)
+        if row is None or row.book_id != book_id or row.run_type != "create":
+            return None
+        raw = (row.artifacts_json or {}).get("checkpoint")
+        if not isinstance(raw, dict) or row.status not in CHAPTER_CHECKPOINT_STAGES:
+            return None
+        try:
+            drafts = tuple(
+                decode_chapter_draft(item)
+                for item in raw.get("draft_history", [])
+            )
+            reviews = tuple(
+                decode_review_report(item)
+                for item in raw.get("review_history", [])
+            )
+            trace = decode_context_trace(raw["context_trace"])
+            previous_raw = raw.get("previous_review")
+            delta_raw = raw.get("state_delta")
+            return ChapterRunCheckpoint(
+                stage=str(raw["stage"]),
+                draft_history=drafts,
+                review_history=reviews,
+                previous_review=(
+                    decode_review_report(previous_raw)
+                    if isinstance(previous_raw, dict)
+                    else None
+                ),
+                revision_count=int(raw.get("revision_count", 0)),
+                context_trace=trace,
+                state_delta=(
+                    decode_story_state_delta(delta_raw)
+                    if isinstance(delta_raw, dict)
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ProjectPersistenceError("章节检查点数据无效") from exc
 
     def save_chapter_candidate(
         self,

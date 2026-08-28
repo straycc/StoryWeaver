@@ -1,4 +1,4 @@
-"""Context V2 Snapshot 持久化。"""
+"""Agent Context Snapshot 持久化。"""
 
 from __future__ import annotations
 

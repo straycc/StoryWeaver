@@ -5,7 +5,39 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Protocol
+
+from .models import ChapterDraft, ContextTrace, ReviewReport, StoryStateDelta
+
+
+# 这些阶段只表示“已安全落盘、可从此继续”的 Worker 边界，不等同于 Job 状态。
+CHAPTER_CHECKPOINT_STAGES = frozenset(
+    {"draft_ready", "review_ready", "revision_ready", "delta_ready"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ChapterRunCheckpoint:
+    """章节运行在一次 Worker 成功后的可恢复快照。"""
+
+    stage: str
+    draft_history: tuple[ChapterDraft, ...]
+    review_history: tuple[ReviewReport, ...]
+    previous_review: ReviewReport | None
+    revision_count: int
+    context_trace: ContextTrace
+    state_delta: StoryStateDelta | None = None
+
+    def __post_init__(self) -> None:
+        if self.stage not in CHAPTER_CHECKPOINT_STAGES:
+            raise ValueError(f"不支持的章节检查点阶段：{self.stage}")
+        if not self.draft_history:
+            raise ValueError("章节检查点必须至少包含一份正文")
+        if self.revision_count < 0:
+            raise ValueError("revision_count 不能小于 0")
+        if self.stage == "delta_ready" and self.state_delta is None:
+            raise ValueError("delta_ready 检查点必须包含状态增量")
 
 
 class StoryProjectRepository(Protocol):
@@ -29,6 +61,8 @@ class StoryProjectRepository(Protocol):
     def load_context_trace(self, book_id: str, chapter_number: int) -> Any: ...
     def save_plan_proposal(self, proposal: Any) -> None: ...
     def load_plan_proposal(self, book_id: str, proposal_id: str) -> Any: ...
+    def save_chapter_checkpoint(self, proposal: Any, checkpoint: ChapterRunCheckpoint) -> None: ...
+    def load_chapter_checkpoint(self, book_id: str, proposal_id: str) -> ChapterRunCheckpoint | None: ...
     def save_chapter_candidate(self, **kwargs: Any) -> Any: ...
     def load_chapter_candidate(self, book_id: str, candidate_id: str) -> Any: ...
     def load_candidate_draft(self, book_id: str, candidate_id: str, *, final: bool = True) -> Any: ...
