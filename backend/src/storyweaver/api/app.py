@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ..novel_creation.application import PROJECT_ROOT, NovelApplicationSettings, build_novel_service
 from ..novel_creation.exceptions import BookBusyError, NovelCreationError
@@ -33,10 +33,34 @@ from .live_preview import LivePreviewHub
 from .action_surface import ActionDispatcher, MainAgentActionSurface
 from .main_agent import MainAgent
 from .main_agent_context import MainAgentContextBuilder, WorkflowContextReader
-from ..skills import load_configured_skills
+from .creative_discussion import CreativeDiscussionService
+from ..skills import (
+    SkillInvocationResolver,
+    SkillMaterializer,
+    SkillResolver,
+    SkillService,
+    build_model_implicit_skill_selector,
+    build_model_skill_selector,
+    creative_task_to_data,
+    load_configured_skills,
+)
 
 
-class CreateBookBody(BaseModel):
+class _CreativeBody(BaseModel):
+    skill_ids: list[str] = Field(default_factory=list, max_length=16)
+
+    @field_validator("skill_ids")
+    @classmethod
+    def validate_skill_ids(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip().lower() for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("skill_ids 不能包含空值")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("skill_ids 不能包含重复 Skill")
+        return normalized
+
+
+class CreateBookBody(_CreativeBody):
     title: str
     genre: str
     premise: str
@@ -48,7 +72,7 @@ class CreateBookBody(BaseModel):
     language: str = "zh"
 
 
-class InstructionBody(BaseModel):
+class InstructionBody(_CreativeBody):
     user_instruction: str | None = None
 
 
@@ -107,7 +131,7 @@ class CreateSimulationBody(BaseModel):
     opening_direction: str = Field(default="", max_length=2000)
 
 
-class SimulationTurnBody(BaseModel):
+class SimulationTurnBody(_CreativeBody):
     client_request_id: str = Field(min_length=1, max_length=128)
     expected_version: int = Field(ge=1)
     input_type: str = Field(pattern="^(speech_action|director_event)$")
@@ -131,6 +155,15 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     context_snapshots = ContextSnapshotRepository(database)
     simulations = SimulationRepository(database)
     skills = load_configured_skills(PROJECT_ROOT)
+    skill_service = SkillService(skills)
+
+    def activate_task(request: str, skill_ids: list[str]) -> dict[str, object]:
+        try:
+            return creative_task_to_data(
+                skill_service.activate(request=request, skill_ids=tuple(skill_ids))
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     creative_controls = CreativeControlRepository(database)
     sessions = PostgresChatSessionRepository(database)
     deletions = PostgresDeletionRepository(database)
@@ -172,6 +205,49 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         context_snapshot_sink=context_snapshots,
     )
     provider = OpenAICompatibleProviderSettings(base_url=settings.base_url, model_name=settings.model, api_key=settings.api_key).create_provider()
+    shared_model = provider.get_model(settings.model)
+    skill_invocations = SkillInvocationResolver(
+        registry=skills,
+        selector=build_model_implicit_skill_selector(
+            model=shared_model,
+            timeout_seconds=settings.timeout_seconds,
+        ),
+    )
+
+    async def activate_chat_task(
+        *,
+        session: object,
+        request: str,
+        explicit_skill_ids: list[str],
+    ) -> dict[str, object]:
+        # 最近对话只帮助判断“身份线”这类简短延续回答，不成为 Skill 状态源。
+        # 每轮仍重新 Resolve，并为当前 Job 创建独立冻结 Snapshot。
+        normalized_request = request.strip()
+        if normalized_request == "/skills" or normalized_request.startswith("/skill "):
+            return activate_task(request, explicit_skill_ids)
+        recent_messages = tuple(getattr(session, "messages", ()))[-8:]
+        recent_conversation = "\n".join(
+            f"{getattr(item, 'role', 'unknown')}："
+            f"{str(getattr(item, 'content', '')).strip()[:1200]}"
+            for item in recent_messages
+        )
+        try:
+            selected = await skill_invocations.resolve(
+                request=request,
+                recent_conversation=recent_conversation,
+                explicit_skill_ids=tuple(explicit_skill_ids),
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return activate_task(request, list(selected))
+    roleplay_skill_materializer = SkillMaterializer(
+        SkillResolver(
+            selector=build_model_skill_selector(
+                model=shared_model,
+                timeout_seconds=settings.timeout_seconds,
+            )
+        )
+    )
     extra_body: dict[str, object] = {}
     if settings.thinking is not None:
         extra_body["thinking"] = {"type": settings.thinking}
@@ -182,15 +258,16 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         runtime=RoleplayRuntime(
             director=SceneDirectorAgent(WorkerSettings(
                 worker_id="roleplay-director", name="角色剧场导演", instructions=DIRECTOR_SYSTEM_PROMPT,
-                model=provider.get_model(settings.model), model_settings=ModelSettings(temperature=0.45, timeout=settings.timeout_seconds, extra_body=extra_body or None),
+                model=shared_model, model_settings=ModelSettings(temperature=0.45, timeout=settings.timeout_seconds, extra_body=extra_body or None),
                 timeout_seconds=settings.timeout_seconds, diagnostic_writer=ModelFailureDiagnosticWriter(settings.model_diagnostics_directory),
             )),
             character=CharacterAgent(WorkerSettings(
                 worker_id="roleplay-character", name="角色剧场角色演员", instructions=CHARACTER_SYSTEM_PROMPT,
-                model=provider.get_model(settings.model), model_settings=ModelSettings(temperature=0.7, timeout=settings.timeout_seconds, extra_body=extra_body or None),
+                model=shared_model, model_settings=ModelSettings(temperature=0.7, timeout=settings.timeout_seconds, extra_body=extra_body or None),
                 timeout_seconds=settings.timeout_seconds, diagnostic_writer=ModelFailureDiagnosticWriter(settings.model_diagnostics_directory),
             )),
             snapshots=context_snapshots,
+            skill_materializer=roleplay_skill_materializer,
         ),
     )
     workspace = build_chat_workspace(
@@ -206,7 +283,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     dispatcher = ActionDispatcher(
         proposals=action_proposals, jobs=jobs, workspace=workspace, submit_job=supervisor.submit,
     )
-    dispatcher.configure_skills(skills)
+    dispatcher.configure_skills(skills, skill_service)
     workflow_reader = WorkflowContextReader(
         jobs=jobs, proposals=action_proposals, workspace=workspace,
     )
@@ -219,6 +296,11 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
             # 会话记忆只在 Main Agent 的对话理解阶段按需检索；创作 Pipeline
             # 不会读取它，正文约束仅来自创作控制和正史状态。
             memory_retriever=workspace.context_manager.memory_retriever,
+        ),
+        creative_discussion=CreativeDiscussionService(
+            model=shared_model,
+            timeout_seconds=settings.timeout_seconds,
+            materializer=roleplay_skill_materializer,
         ),
         context_snapshots=context_snapshots,
     )
@@ -266,14 +348,28 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         """旧工作台首次加载所需的完整索引，数据源为 PostgreSQL。"""
 
         return {**workspace.bootstrap(), "skills": [
-            {"id": item.skill_id, "name": item.name, "description": item.description, "source": item.source}
+            {
+                "id": item.skill_id,
+                "name": item.name,
+                "display_name": item.display_name,
+                "description": item.description,
+                "short_description": item.short_description,
+                "source": item.source,
+            }
             for item in dispatcher.available_skills()
         ]}
 
     @app.get("/api/v1/skills")
     async def list_skills() -> dict[str, Any]:
         return {"skills": [
-            {"id": item.skill_id, "name": item.name, "description": item.description, "source": item.source}
+            {
+                "id": item.skill_id,
+                "name": item.name,
+                "display_name": item.display_name,
+                "description": item.description,
+                "short_description": item.short_description,
+                "source": item.source,
+            }
             for item in dispatcher.available_skills()
         ]}
 
@@ -331,7 +427,10 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         # 按钮已经表达了明确意图，直接经过 Dispatcher，不额外消耗一次 Main Agent 调用。
         shortcut_actions = {
             "write_next": "prepare_chapter_plan",
+            "run_next_chapter_workflow": "run_next_chapter_workflow",
             "revise_chapter_plan": "revise_chapter_plan",
+            "approve_chapter_plan": "approve_chapter_plan",
+            "write_from_plan": "write_from_plan",
             "confirm_chapter_plan": "confirm_and_write_chapter",
             "cancel_chapter_plan": "cancel_chapter_plan",
             "rewrite_chapter": "rewrite_chapter",
@@ -359,6 +458,19 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
                 "label": workspace.bootstrap()["actions"].get(body.action, body.action),
             })
             return _accepted(job)
+        raw_skill_ids = body.payload.get("skill_ids", [])
+        if not isinstance(raw_skill_ids, list):
+            raise HTTPException(status_code=422, detail="skill_ids 必须是数组")
+        explicit_skill_ids = [str(item) for item in raw_skill_ids]
+        creative_task_context = (
+            await activate_chat_task(
+                session=session,
+                request=body.content or "处理当前创作请求",
+                explicit_skill_ids=explicit_skill_ids,
+            )
+            if body.action == "chat"
+            else None
+        )
         job = await supervisor.submit(
             job_type="session_action",
             book_id=bound_book_id,
@@ -367,7 +479,25 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
                 "content": body.content,
                 "action": body.action,
                 "book_id": body.book_id,
-                "action_payload": body.payload,
+                "creative_task_context": creative_task_context,
+                "action_payload": (
+                    {
+                        **body.payload,
+                        "creative_task_context": activate_task(
+                            json.dumps(
+                                {
+                                    key: value
+                                    for key, value in body.payload.items()
+                                    if key != "skill_ids"
+                                },
+                                ensure_ascii=False,
+                            ),
+                            [str(item) for item in body.payload.get("skill_ids", [])],
+                        ),
+                    }
+                    if body.action == "create_novel"
+                    else body.payload
+                ),
             },
         )
         return _accepted(job)
@@ -375,13 +505,17 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     @app.get("/api/v1/sessions/{session_id}/action-proposals")
     async def list_action_proposals(session_id: str) -> dict[str, Any]:
         sessions.load_session(session_id)
-        return {"proposals": [_action_proposal_data(item) for item in action_proposals.list_pending(session_id=session_id)]}
+        return {"proposals": [dispatcher.data(item) for item in action_proposals.list_pending(session_id=session_id)]}
 
     @app.post("/api/v1/action-proposals/{proposal_id}/confirm", status_code=202)
     async def confirm_action_proposal(proposal_id: str) -> dict[str, Any]:
         try:
             proposal = await dispatcher.confirm(proposal_id)
-            workspace.sessions.append_event(proposal.session_id, event_type="action_proposal_confirmed", payload=_action_proposal_data(proposal))
+            workspace.sessions.append_event(
+                proposal.session_id,
+                event_type="action_proposal_confirmed",
+                payload=dispatcher.data(proposal),
+            )
             if not proposal.job_id:
                 raise RuntimeError("确认操作未创建 Job")
             return _accepted(jobs.get(proposal.job_id))
@@ -393,7 +527,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     @app.post("/api/v1/action-proposals/{proposal_id}/cancel")
     async def cancel_action_proposal(proposal_id: str) -> dict[str, Any]:
         try:
-            return {"proposal": _action_proposal_data(dispatcher.cancel(proposal_id))}
+            return {"proposal": dispatcher.data(dispatcher.cancel(proposal_id))}
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -492,10 +626,17 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     @app.post("/api/v1/books", status_code=202)
     async def create_book(body: CreateBookBody) -> dict[str, Any]:
         request_data = body.model_dump()
+        skill_ids = request_data.pop("skill_ids")
         # 创建任务也按稳定 book_id 参与单活跃约束，避免重复简报并发建书。
         from ..novel_creation.models import CreateNovelRequest
         book_id = CreateNovelPipeline.build_book_id(CreateNovelRequest(**request_data))
-        job = await supervisor.submit(job_type="create_book", book_id=book_id, payload={"request": request_data})
+        job = await supervisor.submit(job_type="create_book", book_id=book_id, payload={
+            "request": request_data,
+            "creative_task_context": activate_task(
+                json.dumps(request_data, ensure_ascii=False),
+                skill_ids,
+            ),
+        })
         return _accepted(job)
 
     @app.delete("/api/v1/books/{book_id}")
@@ -566,7 +707,13 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
             existing = simulations.find_by_client_request(simulation_id=simulation_id, client_request_id=body.client_request_id)
             if existing is not None and existing.job_id:
                 return _accepted(jobs.get(existing.job_id))
-            job = await supervisor.submit(job_type="roleplay_turn", book_id=simulation.book_id, payload={"simulation_id": simulation_id, **body.model_dump()})
+            payload = body.model_dump()
+            skill_ids = payload.pop("skill_ids")
+            job = await supervisor.submit(job_type="roleplay_turn", book_id=simulation.book_id, payload={
+                "simulation_id": simulation_id,
+                **payload,
+                "creative_task_context": activate_task(body.content, skill_ids),
+            })
             return _accepted(job)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -584,7 +731,17 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
             existing = simulations.find_by_client_request(simulation_id=simulation_id, client_request_id=body.client_request_id)
             if existing is not None and existing.job_id:
                 return _accepted(jobs.get(existing.job_id))
-            job = await supervisor.submit(job_type="roleplay_turn", book_id=simulation.book_id, payload={"simulation_id": simulation_id, "client_request_id": body.client_request_id, "expected_version": body.expected_version, "input_type": "observer_continue", "content": body.content or "继续推演"})
+            job = await supervisor.submit(job_type="roleplay_turn", book_id=simulation.book_id, payload={
+                "simulation_id": simulation_id,
+                "client_request_id": body.client_request_id,
+                "expected_version": body.expected_version,
+                "input_type": "observer_continue",
+                "content": body.content or "继续推演",
+                "creative_task_context": activate_task(
+                    body.content or "继续推演",
+                    body.skill_ids,
+                ),
+            })
             return _accepted(job)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -728,7 +885,13 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
 
     @app.post("/api/v1/books/{book_id}/plans", status_code=202)
     async def prepare_plan(book_id: str, body: InstructionBody) -> dict[str, Any]:
-        return _accepted(await supervisor.submit(job_type="prepare_chapter", book_id=book_id, payload=body.model_dump()))
+        payload = body.model_dump()
+        skill_ids = payload.pop("skill_ids")
+        payload["creative_task_context"] = activate_task(
+            body.user_instruction or "规划下一章",
+            skill_ids,
+        )
+        return _accepted(await supervisor.submit(job_type="prepare_chapter", book_id=book_id, payload=payload))
 
     @app.get("/api/v1/books/{book_id}/proposals/{proposal_id}")
     async def get_proposal(book_id: str, proposal_id: str) -> dict[str, Any]:
@@ -748,11 +911,26 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
 
     @app.post("/api/v1/books/{book_id}/chapters/batch", status_code=202)
     async def write_batch(book_id: str, body: BatchBody) -> dict[str, Any]:
-        return _accepted(await supervisor.submit(job_type="write_batch", book_id=book_id, payload=body.model_dump()))
+        payload = body.model_dump()
+        skill_ids = payload.pop("skill_ids")
+        payload["creative_task_context"] = activate_task(
+            body.user_instruction or f"连续创作 {body.count} 章",
+            skill_ids,
+        )
+        return _accepted(await supervisor.submit(job_type="write_batch", book_id=book_id, payload=payload))
 
     @app.post("/api/v1/books/{book_id}/chapters/{chapter_number}/rewrite", status_code=202)
     async def rewrite(book_id: str, chapter_number: int, body: InstructionBody) -> dict[str, Any]:
-        return _accepted(await supervisor.submit(job_type="rewrite_chapter", book_id=book_id, payload={"chapter_number": chapter_number, **body.model_dump()}))
+        payload = body.model_dump()
+        skill_ids = payload.pop("skill_ids")
+        payload.update({
+            "chapter_number": chapter_number,
+            "creative_task_context": activate_task(
+                body.user_instruction or f"重写第 {chapter_number} 章",
+                skill_ids,
+            ),
+        })
+        return _accepted(await supervisor.submit(job_type="rewrite_chapter", book_id=book_id, payload=payload))
 
     @app.get("/api/v1/jobs/{job_id}")
     async def get_job(job_id: str) -> dict[str, Any]:
@@ -840,17 +1018,6 @@ def _job_data(job: Any) -> dict[str, Any]:
 
 def _accepted(job: Any) -> dict[str, Any]:
     return {"job_id": job.job_id, "status": job.status, "events_url": f"/api/v1/jobs/{job.job_id}/events"}
-
-
-def _action_proposal_data(proposal: Any) -> dict[str, Any]:
-    return {
-        "action_proposal_id": proposal.proposal_id, "session_id": proposal.session_id,
-        "book_id": proposal.book_id, "action_type": proposal.action_type,
-        "payload": dict(proposal.payload), "summary": proposal.summary, "status": proposal.status,
-        "job_id": proposal.job_id, "created_at": proposal.created_at,
-        "confirmed_at": proposal.confirmed_at, "expires_at": proposal.expires_at,
-        "updated_at": proposal.updated_at,
-    }
 
 
 def _creative_control_data(control: Any) -> dict[str, Any]:

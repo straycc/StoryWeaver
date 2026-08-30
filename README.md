@@ -22,7 +22,7 @@ React Studio Chat / 作品工作台
               │ REST + SSE
               ▼
 FastAPI Action Surface
-  Main Agent ──► Query Reply / ActionProposal
+  Main Agent ──► Capability Manifest ──► Query / Creative / Workflow
               │
               ▼
 ActionDispatcher ──► Persistent Job ──► JobSupervisor
@@ -152,7 +152,9 @@ Studio Chat 支持自然语言和快捷按钮：
 
 - 查询作品进度、已完成章节、指定章节、待确认计划、审稿结果、人物与伏笔：直接返回结果，不创建 Job。
 - 生成或调整计划：直接创建候选计划 Job，不修改正史。
-- 确认写作与重写：先创建 `ActionProposal`，用户确认后才创建 Job。
+- 章节计划按 `pending → approved → confirmed` 推进：批准计划不会自动写作，之后可单独按计划生成正文。
+- 创建作品、按计划写作、批量与重写等高影响动作：先创建 `ActionProposal`，用户确认后才创建 Job。
+- 借助 Skill 的创作讨论由 `creative_discussion` 专业 Worker 完成，只返回建议，不修改正史或计划。
 - 快捷按钮已有明确意图，直接进入 Dispatcher，不经 Main Agent。
 
 示例：
@@ -165,13 +167,33 @@ Studio Chat 支持自然语言和快捷按钮：
 
 ## Skill
 
-项目 Skill 位于 `skills/<skill-id>/SKILL.md`：
+首版本地 Skill 只从仓库根目录 `skills/builtin/<skill-id>/SKILL.md` 发现：
 
 ```text
 skills/
-└── wuxia-serial-writing/
-    └── SKILL.md
+├── builtin/
+│   ├── chapter-planning/
+│   ├── fiction-quality-review/
+│   ├── natural-fiction-prose-zh/
+│   ├── novel-conception/
+│   ├── story-continuity-review/
+│   └── wuxia-serial-writing/
+└── vendor/
+    └── story-skills/          # 上游参考副本，不参与 Discover
 ```
+
+Backend 启动时只扫描 metadata；用户提交创作任务后，Runtime 按
+`Discover → Activate → Resolve → Materialize` 处理 Skill。Activate 会冻结完整
+`SKILL.md` 与内容哈希到 `CreativeTaskContext`，后续 Pipeline 不读取磁盘。
+Job 创建后以 Job Snapshot 为准；创建章节 Proposal 后，该 Proposal Snapshot 是
+修订、确认和写作的唯一 Skill 输入来源。
+
+Skill 默认只对本次用户提交的 `CreativeTask` 生效；前端提交成功后清空选择。若该
+任务产生 Job 或 Proposal，冻结 Snapshot 会继续传递给同一长任务的所有内部节点、
+确认步骤和重试，不会要求 Pipeline 再次读取或选择 Skill。
+未选择 Skill 时不会从 Registry 自动激活；一旦 UI 显式选择，Main Agent 的普通
+创作回复不得忽略它，而会确定性转交 `creative_discussion`。Pipeline 内的 Resolver
+只能在已冻结集合中决定本次 invocation 全文加载哪些 Skill。
 
 输入框键入 `/` 可选择 Skill，或直接使用：
 
@@ -180,7 +202,13 @@ skills/
 /skill wuxia-serial-writing 下一章加强江湖压迫感与人物试探，但不要揭露反派身份。
 ```
 
-Skill 仅影响候选计划；计划卡会显示实际注入的 Skill ID 与内容哈希前缀，确认写作后沿用该冻结版本。
+输入框只保存用户原始要求，Skill 通过结构化 `skill_ids` 提交。每次实际模型调用会
+依据本次语义目标独立 Resolve：所有已激活 Skill 都暴露 metadata，相关 Skill 的
+完整正文按预算原子装入，不会截断半个 `SKILL.md`。Canon、业务硬约束、用户要求和
+Confirmed Plan 的优先级始终高于 Skill。计划卡会显示冻结的 Skill ID 与内容哈希前缀。
+
+V1 不读取或执行 `references/`、`scripts/`、`assets/`；因此内置 `SKILL.md` 必须独立
+可执行。新增或修改内置 Skill 后需要重启 Backend，本版不提供 refresh、上传或 watcher。
 
 ## API 概览
 

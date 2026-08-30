@@ -75,7 +75,7 @@ class ActionProposalRepository:
         pending = self._pending_for_book(book_id)
         expired: list[ActionProposal] = []
         for proposal in pending:
-            if proposal.action_type != "confirm_and_write_chapter":
+            if proposal.action_type not in {"confirm_and_write_chapter", "write_from_plan"}:
                 continue
             if str(proposal.payload.get("proposal_id") or "") == chapter_plan_proposal_id:
                 expired.append(self.expire(proposal.proposal_id))

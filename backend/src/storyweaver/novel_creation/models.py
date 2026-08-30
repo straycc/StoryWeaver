@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 
+from ..skills.models import CreativeTaskContext
+
 
 HOOK_STATUSES = frozenset({"open", "progressing", "resolved", "deferred"})
 CHAPTER_STATUSES = frozenset({"ready_for_review", "review_warning"})
@@ -311,7 +313,7 @@ class ChapterPlan:
 
 
 CHAPTER_PLAN_PROPOSAL_STATUSES = frozenset(
-    {"pending", "confirmed", "cancelled", "expired"}
+    {"pending", "approved", "confirmed", "cancelled", "expired"}
 )
 
 
@@ -333,6 +335,7 @@ class ChapterPlanProposal:
     selected_memory_descriptions: tuple[str, ...]
     created_at: str
     updated_at: str
+    creative_task_context: CreativeTaskContext | None = None
 
     def __post_init__(self) -> None:
         for field_name in (

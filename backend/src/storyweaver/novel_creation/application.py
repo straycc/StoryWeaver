@@ -13,6 +13,12 @@ from agents import ModelSettings
 
 from ..context import AgentContextPolicy, default_agent_context_policies
 from ..llm.errors import ConfigurationError
+from ..skills import (
+    CreativeTaskContext,
+    SkillMaterializer,
+    SkillResolver,
+    build_model_skill_selector,
+)
 from ..observability import ModelFailureDiagnosticWriter
 from ..llm import OpenAICompatibleProviderSettings, WorkerSettings
 from .agents import (
@@ -20,13 +26,11 @@ from .agents import (
     ChapterAnalyzerAgent,
     PlannerAgent,
     ReviewerAgent,
-    ReviserAgent,
-    WriterAgent,
+    WritingAgent,
 )
 from .agents.architect import ARCHITECT_SYSTEM_PROMPT
 from .agents.chapter_analyzer import CHAPTER_ANALYZER_SYSTEM_PROMPT
-from .agents.reviser import REVISER_SYSTEM_PROMPT
-from .agents.writer import WRITER_SYSTEM_PROMPT
+from .agents.writing import REVISER_SYSTEM_PROMPT, WRITER_SYSTEM_PROMPT
 from .agents.planner import PLANNER_SYSTEM_PROMPT
 from .agents.reviewer import REVIEWER_SYSTEM_PROMPT
 from .context_builder import ChapterContextBuilder
@@ -379,8 +383,12 @@ class NovelService:
         self._write_pipeline = write_pipeline
         self._execution_locks = execution_locks or BookExecutionLockManager()
 
-    async def create_project(self, request: CreateNovelRequest) -> NovelProject:
-        return await self._create_pipeline.run(request)
+    async def create_project(
+        self,
+        request: CreateNovelRequest,
+        creative_task: CreativeTaskContext | None = None,
+    ) -> NovelProject:
+        return await self._create_pipeline.run(request, creative_task)
 
     async def write_next_chapter(
         self,
@@ -388,12 +396,14 @@ class NovelService:
         book_id: str,
         user_instruction: str | None = None,
         batch_context: BatchPlanningContext | None = None,
+        creative_task: CreativeTaskContext | None = None,
     ) -> ChapterResult:
         with self._execution_locks.acquire(book_id):
             return await self._write_pipeline.run(
                 book_id=book_id,
                 user_instruction=user_instruction,
                 batch_context=batch_context,
+                creative_task=creative_task,
             )
 
     async def prepare_next_chapter(
@@ -402,11 +412,13 @@ class NovelService:
         book_id: str,
         user_instruction: str | None = None,
         batch_context: BatchPlanningContext | None = None,
+        creative_task: CreativeTaskContext | None = None,
     ) -> ChapterPlanProposal:
         proposal = await self._write_pipeline.prepare(
             book_id=book_id,
             user_instruction=user_instruction,
             batch_context=batch_context,
+            creative_task=creative_task,
         )
         self.store.save_plan_proposal(proposal)
         return proposal
@@ -417,6 +429,7 @@ class NovelService:
         book_id: str,
         chapter_number: int,
         user_instruction: str | None = None,
+        creative_task: CreativeTaskContext | None = None,
     ) -> tuple[ChapterRewriteRecord, ChapterPlanProposal]:
         """安全回退到指定章节之前，并生成新的候选章节计划。"""
 
@@ -426,6 +439,7 @@ class NovelService:
                 proposal = await self._write_pipeline.prepare(
                     book_id=book_id,
                     user_instruction=user_instruction,
+                    creative_task=creative_task,
                 )
                 if proposal.chapter_number != chapter_number:
                     raise ValueError(
@@ -459,8 +473,67 @@ class NovelService:
         quality_gate: ReviewQualityGate | None = None,
     ) -> ChapterResult:
         with self._execution_locks.acquire(book_id):
-            # 必须在获得作品锁后重新加载基线，防止两个确认请求同时通过预检。
+            # 旧入口保持“批准并写作”的兼容语义，内部仍经过 approved 状态。
+            proposal = self._load_proposal_with_status(
+                book_id,
+                proposal_id,
+                allowed_statuses=frozenset({"pending", "approved"}),
+            )
+            approved = proposal
+            if proposal.status == "pending":
+                approved = replace(
+                    proposal,
+                    status="approved",
+                    updated_at=datetime.now(timezone.utc).isoformat(),
+                )
+                self.store.save_plan_proposal(approved)
+            result = await self._write_pipeline.execute(
+                approved,
+                quality_gate=quality_gate,
+            )
+            if result.committed:
+                self.store.save_plan_proposal(
+                    replace(
+                        approved,
+                        status="confirmed",
+                        updated_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                )
+            return result
+
+    def approve_chapter_plan(
+        self,
+        *,
+        book_id: str,
+        proposal_id: str,
+    ) -> ChapterPlanProposal:
+        """批准候选计划，但不启动正文生成。"""
+
+        with self._execution_locks.acquire(book_id):
             proposal = self._load_pending_proposal(book_id, proposal_id)
+            approved = replace(
+                proposal,
+                status="approved",
+                updated_at=datetime.now(timezone.utc).isoformat(),
+            )
+            self.store.save_plan_proposal(approved)
+            return approved
+
+    async def write_from_plan(
+        self,
+        *,
+        book_id: str,
+        proposal_id: str,
+        quality_gate: ReviewQualityGate | None = None,
+    ) -> ChapterResult:
+        """只执行已经批准的计划，并在提交前重新校验作品基线。"""
+
+        with self._execution_locks.acquire(book_id):
+            proposal = self._load_proposal_with_status(
+                book_id,
+                proposal_id,
+                allowed_statuses=frozenset({"approved"}),
+            )
             result = await self._write_pipeline.execute(
                 proposal,
                 quality_gate=quality_gate,
@@ -481,7 +554,11 @@ class NovelService:
         book_id: str,
         proposal_id: str,
     ) -> ChapterPlanProposal:
-        proposal = self._load_pending_proposal(book_id, proposal_id)
+        proposal = self._load_proposal_with_status(
+            book_id,
+            proposal_id,
+            allowed_statuses=frozenset({"pending", "approved"}),
+        )
         cancelled = replace(
             proposal,
             status="cancelled",
@@ -503,8 +580,21 @@ class NovelService:
         book_id: str,
         proposal_id: str,
     ) -> ChapterPlanProposal:
+        return self._load_proposal_with_status(
+            book_id,
+            proposal_id,
+            allowed_statuses=frozenset({"pending"}),
+        )
+
+    def _load_proposal_with_status(
+        self,
+        book_id: str,
+        proposal_id: str,
+        *,
+        allowed_statuses: frozenset[str],
+    ) -> ChapterPlanProposal:
         proposal = self.store.load_plan_proposal(book_id, proposal_id)
-        if proposal.status != "pending":
+        if proposal.status not in allowed_statuses:
             raise ValueError(f"候选计划状态为 {proposal.status}，不能继续操作")
         state = self.store.load_state(book_id)
         if state.last_committed_chapter != proposal.base_chapter_number:
@@ -523,6 +613,7 @@ class NovelService:
         book_id: str,
         count: int,
         user_instruction: str | None = None,
+        creative_task: CreativeTaskContext | None = None,
         on_chapter_committed: Callable[[ChapterResult], None] | None = None,
     ) -> tuple[ChapterResult, ...]:
         if count <= 0:
@@ -542,6 +633,7 @@ class NovelService:
             result = await self.write_next_chapter(
                 book_id=book_id,
                 user_instruction=user_instruction,
+                creative_task=creative_task,
             )
             results.append(result)
             if result.committed and on_chapter_committed is not None:
@@ -691,6 +783,14 @@ def build_novel_service(
         api_key=settings.api_key,
     ).create_provider()
     sdk_model = sdk_provider.get_model(settings.model)
+    skill_materializer = SkillMaterializer(
+        SkillResolver(
+            selector=build_model_skill_selector(
+                model=sdk_model,
+                timeout_seconds=settings.timeout_seconds,
+            )
+        )
+    )
 
     def sdk_worker_settings(
         *,
@@ -728,6 +828,7 @@ def build_novel_service(
             temperature=settings.architect_temperature,
         ),
         event_sinks=hooks,
+        skill_materializer=skill_materializer,
     )
     planner = PlannerAgent(
         store=store,
@@ -739,9 +840,10 @@ def build_novel_service(
         ),
         event_sinks=hooks,
         context_policy=context_policies["planner"],
+        skill_materializer=skill_materializer,
     )
-    writer = WriterAgent(
-        sdk_settings=sdk_worker_settings(
+    writing = WritingAgent(
+        writer_settings=sdk_worker_settings(
             worker_id="novel-writer",
             name="小说正文作者",
             instructions=WRITER_SYSTEM_PROMPT,
@@ -749,7 +851,17 @@ def build_novel_service(
             output_token_limit=settings.writer_output_token_limit,
         ),
         event_sinks=hooks,
-        context_policy=context_policies["writer"],
+        writer_context_policy=context_policies["writer"],
+        reviser_settings=sdk_worker_settings(
+            worker_id="novel-reviser",
+            name="章节修订者",
+            instructions=REVISER_SYSTEM_PROMPT,
+            temperature=settings.reviser_temperature,
+            output_token_limit=settings.reviser_output_token_limit,
+        ),
+        reviser_context_policy=context_policies["reviser"],
+        context_snapshot_sink=context_snapshot_sink,
+        skill_materializer=skill_materializer,
     )
     reviewer = ReviewerAgent(
         store=store,
@@ -763,18 +875,7 @@ def build_novel_service(
         event_sinks=hooks,
         context_policy=context_policies["reviewer"],
         verification_context_policy=context_policies["reviewer_verification"],
-    )
-    reviser = ReviserAgent(
-        sdk_settings=sdk_worker_settings(
-            worker_id="novel-reviser",
-            name="章节修订者",
-            instructions=REVISER_SYSTEM_PROMPT,
-            temperature=settings.reviser_temperature,
-            output_token_limit=settings.reviser_output_token_limit,
-        ),
-        event_sinks=hooks,
-        context_policy=context_policies["reviser"],
-        context_snapshot_sink=context_snapshot_sink,
+        skill_materializer=skill_materializer,
     )
     analyzer = ChapterAnalyzerAgent(
         sdk_settings=sdk_worker_settings(
@@ -787,6 +888,7 @@ def build_novel_service(
         event_sinks=hooks,
         context_policy=context_policies["analyzer"],
         context_snapshot_sink=context_snapshot_sink,
+        skill_materializer=skill_materializer,
     )
 
     return NovelService(
@@ -802,9 +904,8 @@ def build_novel_service(
                 context_policy=context_policies["writer"],
                 creative_control_provider=creative_control_provider if callable(creative_control_provider) else None,
             ),
-            writer=writer,
+            writing=writing,
             reviewer=reviewer,
-            reviser=reviser,
             analyzer=analyzer,
             creative_control_provider=creative_control_provider if callable(creative_control_provider) else None,
             context_snapshot_sink=context_snapshot_sink,

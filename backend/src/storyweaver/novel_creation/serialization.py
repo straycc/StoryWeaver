@@ -35,6 +35,7 @@ from .models import (
     StoryStateDelta,
     persisted_field_names,
 )
+from ..skills.models import creative_task_from_data
 
 
 T = TypeVar("T")
@@ -145,7 +146,12 @@ def decode_chapter_plan_proposal(data: object) -> ChapterPlanProposal:
             "selected_memory_ids",
             "selected_memory_descriptions",
         ),
-        nested_fields={"plan": decode_chapter_plan},
+        nested_fields={
+            "plan": decode_chapter_plan,
+            "creative_task_context": lambda value: (
+                None if value is None else creative_task_from_data(value)
+            ),
+        },
     )
 
 

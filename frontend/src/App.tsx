@@ -6,6 +6,7 @@ import {
   type Json,
   type ProjectSummary,
   type Session,
+  type SkillOption,
   type TimelineEvent,
 } from "./api";
 import { SimulationWorkspace } from "./features/simulation/SimulationWorkspace";
@@ -37,6 +38,8 @@ const obj = (value: unknown): Json =>
 const text = (value: unknown) =>
   typeof value === "string" ? value : value == null ? "" : String(value);
 const list = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+const skillName = (skill: SkillOption | undefined, fallback: string) =>
+  skill?.display_name || skill?.name || fallback;
 
 /** 侧栏保持轻量，不额外引入图标库。 */
 function NavIcon({ name }: { name: "new" | "write" | "batch" | "theater" | "memory" | "control" }) {
@@ -57,7 +60,7 @@ export default function App() {
     sessions: any[];
     projects: ProjectSummary[];
     actions: Record<string, string>;
-    skills?: Array<{ id: string; name: string; description: string }>;
+    skills?: SkillOption[];
   } | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
@@ -89,6 +92,7 @@ export default function App() {
   const [input, setInput] = useState("");
   const [skillMenuOpen, setSkillMenuOpen] = useState(false);
   const [skillMenuIndex, setSkillMenuIndex] = useState(0);
+  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const eventSources = useRef<Map<string, EventSource>>(new Map());
 
@@ -302,12 +306,25 @@ export default function App() {
       if (!normalized && action === "chat") return;
       setBusy(true);
       setInput("");
+      const creativePayload =
+        action === "chat" ||
+        ["create_novel", "write_next", "rewrite_chapter", "start_chapter_batch"].includes(action)
+          ? {
+              ...payload,
+              skill_ids: Array.from(
+                new Set([
+                  ...list(payload.skill_ids).map((item) => text(item)),
+                  ...selectedSkillIds,
+                ]),
+              ),
+            }
+          : payload;
       try {
         const result = await api.send(session.session_id, {
           content: normalized,
           action,
           book_id: session.book_id,
-          payload,
+          payload: creativePayload,
         });
         // HTTP 只确认 Job 已入队。先在本地补一对时间线事件，让用户不必等
         // Planner 完整结束才看到“写下一章”及其实时模型/工具进度。
@@ -347,6 +364,7 @@ export default function App() {
           ]),
         );
         watchJob(result.job_id, session.session_id);
+        setSelectedSkillIds([]);
         if (action !== "revise_chapter_plan") setActiveAction("chat");
       } catch (error) {
         setBusy(false);
@@ -360,6 +378,7 @@ export default function App() {
       input,
       notify,
       session,
+      selectedSkillIds,
       timeline,
       watchJob,
     ],
@@ -459,7 +478,10 @@ export default function App() {
     [bootstrap?.skills, input],
   );
   const selectSkill = (skillId: string) => {
-    setInput(`/skill ${skillId} `);
+    setSelectedSkillIds((old) =>
+      old.includes(skillId) ? old : [...old, skillId],
+    );
+    if (/^\/[^\s]*$/.test(input.trim())) setInput("");
     setSkillMenuOpen(false);
     setSkillMenuIndex(0);
     window.setTimeout(
@@ -711,10 +733,10 @@ export default function App() {
                   event={event}
                   actions={bootstrap?.actions || {}}
                   progress={jobEvents[text(event.payload.run_id)] || []}
-                  onConfirm={(id) =>
+                  onConfirm={(id, status) =>
                     void send(
-                      "confirm_chapter_plan",
-                      "确认候选计划并生成本章",
+                      status === "approved" ? "write_from_plan" : "approve_chapter_plan",
+                      status === "approved" ? "根据已批准计划生成本章" : "批准候选章节计划，暂不生成正文",
                       { proposal_id: id },
                     )
                   }
@@ -728,7 +750,7 @@ export default function App() {
                     setInput("");
                     (window as any).__proposalId = id;
                   }}
-                  onConfirmAction={(id) =>
+                  onConfirmAction={(id, actionType) =>
                     session &&
                     void api
                       .confirmActionProposal(id)
@@ -751,8 +773,8 @@ export default function App() {
                               payload: {
                                 run_id: item.job_id,
                                 root_run_id: item.job_id,
-                                action: "confirm_chapter_plan",
-                                label: "确认候选计划并生成本章",
+                                action: actionType,
+                                label: displayActionLabel(actionType, "", bootstrap?.actions || {}),
                               },
                             },
                           ]),
@@ -787,6 +809,29 @@ export default function App() {
               </div>
             )}
             <div className="composer-command-wrap">
+              {selectedSkillIds.length > 0 && (
+                <div className="selected-skill-row" aria-label="已选择创作 Skill">
+                  {selectedSkillIds.map((skillId) => (
+                    <span key={skillId}>
+                      {skillName(
+                        bootstrap?.skills?.find((item) => item.id === skillId),
+                        skillId,
+                      )}
+                      <button
+                        type="button"
+                        aria-label={`移除 ${skillId}`}
+                        onClick={() =>
+                          setSelectedSkillIds((old) =>
+                            old.filter((item) => item !== skillId),
+                          )
+                        }
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
               {skillMenuOpen && (
                 <div
                   className="skill-command-menu"
@@ -806,8 +851,19 @@ export default function App() {
                           selectSkill(skill.id);
                         }}
                       >
-                        <strong>/{skill.id}</strong>
-                        <span>{skill.description}</span>
+                        <span className="skill-command-title">
+                          <strong>{skillName(skill, skill.id)}</strong>
+                          <code>/{skill.id}</code>
+                        </span>
+                        <span className="skill-command-summary">
+                          {skill.short_description || skill.description}
+                        </span>
+                        {index === skillMenuIndex &&
+                          skill.description !== skill.short_description && (
+                            <span className="skill-command-detail">
+                              {skill.description}
+                            </span>
+                          )}
                       </button>
                     ))
                   ) : (
@@ -946,12 +1002,14 @@ export default function App() {
         >
           <SimulationWorkspace
             bookId={currentBookId}
+            skills={bootstrap?.skills || []}
             onError={(message) => notify(message, true)}
           />
         </section>
       </main>
       {createOpen && (
         <CreateDialog
+          skills={bootstrap?.skills || []}
           onClose={() => setCreateOpen(false)}
           onSubmit={(payload: Json) => {
             setCreateOpen(false);
@@ -1090,10 +1148,10 @@ function TimelineCard({
   event: TimelineEvent;
   actions: Record<string, string>;
   progress: any[];
-  onConfirm: (id: string) => void;
+  onConfirm: (id: string, status: string) => void;
   onCancel: (id: string) => void;
   onRevise: (id: string) => void;
-  onConfirmAction: (id: string) => void;
+  onConfirmAction: (id: string, actionType: string) => void;
   onCancelAction: (id: string) => void;
   onRetry: (id: string) => void;
   onTrace: () => void;
@@ -1102,6 +1160,9 @@ function TimelineCard({
   if (event.event_type === "message_added") {
     const metadata = obj(payload.metadata);
     const chapterResult = obj(metadata.chapter_result);
+    const skillResolution = obj(obj(metadata.context_trace).skill_resolution);
+    const materializedSkills = list(skillResolution.materialized_ids).map(text);
+    const metadataOnlySkills = list(skillResolution.metadata_only_ids).map(text);
     return (
       <article
         className={
@@ -1113,6 +1174,20 @@ function TimelineCard({
             <ChapterCompletionCard result={chapterResult} />
           ) : (
             <Text value={text(payload.content)} />
+          )}
+          {payload.role !== "user" && materializedSkills.length > 0 && (
+            <div className="plan-skill-row">
+              {materializedSkills.map((skillId) => (
+                <span key={skillId}>已完整加载 Skill：{skillId}</span>
+              ))}
+            </div>
+          )}
+          {payload.role !== "user" && metadataOnlySkills.length > 0 && (
+            <div className="plan-skill-row">
+              {metadataOnlySkills.map((skillId) => (
+                <span key={skillId}>仅加载 Skill metadata：{skillId}</span>
+              ))}
+            </div>
           )}
           {payload.role !== "user" &&
             Boolean(metadata.context_trace) && (
@@ -1249,9 +1324,13 @@ function displayActionLabel(action: string, label: string, actions: Record<strin
     cancel_chapter_plan: "取消候选计划",
     confirm_plan: "生成本章",
     confirm_chapter_plan: "生成本章",
+    approve_plan: "批准章节计划",
+    approve_chapter_plan: "批准章节计划",
+    write_from_plan: "按计划生成本章",
     rewrite_chapter: "重写章节",
     write_batch: "连续创作",
     start_chapter_batch: "连续创作",
+    create_novel: "创建小说",
   };
   return actions[action] || fallback[action] || (label && !label.includes("_") ? label : "创作任务");
 }
@@ -1304,10 +1383,12 @@ function ActionProposalCard({
   onCancel,
 }: {
   proposal: ActionProposal;
-  onConfirm: (id: string) => void;
+  onConfirm: (id: string, actionType: string) => void;
   onCancel: (id: string) => void;
 }) {
   const id = text(proposal.action_proposal_id);
+  const actionType = text(proposal.action_type);
+  const payload = obj(proposal.payload);
   return (
     <article className="chapter-plan-card pending action-proposal-card">
       <header>
@@ -1317,8 +1398,18 @@ function ActionProposalCard({
         <span className="plan-status">等待确认</span>
       </header>
       <p>{text(proposal.summary)}</p>
+      {actionType === "create_novel" && (
+        <div className="plan-grid">
+          <section><span>题材</span><p>{text(payload.genre)}</p></section>
+          <section><span>主角</span><p>{text(payload.protagonist)}</p></section>
+          <section className="plan-wide"><span>故事前提</span><p>{text(payload.premise)}</p></section>
+          <section className="plan-wide"><span>核心冲突</span><p>{text(payload.central_conflict)}</p></section>
+          <section><span>基调</span><p>{text(payload.tone)}</p></section>
+          <section><span>规模</span><p>{text(payload.target_chapters)} 章 · 每章约 {text(payload.chapter_target_words)} 字</p></section>
+        </div>
+      )}
       <div className="plan-actions">
-        <button className="primary-button" onClick={() => onConfirm(id)}>
+        <button className="primary-button" onClick={() => onConfirm(id, actionType)}>
           确认并执行
         </button>
         <button className="plan-cancel" onClick={() => onCancel(id)}>
@@ -1511,6 +1602,7 @@ function describeToolAction(toolName: string, argumentsValue: Json): string {
 }
 function PlanCard({ plan, onConfirm, onCancel, onRevise }: any) {
   const pending = plan.status === "pending";
+  const approved = plan.status === "approved";
   const confirmed = plan.status === "confirmed";
   const appliedSkills = list(plan.applied_skills);
   const row = (label: string, value: any) => (
@@ -1536,7 +1628,7 @@ function PlanCard({ plan, onConfirm, onCancel, onRevise }: any) {
       <header>
         <div>
           <h3>
-            第 {plan.chapter_number} 章{pending ? "候选计划" : confirmed ? "已确认计划" : "已执行计划"}
+            第 {plan.chapter_number} 章{pending ? "候选计划" : approved ? "已批准计划" : confirmed ? "已确认计划" : "已执行计划"}
           </h3>
           {appliedSkills.length > 0 && (
             <div className="plan-skill-row">
@@ -1554,6 +1646,8 @@ function PlanCard({ plan, onConfirm, onCancel, onRevise }: any) {
         <span className="plan-status">
           {pending
             ? "等待确认"
+            : approved
+              ? "已批准，尚未写作"
             : confirmed
               ? "已确认"
               : text(plan.status)}
@@ -1584,20 +1678,20 @@ function PlanCard({ plan, onConfirm, onCancel, onRevise }: any) {
       <footer>
         <span>目标约 {plan.target_words || 0} 字</span>
       </footer>
-      {pending && (
+      {(pending || approved) && (
         <div className="plan-actions">
           <button
             className="primary-button"
-            onClick={() => onConfirm(plan.proposal_id)}
+            onClick={() => onConfirm(plan.proposal_id, plan.status)}
           >
-            确认并开始写作
+            {approved ? "按此计划开始写作" : "批准计划"}
           </button>
-          <button
+          {pending && <button
             className="secondary-button"
             onClick={() => onRevise(plan.proposal_id)}
           >
             调整计划
-          </button>
+          </button>}
           <button
             className="plan-cancel"
             onClick={() => onCancel(plan.proposal_id)}
@@ -1804,11 +1898,14 @@ function ChapterReader({ chapter, onClose, onRewrite }: any) {
 function CreateDialog({
   onClose,
   onSubmit,
+  skills,
 }: {
   onClose: () => void;
   onSubmit: (payload: Json) => void;
+  skills: SkillOption[];
 }) {
   const [data, setData] = useState(DEFAULT_BOOK);
+  const [skillIds, setSkillIds] = useState<string[]>([]);
   const change = (key: string, value: unknown) =>
     setData((old) => ({ ...old, [key]: value }));
   return (
@@ -1816,10 +1913,57 @@ function CreateDialog({
       <form
         onSubmit={(event) => {
           event.preventDefault();
-          onSubmit(data);
+          onSubmit({ ...data, skill_ids: skillIds });
         }}
       >
         <DialogHead kicker="新建故事" title="创建小说" onClose={onClose} />
+        {skills.length > 0 && (
+          <div className="create-skill-fields">
+            <div className="create-skill-select">
+              <select
+                aria-label="添加创作 Skill"
+                value=""
+                disabled={skillIds.length >= 16 || skillIds.length === skills.length}
+                onChange={(event) => {
+                  const id = event.target.value;
+                  if (id && !skillIds.includes(id))
+                    setSkillIds((old) => [...old, id]);
+                }}
+              >
+                <option value="">
+                  {skillIds.length === skills.length
+                    ? "已添加全部可用 Skill"
+                    : "添加创作 Skill（可选）"}
+                </option>
+                {skills
+                  .filter((item) => !skillIds.includes(item.id))
+                  .map((item) => (
+                    <option value={item.id} key={item.id}>
+                      {skillName(item, item.id)}
+                    </option>
+                  ))}
+              </select>
+            </div>
+            {skillIds.length > 0 && (
+              <div className="selected-skill-row create-selected-skills" aria-label="已选择的创作 Skill">
+                {skillIds.map((id) => (
+                  <span key={id}>
+                    {skillName(skills.find((item) => item.id === id), id)}
+                    <button
+                      type="button"
+                      aria-label={`移除 ${skillName(skills.find((item) => item.id === id), id)}`}
+                      onClick={() =>
+                        setSkillIds((old) => old.filter((item) => item !== id))
+                      }
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         <div className="form-grid">
           <label>
             小说标题
@@ -2214,8 +2358,23 @@ function TraceDrawer({ trace, onClose }: any) {
     .find(Boolean);
   const estimated = Number(trace?.estimated_tokens ?? notedTokens?.[1] ?? 0);
   const budget = Number(trace?.budget ?? notedTokens?.[2] ?? 0);
+  const skillResolution = obj(trace?.skill_resolution);
+  const activatedSkills = list(skillResolution.activated_skills).map((item) => {
+    const skill = obj(item);
+    const hash = text(skill.content_hash);
+    return `${text(skill.skill_id)}${hash ? ` · ${hash.slice(0, 12)}` : ""}`;
+  });
   const rows = [
     ["预算", `${estimated}/${budget} Token`],
+    ["已激活 Skill", activatedSkills],
+    ["本次完整加载 Skill", list(skillResolution.materialized_ids).map(text)],
+    ["仅加载 metadata", list(skillResolution.metadata_only_ids).map(text)],
+    [
+      "Skill Resolver",
+      Object.keys(skillResolution).length
+        ? `${text(skillResolution.strategy) || "未知"}${skillResolution.fallback === true ? " · fallback" : ""}`
+        : "无",
+    ],
     ["受保护来源", trace?.protected_source_ids || []],
     ["会话记忆", trace?.selected_memory_ids || []],
     ["压缩来源", trace?.compressed_source_ids || []],

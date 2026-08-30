@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 from ..persistence.context_snapshots import ContextSnapshotRepository
+from ..skills import CreativeTaskContext, SkillMaterializer
 from .agent import (CharacterAgent, CharacterContributionOutput, RoleplayDeltaOutput,
                     RoleplayTurnOutput, SceneDirectorAgent, TurnPlanOutput)
 from .context_builder import RoleplayContextBuilder
@@ -131,16 +132,20 @@ class TurnAssembler:
 
 class RoleplayRuntime:
     def __init__(self, *, director: SceneDirectorAgent, character: CharacterAgent,
-                 snapshots: ContextSnapshotRepository) -> None:
+                 snapshots: ContextSnapshotRepository,
+                 skill_materializer: SkillMaterializer | None = None) -> None:
         self._director = director
         self._character = character
         self._snapshots = snapshots
         self._router = TurnRouter()
         self._contexts = RoleplayContextBuilder()
         self._assembler = TurnAssembler()
+        self._skill_materializer = skill_materializer
 
     async def run_turn(self, *, simulation: SimulationSession, turn: SimulationTurn, job_id: str,
-                       history: tuple[SimulationTurn, ...], emit: Callable[[str, dict[str, Any]], None]) -> RuntimeResult:
+                       history: tuple[SimulationTurn, ...],
+                       creative_task: CreativeTaskContext | None = None,
+                       emit: Callable[[str, dict[str, Any]], None]) -> RuntimeResult:
         decision = self._router.route(simulation=simulation, turn=turn)
         emit("simulation_router_selected", {"turn_number": turn.turn_number, "path": decision.path,
                                              "actor_ids": list(decision.actor_ids), "reason": decision.reason})
@@ -151,6 +156,13 @@ class RoleplayRuntime:
             prompt, trace = self._contexts.build_director(
                 simulation=simulation, turns=history, request=turn.user_input,
                 input_type=turn.input_type, candidate_ids=candidates,
+            )
+            prompt = await self._with_skills(
+                prompt,
+                creative_task=creative_task,
+                objective="根据当前场景和用户输入规划下一步叙事行动",
+                emit=emit,
+                worker_id="scene_director",
             )
             snapshot = self._snapshots.save(
                 agent_role="scene_director", book_id=simulation.book_id, book_version=simulation.base_book_version,
@@ -186,6 +198,13 @@ class RoleplayRuntime:
                 simulation=simulation, turns=history, request=turn.user_input, input_type=turn.input_type,
                 character_id=actor_id, scene_instruction=instruction, visible_contributions=tuple(visible),
             )
+            prompt = await self._with_skills(
+                prompt,
+                creative_task=creative_task,
+                objective=f"以角色 {actor_id} 的身份生成当前场景贡献",
+                emit=emit,
+                worker_id="character_agent",
+            )
             snapshot = self._snapshots.save(
                 agent_role="character_agent", book_id=simulation.book_id, book_version=simulation.base_book_version,
                 policy_version=self._contexts.character_policy_version, renderer_version="roleplay-character-v2",
@@ -207,6 +226,32 @@ class RoleplayRuntime:
             simulation=simulation, actor_ids=decision.actor_ids, contributions=tuple(contributions), plan=plan,
         )
         return RuntimeResult(output=output, delta=delta, snapshot_links=tuple(links))
+
+    async def _with_skills(
+        self,
+        prompt: str,
+        *,
+        creative_task: CreativeTaskContext | None,
+        objective: str,
+        emit: Callable[[str, dict[str, Any]], None],
+        worker_id: str,
+    ) -> str:
+        if creative_task is None or not creative_task.applied_skills:
+            return prompt
+        if self._skill_materializer is None:
+            raise RuntimeError("角色剧场未配置 SkillMaterializer")
+        materialized = await self._skill_materializer.materialize(
+            creative_task,
+            objective=objective,
+        )
+        emit(
+            "skill_resolved",
+            {
+                "agent_id": worker_id,
+                **self._skill_materializer.observation(creative_task, materialized),
+            },
+        )
+        return f"{prompt}\n\n{materialized.render()}"
 
     @staticmethod
     def _validate_plan(*, simulation: SimulationSession, plan: TurnPlanOutput) -> None:

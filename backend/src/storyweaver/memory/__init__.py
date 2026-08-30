@@ -9,10 +9,16 @@ from .long_term import (
     MemoryScopeType,
 )
 from .long_term_store import LongTermMemoryStore
-from .services import LongTermMemoryConsolidator, LongTermMemoryExtractor, LongTermMemoryRetriever
+from .services import (
+    LongTermMemoryConsolidator,
+    LongTermMemoryExtractor,
+    LongTermMemoryRetriever,
+    format_recent_dialogue,
+)
 
 __all__ = [
     "LongTermMemoryConsolidator", "LongTermMemoryExtractor", "LongTermMemoryRecord",
     "LongTermMemoryRetriever", "LongTermMemoryStatus", "LongTermMemoryStore",
     "LongTermMemoryType", "MemoryCandidate", "MemoryExtractionResult", "MemoryScopeType",
+    "format_recent_dialogue",
 ]

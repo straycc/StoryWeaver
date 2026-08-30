@@ -25,6 +25,7 @@ from ...llm import (
 from ..exceptions import ChapterAnalysisError, SerializationError, StateTransitionError
 from ..hook_manager import HookManager
 from ...observability import get_log_context, logging_context
+from ...skills import CreativeTaskContext, SkillMaterializer
 from ..models import ChapterDraft, ChapterPlan, NovelProject, StoryStateDelta
 from ..review_tools import ReviewSnapshot, build_sdk_read_tools
 from ..serialization import decode_story_state_delta, dumps_json, to_data
@@ -95,6 +96,7 @@ class ChapterAnalyzerAgent(BaseNovelAgent[dict[str, Any]]):
         event_sinks: tuple[LlmEventSink, ...] = (),
         context_policy: AgentContextPolicy | None = None,
         context_snapshot_sink: object | None = None,
+        skill_materializer: SkillMaterializer | None = None,
     ) -> None:
         super().__init__(
             agent_id="chapter-analyzer",
@@ -104,6 +106,7 @@ class ChapterAnalyzerAgent(BaseNovelAgent[dict[str, Any]]):
             retry_policy=retry_policy,
             sdk_settings=sdk_settings,
             event_sinks=event_sinks,
+            skill_materializer=skill_materializer,
         )
         self._hook_manager = hook_manager or HookManager()
         self._context_policy = context_policy or default_agent_context_policies()["analyzer"]
@@ -115,6 +118,7 @@ class ChapterAnalyzerAgent(BaseNovelAgent[dict[str, Any]]):
         project: NovelProject,
         plan: ChapterPlan,
         draft: ChapterDraft,
+        creative_task: CreativeTaskContext | None = None,
     ) -> StoryStateDelta:
         participant_ids = set(plan.participating_character_ids)
         participant_states = tuple(
@@ -173,6 +177,12 @@ class ChapterAnalyzerAgent(BaseNovelAgent[dict[str, Any]]):
         }
         serialized_input = dumps_json(to_data(analysis_input))
         analysis_prompt = "请分析以下最终章节并提取状态增量。\n\n" + serialized_input
+        analysis_prompt = await self._with_skills(
+            analysis_prompt,
+            creative_task=creative_task,
+            objective="从最终创作结果中提取已经发生的正史状态变化",
+            total_token_budget=self._context_policy.budget.initial_dynamic_context,
+        )
         require_within_budget(
             analysis_prompt,
             budget=self._context_policy.budget.initial_dynamic_context,

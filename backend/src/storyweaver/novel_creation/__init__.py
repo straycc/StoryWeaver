@@ -25,8 +25,7 @@ from .agents import (
     ChapterAnalyzerAgent,
     PlannerAgent,
     ReviewerAgent,
-    ReviserAgent,
-    WriterAgent,
+    WritingAgent,
 )
 from .models import (
     BatchPlanningContext,
@@ -67,9 +66,8 @@ from .pipeline import (
     CreateNovelPipeline,
     Planner,
     Reviewer,
-    Reviser,
     WriteNextChapterPipeline,
-    Writer,
+    Writing,
 )
 from .validation import (
     ChapterDraftValidator,
@@ -159,8 +157,6 @@ __all__ = [
     "ReviewGateResult",
     "ReviewQualityGate",
     "ReviewQualityGatePolicy",
-    "Reviser",
-    "ReviserAgent",
     "SerializationError",
     "StateTransitionError",
     "StoryHook",
@@ -168,9 +164,9 @@ __all__ = [
     "StoryStateDelta",
     "UsageSummary",
     "WorkerRunMetric",
-    "WriterAgent",
+    "WritingAgent",
     "WriteNextChapterPipeline",
-    "Writer",
+    "Writing",
     "build_novel_service",
     "load_env_file",
 ]

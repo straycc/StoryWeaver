@@ -17,7 +17,14 @@ class BlockingWritePipeline:
         self.release = asyncio.Event()
         self.calls = 0
 
-    async def run(self, *, book_id, user_instruction=None):
+    async def run(
+        self,
+        *,
+        book_id,
+        user_instruction=None,
+        batch_context=None,
+        creative_task=None,
+    ):
         self.calls += 1
         self.entered.set()
         await self.release.wait()

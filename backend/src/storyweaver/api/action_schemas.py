@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, TypeAlias
+from typing import Annotated, Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class _ActionParameters(BaseModel):
@@ -13,7 +13,21 @@ class _ActionParameters(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
-class PrepareChapterPlanParameters(_ActionParameters):
+class _CreativeActionParameters(_ActionParameters):
+    skill_ids: list[str] = Field(default_factory=list, max_length=16)
+
+    @field_validator("skill_ids")
+    @classmethod
+    def validate_skill_ids(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip().lower() for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("skill_ids 不能包含空值")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("skill_ids 不能包含重复 Skill")
+        return normalized
+
+
+class PrepareChapterPlanParameters(_CreativeActionParameters):
     instruction: str | None = Field(default=None, max_length=4000)
 
 
@@ -26,7 +40,15 @@ class ConfirmAndWriteParameters(_ActionParameters):
     proposal_id: str | None = None
 
 
-class RewriteChapterParameters(_ActionParameters):
+class ApproveChapterPlanParameters(_ActionParameters):
+    proposal_id: str | None = None
+
+
+class WriteFromPlanParameters(_ActionParameters):
+    proposal_id: str | None = None
+
+
+class RewriteChapterParameters(_CreativeActionParameters):
     chapter_number: int = Field(ge=1)
     instruction: str | None = Field(default=None, max_length=4000)
 
@@ -35,8 +57,28 @@ class CancelChapterPlanParameters(_ActionParameters):
     proposal_id: str | None = None
 
 
-class WriteBatchParameters(_ActionParameters):
+class WriteBatchParameters(_CreativeActionParameters):
     count: int = Field(ge=1, le=50)
+    instruction: str | None = Field(default=None, max_length=4000)
+
+
+class CreativeDiscussionParameters(_ActionParameters):
+    objective: str = Field(min_length=1, max_length=4000)
+
+
+class CreateNovelParameters(_ActionParameters):
+    title: str = Field(min_length=1, max_length=200)
+    genre: str = Field(min_length=1, max_length=100)
+    premise: str = Field(min_length=1, max_length=4000)
+    protagonist: str = Field(min_length=1, max_length=1000)
+    central_conflict: str = Field(min_length=1, max_length=2000)
+    tone: str = Field(min_length=1, max_length=500)
+    target_chapters: int = Field(ge=1, le=10000)
+    chapter_target_words: int = Field(ge=200, le=100000)
+    language: str = Field(default="zh", min_length=1, max_length=32)
+
+
+class RunNextChapterWorkflowParameters(_CreativeActionParameters):
     instruction: str | None = Field(default=None, max_length=4000)
 
 
@@ -79,37 +121,11 @@ class QueryTextParameters(_ActionParameters):
 
 ActionParameters: TypeAlias = (
     PrepareChapterPlanParameters | ReviseChapterPlanParameters | ConfirmAndWriteParameters |
+    ApproveChapterPlanParameters | WriteFromPlanParameters |
     RewriteChapterParameters | CancelChapterPlanParameters | WriteBatchParameters |
     QueryBookStateParameters | QueryStoryProgressParameters | QueryCompletedChaptersParameters |
     QueryChapterParameters | QueryPendingPlanParameters | QueryRecentReviewParameters |
-    QueryOpenForeshadowingsParameters | QueryTextParameters
+    QueryOpenForeshadowingsParameters | QueryTextParameters |
+    CreativeDiscussionParameters | CreateNovelParameters |
+    RunNextChapterWorkflowParameters
 )
-
-
-ACTION_PARAMETER_MODELS: dict[str, type[_ActionParameters]] = {
-    "prepare_chapter_plan": PrepareChapterPlanParameters,
-    "revise_chapter_plan": ReviseChapterPlanParameters,
-    "confirm_and_write_chapter": ConfirmAndWriteParameters,
-    "rewrite_chapter": RewriteChapterParameters,
-    "cancel_chapter_plan": CancelChapterPlanParameters,
-    "write_batch": WriteBatchParameters,
-    "query_book_state": QueryBookStateParameters,
-    "query_story_progress": QueryStoryProgressParameters,
-    "query_completed_chapters": QueryCompletedChaptersParameters,
-    "query_chapter": QueryChapterParameters,
-    "query_pending_plan": QueryPendingPlanParameters,
-    "query_recent_review": QueryRecentReviewParameters,
-    "query_open_foreshadowings": QueryOpenForeshadowingsParameters,
-    "query_character": QueryTextParameters,
-    "query_foreshadowing": QueryTextParameters,
-    "explain_review": QueryRecentReviewParameters,
-}
-
-
-def validate_action_parameters(action: str, parameters: dict[str, Any]) -> dict[str, Any]:
-    """用同一份 Pydantic 模型校验 Main Agent、快捷按钮和确认操作。"""
-
-    model = ACTION_PARAMETER_MODELS.get(action)
-    if model is None:
-        raise ValueError(f"不支持的业务动作：{action}")
-    return model.model_validate(parameters).model_dump(exclude_none=True)

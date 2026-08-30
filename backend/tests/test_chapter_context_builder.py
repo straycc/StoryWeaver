@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
 from novel_fixtures import (
+    create_chapter_draft,
     create_chapter_plan,
     create_foundation,
     create_initial_state,
@@ -16,13 +18,15 @@ from storyweaver.novel_creation import (
     ChapterSummary,
     FactRecord,
     NovelProject,
+    ReviewIssue,
+    ReviewReport,
     StoryHook,
 )
 from storyweaver.context import ContextBudgetExceededError
 from storyweaver.novel_creation.serialization import loads_json
 from storyweaver.context import default_agent_context_policies
 from storyweaver.llm import WorkerSettings
-from storyweaver.novel_creation.agents.writer import WriterAgent
+from storyweaver.novel_creation.agents.writing import WritingAgent
 from agents import ModelSettings
 
 
@@ -234,22 +238,94 @@ class ChapterContextBuilderTests(unittest.TestCase):
             plan=create_next_plan(),
         )
         policy = default_agent_context_policies()["writer"]
-        writer = WriterAgent(
-            sdk_settings=WorkerSettings(
-                worker_id="novel-writer",
-                name="Writer",
-                instructions="test",
-                model=object(),
-                model_settings=ModelSettings(),
-                timeout_seconds=1,
-            ),
-            context_policy=policy,
+        writer_settings = WorkerSettings(
+            worker_id="novel-writer",
+            name="Writer",
+            instructions="test",
+            model=object(),
+            model_settings=ModelSettings(),
+            timeout_seconds=1,
+        )
+        reviser_settings = WorkerSettings(
+            worker_id="novel-reviser",
+            name="Reviser",
+            instructions="test",
+            model=object(),
+            model_settings=ModelSettings(),
+            timeout_seconds=1,
+        )
+        writing = WritingAgent(
+            writer_settings=writer_settings,
+            reviser_settings=reviser_settings,
+            writer_context_policy=policy,
         )
 
-        output_limit = writer._output_token_limit(context)
+        output_limit = writing._output_token_limit(context)
 
         self.assertGreaterEqual(output_limit, 6_144)
         self.assertLessEqual(output_limit, policy.budget.output_reserve)
+        self.assertIs(writing._sdk_settings, writer_settings)
+        self.assertIs(writing._reviser_settings, reviser_settings)
+
+
+class WritingAgentModeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_write_and_revise_use_separate_runtime_modes(self) -> None:
+        context, _ = ChapterContextBuilder(token_budget=10000).build(
+            project=create_history_project(),
+            plan=create_next_plan(),
+        )
+        writer_settings = WorkerSettings(
+            worker_id="novel-writer",
+            name="Writer",
+            instructions="test",
+            model=object(),
+            model_settings=ModelSettings(),
+            timeout_seconds=1,
+        )
+        reviser_settings = replace(
+            writer_settings,
+            worker_id="novel-reviser",
+            name="Reviser",
+        )
+        writing = WritingAgent(
+            writer_settings=writer_settings,
+            reviser_settings=reviser_settings,
+        )
+        draft = create_chapter_draft()
+        generate = AsyncMock(return_value=draft)
+        writing._generate_validated = generate
+
+        self.assertIs(await writing.write(context), draft)
+        self.assertEqual(generate.await_args.kwargs["agent_id"], "novel-writer")
+
+        generate.reset_mock()
+        review = ReviewReport(
+            passed=False,
+            summary="需要修订",
+            issues=(
+                ReviewIssue(
+                    category="world_continuity",
+                    severity="warning",
+                    description="线索交代不足",
+                    suggestion="补充登记册线索",
+                    related_source_ids=("plan:6",),
+                ),
+            ),
+            score=70,
+        )
+        self.assertIs(
+            await writing.revise(
+                context=context,
+                draft=draft,
+                review=review,
+            ),
+            draft,
+        )
+        self.assertEqual(generate.await_args.kwargs["agent_id"], "novel-reviser")
+        self.assertIs(
+            generate.await_args.kwargs["sdk_settings"],
+            reviser_settings,
+        )
 
 
 if __name__ == "__main__":

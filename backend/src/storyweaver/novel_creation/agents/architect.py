@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ...llm import LlmEventSink, WorkerRetryPolicy, WorkerSettings
+from ...skills import CreativeTaskContext, SkillMaterializer
 from ..exceptions import NovelFoundationValidationError, SerializationError
 from ..models import CreateNovelRequest, NovelFoundation
 from ..serialization import decode_novel_foundation, dumps_json, to_data
@@ -68,6 +69,7 @@ class ArchitectAgent(BaseNovelAgent[dict[str, Any]]):
         retry_policy: WorkerRetryPolicy | None = None,
         sdk_settings: WorkerSettings | None = None,
         event_sinks: tuple[LlmEventSink, ...] = (),
+        skill_materializer: SkillMaterializer | None = None,
     ) -> None:
         super().__init__(
             agent_id="novel-architect",
@@ -77,10 +79,15 @@ class ArchitectAgent(BaseNovelAgent[dict[str, Any]]):
             retry_policy=retry_policy,
             sdk_settings=sdk_settings,
             event_sinks=event_sinks,
+            skill_materializer=skill_materializer,
         )
         self._validator = validator or NovelFoundationValidator()
 
-    async def create(self, request: CreateNovelRequest) -> NovelFoundation:
+    async def create(
+        self,
+        request: CreateNovelRequest,
+        creative_task: CreativeTaskContext | None = None,
+    ) -> NovelFoundation:
         def convert(raw_foundation: dict[str, Any]) -> NovelFoundation:
             normalized = self._remove_echoed_request_fields(raw_foundation)
             try:
@@ -92,8 +99,13 @@ class ArchitectAgent(BaseNovelAgent[dict[str, Any]]):
             self._validator.validate(request=request, foundation=foundation)
             return foundation
 
-        return await self._generate_validated(
+        prompt = await self._with_skills(
             self._build_prompt(request),
+            creative_task=creative_task,
+            objective="设计小说基础设定、人物、世界观和整体结构",
+        )
+        return await self._generate_validated(
+            prompt,
             convert,
             repair_instruction=(
                 "上一次小说基础资料未通过校验。请根据错误修正，"

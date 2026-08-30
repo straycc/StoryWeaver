@@ -125,6 +125,17 @@ class NovelRunObserver:
         event_type = str(event.type)
         active_key = (run_id, worker_id)
         display_name = AGENT_DISPLAY_NAMES.get(worker_id, worker_id)
+        if event_type == LlmEventType.SKILL_RESOLVED.value:
+            self._emit_progress(
+                run_id,
+                "skill_resolved",
+                {
+                    "agent_id": worker_id,
+                    "display_name": display_name,
+                    **dict(event.data),
+                },
+            )
+            return
         if event_type == LlmEventType.RUN_STARTED.value:
             with self._lock:
                 self._active[active_key] = _ActiveRun(

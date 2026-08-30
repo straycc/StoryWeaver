@@ -8,6 +8,7 @@ export interface Session {
 }
 export interface SessionSummary { session_id: string; title: string; book_id: string | null; message_count: number; updated_at: string; }
 export interface ProjectSummary { book_id: string; title: string; genre: string; target_chapters: number; }
+export interface SkillOption { id: string; name: string; display_name: string; description: string; short_description: string; }
 export interface JobEvent { sequence: number; job_id: string; event_type: string; created_at: string; payload: Json; }
 export interface Job { job_id: string; status: string; error: string | null; result: Json | null; }
 export interface ActionProposal { action_proposal_id: string; action_type: string; summary: string; status: string; job_id: string | null; payload: Json; }
@@ -23,7 +24,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  bootstrap: () => request<{ model: string; sessions: SessionSummary[]; projects: ProjectSummary[]; actions: Record<string, string> }>("/bootstrap"),
+  bootstrap: () => request<{ model: string; sessions: SessionSummary[]; projects: ProjectSummary[]; actions: Record<string, string>; skills?: SkillOption[] }>("/bootstrap"),
   createSession: (book_id: string | null = null) => request<Session>("/sessions", { method: "POST", body: JSON.stringify({ book_id }) }),
   deleteSession: (id: string) => request<{ ok: boolean }>(`/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }),
   getSession: (id: string, before?: number | null) => request<Session>(`/sessions/${encodeURIComponent(id)}?limit=50${before ? `&before_sequence=${before}` : ""}`),

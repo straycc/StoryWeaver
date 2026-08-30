@@ -14,6 +14,7 @@ class LlmEventType(StrEnum):
     RUN_STARTED = "run_started"
     MODEL_COMPLETED = "model_completed"
     TOOL_COMPLETED = "tool_completed"
+    SKILL_RESOLVED = "skill_resolved"
     MODEL_REPAIRING = "model_repairing"
     STREAM_STARTED = "stream_started"
     TEXT_DELTA = "text_delta"

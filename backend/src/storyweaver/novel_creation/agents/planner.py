@@ -22,6 +22,7 @@ from ...llm import (
     WorkerSettings,
     run_research_then_submit,
 )
+from ...skills import CreativeTaskContext, SkillMaterializer
 from ..exceptions import ChapterPlanValidationError, SerializationError
 from ..hook_manager import HookManager
 from ..models import BatchPlanningContext, ChapterPlan, NovelProject
@@ -79,6 +80,7 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
         event_sinks: tuple[LlmEventSink, ...] = (),
         context_snapshot_sink: object | None = None,
         context_policy: AgentContextPolicy | None = None,
+        skill_materializer: SkillMaterializer | None = None,
     ) -> None:
         super().__init__(
             agent_id="novel-planner",
@@ -88,6 +90,7 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
             retry_policy=retry_policy,
             sdk_settings=sdk_settings,
             event_sinks=event_sinks,
+            skill_materializer=skill_materializer,
         )
         self._validator = validator or ChapterPlanValidator()
         self._hook_manager = hook_manager or HookManager()
@@ -101,6 +104,7 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
         project: NovelProject,
         user_instruction: str | None = None,
         batch_context: BatchPlanningContext | None = None,
+        creative_task: CreativeTaskContext | None = None,
     ) -> ChapterPlan:
         if user_instruction is not None and not user_instruction.strip():
             raise ValueError("user_instruction 必须为非空字符串或 None")
@@ -131,6 +135,12 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
             raise ValueError("Planner 必须注入 StoryProjectRepository")
         snapshot = self._load_snapshot(project)
         prompt = self._tool_prompt(snapshot=snapshot, user_instruction=user_instruction, batch_context=batch_context)
+        prompt = await self._with_skills(
+            prompt,
+            creative_task=creative_task,
+            objective="规划当前创作任务的叙事推进、场景节拍和伏笔安排",
+            total_token_budget=self._context_policy.budget.initial_dynamic_context,
+        )
         require_within_budget(
             prompt,
             budget=self._context_policy.budget.initial_dynamic_context,

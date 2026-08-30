@@ -16,6 +16,7 @@ from ...context import (
     with_tool_results,
 )
 from ...observability import get_log_context
+from ...skills import CreativeTaskContext, SkillMaterializer
 from ...llm import LlmEvent, LlmEventSink, LlmEventType, NOVEL_OUTPUT_TYPES, WorkerRetryPolicy, WorkerSettings, run_research_then_submit
 from ..context_renderer import ChapterContextRenderer
 from ..models import ChapterContext, ChapterDraft, ChapterPlan, ReviewReport
@@ -150,6 +151,7 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
         context_snapshot_sink: object | None = None,
         context_policy: AgentContextPolicy | None = None,
         verification_context_policy: AgentContextPolicy | None = None,
+        skill_materializer: SkillMaterializer | None = None,
     ) -> None:
         super().__init__(
             agent_id="novel-reviewer",
@@ -159,6 +161,7 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
             retry_policy=retry_policy,
             sdk_settings=sdk_settings,
             event_sinks=event_sinks,
+            skill_materializer=skill_materializer,
         )
         self._renderer = renderer or ChapterContextRenderer()
         self._store = store
@@ -174,11 +177,18 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
         *,
         context: ChapterContext,
         draft: ChapterDraft,
+        creative_task: CreativeTaskContext | None = None,
     ) -> ReviewReport:
         if self._store is None or context.book_id is None:
             raise ValueError("Reviewer 必须注入作品存储和 book_id")
         snapshot = self._load_snapshot(context)
         prompt = self._review_prompt(context=context, draft=draft, snapshot=snapshot)
+        prompt = await self._with_skills(
+            prompt,
+            creative_task=creative_task,
+            objective="检查候选正文是否满足正史、计划、用户要求和创作质量",
+            total_token_budget=self._context_policy.budget.initial_dynamic_context,
+        )
         require_within_budget(
             prompt,
             budget=self._context_policy.budget.initial_dynamic_context,
@@ -192,6 +202,7 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
         context: ChapterContext,
         draft: ChapterDraft,
         original_review: ReviewReport,
+        creative_task: CreativeTaskContext | None = None,
     ) -> ReviewReport:
         """修订后只核验原硬问题，避免再次启动完整自主审查。"""
 
@@ -202,6 +213,14 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
             context=context,
             draft=draft,
             original_review=original_review,
+        )
+        prompt = await self._with_skills(
+            prompt,
+            creative_task=creative_task,
+            objective="核验修订稿是否解决已确认问题且没有明显回归",
+            total_token_budget=(
+                self._verification_context_policy.budget.initial_dynamic_context
+            ),
         )
         require_within_budget(
             prompt,

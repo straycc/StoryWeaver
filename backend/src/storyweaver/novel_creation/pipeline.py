@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from ..observability import get_log_context, logging_context
 from ..context import trace_from_selected_entries
+from ..skills import CreativeTaskContext
 
 from .context_builder import ChapterContextBuilder
 from .context_renderer import ChapterContextRenderer
@@ -51,7 +52,11 @@ _LOGGER = logging.getLogger(__name__)
 class Architect(Protocol):
     """创建 Pipeline 所依赖的最小 Architect 接口。"""
 
-    async def create(self, request: CreateNovelRequest) -> NovelFoundation:
+    async def create(
+        self,
+        request: CreateNovelRequest,
+        creative_task: CreativeTaskContext | None = None,
+    ) -> NovelFoundation:
         """根据创作简报返回候选小说基础资料。"""
 
 
@@ -62,13 +67,30 @@ class Planner(Protocol):
         project: NovelProject,
         user_instruction: str | None = None,
         batch_context: BatchPlanningContext | None = None,
+        creative_task: CreativeTaskContext | None = None,
     ) -> ChapterPlan:
         """规划项目的下一章。"""
 
 
-class Writer(Protocol):
-    async def write(self, context: ChapterContext) -> ChapterDraft:
+class Writing(Protocol):
+    """正文生成与修订阶段依赖的统一写作接口。"""
+
+    async def write(
+        self,
+        context: ChapterContext,
+        creative_task: CreativeTaskContext | None = None,
+    ) -> ChapterDraft:
         """根据有限 Context 生成章节初稿。"""
+
+    async def revise(
+        self,
+        *,
+        context: ChapterContext,
+        draft: ChapterDraft,
+        review: ReviewReport,
+        creative_task: CreativeTaskContext | None = None,
+    ) -> ChapterDraft:
+        """根据审查报告修订一次正文。"""
 
 
 class Reviewer(Protocol):
@@ -77,6 +99,7 @@ class Reviewer(Protocol):
         *,
         context: ChapterContext,
         draft: ChapterDraft,
+        creative_task: CreativeTaskContext | None = None,
     ) -> ReviewReport:
         """审查章节正文。"""
 
@@ -86,19 +109,9 @@ class Reviewer(Protocol):
         context: ChapterContext,
         draft: ChapterDraft,
         original_review: ReviewReport,
+        creative_task: CreativeTaskContext | None = None,
     ) -> ReviewReport:
         """只复查上一轮要求修复的问题及明显回归。"""
-
-
-class Reviser(Protocol):
-    async def revise(
-        self,
-        *,
-        context: ChapterContext,
-        draft: ChapterDraft,
-        review: ReviewReport,
-    ) -> ChapterDraft:
-        """根据审查报告修订一次正文。"""
 
 
 class ChapterAnalyzer(Protocol):
@@ -108,6 +121,7 @@ class ChapterAnalyzer(Protocol):
         project: NovelProject,
         plan: ChapterPlan,
         draft: ChapterDraft,
+        creative_task: CreativeTaskContext | None = None,
     ) -> StoryStateDelta:
         """从最终正文提取候选状态增量。"""
 
@@ -130,10 +144,18 @@ class CreateNovelPipeline:
         self._validator = validator or NovelFoundationValidator()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
-    async def run(self, request: CreateNovelRequest) -> NovelProject:
+    async def run(
+        self,
+        request: CreateNovelRequest,
+        creative_task: CreativeTaskContext | None = None,
+    ) -> NovelProject:
         """创建并发布项目；Architect 或校验失败时不会触碰正式目录。"""
 
-        foundation = await self._architect.create(request)
+        foundation = (
+            await self._architect.create(request, creative_task)
+            if creative_task is not None
+            else await self._architect.create(request)
+        )
         if not isinstance(foundation, NovelFoundation):
             raise TypeError("Architect.create 必须返回 NovelFoundation")
         self._validator.validate(request=request, foundation=foundation)
@@ -219,9 +241,8 @@ class WriteNextChapterPipeline:
         store: StoryProjectRepository,
         planner: Planner,
         context_builder: ChapterContextBuilder,
-        writer: Writer,
+        writing: Writing,
         reviewer: Reviewer,
-        reviser: Reviser,
         analyzer: ChapterAnalyzer,
         draft_validator: ChapterDraftValidator | None = None,
         state_reducer: NovelStateReducer | None = None,
@@ -235,9 +256,8 @@ class WriteNextChapterPipeline:
         self._store = store
         self._planner = planner
         self._context_builder = context_builder
-        self._writer = writer
+        self._writing = writing
         self._reviewer = reviewer
-        self._reviser = reviser
         self._analyzer = analyzer
         self._draft_validator = draft_validator or ChapterDraftValidator()
         self._state_reducer = state_reducer or NovelStateReducer()
@@ -253,11 +273,13 @@ class WriteNextChapterPipeline:
         book_id: str,
         user_instruction: str | None = None,
         batch_context: BatchPlanningContext | None = None,
+        creative_task: CreativeTaskContext | None = None,
     ) -> ChapterResult:
         proposal = await self.prepare(
             book_id=book_id,
             user_instruction=user_instruction,
             batch_context=batch_context,
+            creative_task=creative_task,
         )
         return await self.execute(proposal)
 
@@ -267,6 +289,7 @@ class WriteNextChapterPipeline:
         book_id: str,
         user_instruction: str | None = None,
         batch_context: BatchPlanningContext | None = None,
+        creative_task: CreativeTaskContext | None = None,
     ) -> ChapterPlanProposal:
         """只规划下一章，不生成正文。"""
 
@@ -279,6 +302,8 @@ class WriteNextChapterPipeline:
         # 保持现有测试替身和第三方 Planner 的兼容；只有连续创作才需要新边界。
         if batch_context is not None:
             plan_arguments["batch_context"] = batch_context
+        if creative_task is not None:
+            plan_arguments["creative_task"] = creative_task
         plan = await self._planner.plan(**plan_arguments)
         if not isinstance(plan, ChapterPlan):
             raise ChapterPipelineError("Planner 必须返回 ChapterPlan")
@@ -306,6 +331,7 @@ class WriteNextChapterPipeline:
             selected_memory_descriptions=(),
             created_at=timestamp,
             updated_at=timestamp,
+            creative_task_context=creative_task,
         )
 
     async def revise(
@@ -327,10 +353,18 @@ class WriteNextChapterPipeline:
             f"当前候选计划：\n{dumps_json(to_data(proposal.plan))}\n"
             f"本次修改意见：{normalized_feedback}"
         )
-        plan = await self._planner.plan(
-            project=project,
-            user_instruction=self._planner_instruction(proposal.book_id, revision_instruction, proposal.chapter_number),
-        )
+        plan_arguments: dict[str, object] = {
+            "project": project,
+            "user_instruction": self._planner_instruction(
+                proposal.book_id,
+                revision_instruction,
+                proposal.chapter_number,
+            ),
+        }
+        # Proposal 创建后，它持有的 Snapshot 是修订流程唯一 Skill 输入来源。
+        if proposal.creative_task_context is not None:
+            plan_arguments["creative_task"] = proposal.creative_task_context
+        plan = await self._planner.plan(**plan_arguments)
         if not isinstance(plan, ChapterPlan):
             raise ChapterPipelineError("Planner 必须返回 ChapterPlan")
         self._log_stage_summary(
@@ -358,7 +392,10 @@ class WriteNextChapterPipeline:
     ) -> ChapterResult:
         """使用用户已查看的候选计划执行正文、审查和状态提交。"""
 
-        project = self._validate_proposal_base(proposal)
+        project = self._validate_proposal_base(
+            proposal,
+            allowed_statuses=frozenset({"approved"}),
+        )
         active_quality_gate = quality_gate or self._quality_gate
         summaries = self._store.load_chapter_summaries(proposal.book_id)
         context, context_trace = self._context_builder.build(
@@ -383,7 +420,14 @@ class WriteNextChapterPipeline:
                 context=context,
                 context_trace=context_trace,
             )
-            draft = await self._writer.write(context)
+            draft = (
+                await self._writing.write(
+                    context,
+                    creative_task=proposal.creative_task_context,
+                )
+                if proposal.creative_task_context is not None
+                else await self._writing.write(context)
+            )
             if not isinstance(draft, ChapterDraft):
                 raise ChapterPipelineError("Writer 必须返回 ChapterDraft")
             draft = self._draft_validator.validate_and_normalize(
@@ -444,15 +488,27 @@ class WriteNextChapterPipeline:
             final_draft = draft_history[-1]
             if checkpoint_stage in {"draft_ready", "revision_ready"}:
                 if previous_review is None:
-                    final_review = await self._reviewer.review(
-                        context=context,
-                        draft=final_draft,
-                    )
+                    review_arguments: dict[str, object] = {
+                        "context": context,
+                        "draft": final_draft,
+                    }
+                    if proposal.creative_task_context is not None:
+                        review_arguments["creative_task"] = (
+                            proposal.creative_task_context
+                        )
+                    final_review = await self._reviewer.review(**review_arguments)
                 else:
+                    verification_arguments: dict[str, object] = {
+                        "context": context,
+                        "draft": final_draft,
+                        "original_review": previous_review,
+                    }
+                    if proposal.creative_task_context is not None:
+                        verification_arguments["creative_task"] = (
+                            proposal.creative_task_context
+                        )
                     final_review = await self._reviewer.verify_revision(
-                        context=context,
-                        draft=final_draft,
-                        original_review=previous_review,
+                        **verification_arguments
                     )
                 if not isinstance(final_review, ReviewReport):
                     raise ChapterPipelineError("Reviewer 必须返回 ReviewReport")
@@ -501,11 +557,14 @@ class WriteNextChapterPipeline:
                 final_review,
                 issues=gate_result.actionable_issues,
             )
-            revised_candidate = await self._reviser.revise(
-                context=context,
-                draft=final_draft,
-                review=revision_review,
-            )
+            revision_arguments: dict[str, object] = {
+                "context": context,
+                "draft": final_draft,
+                "review": revision_review,
+            }
+            if proposal.creative_task_context is not None:
+                revision_arguments["creative_task"] = proposal.creative_task_context
+            revised_candidate = await self._writing.revise(**revision_arguments)
             if not isinstance(revised_candidate, ChapterDraft):
                 raise ChapterPipelineError("Reviser 必须返回 ChapterDraft")
             revised_candidate = self._draft_validator.validate_and_normalize(
@@ -595,11 +654,16 @@ class WriteNextChapterPipeline:
             delta = checkpoint.state_delta
             self._log_stage_summary("pipeline", "恢复章节检查点 | 复用状态分析结果")
         else:
-            delta = await self._analyzer.analyze(
-                project=project,
-                plan=proposal.plan,
-                draft=final_draft,
-            )
+            analyzer_arguments: dict[str, object] = {
+                "project": project,
+                "plan": proposal.plan,
+                "draft": final_draft,
+            }
+            if proposal.creative_task_context is not None:
+                analyzer_arguments["creative_task"] = (
+                    proposal.creative_task_context
+                )
+            delta = await self._analyzer.analyze(**analyzer_arguments)
             if not isinstance(delta, StoryStateDelta):
                 raise ChapterPipelineError("ChapterAnalyzer 必须返回 StoryStateDelta")
             self._log_stage_summary(
@@ -796,8 +860,10 @@ class WriteNextChapterPipeline:
     def _validate_proposal_base(
         self,
         proposal: ChapterPlanProposal,
+        *,
+        allowed_statuses: frozenset[str] = frozenset({"pending"}),
     ) -> NovelProject:
-        if proposal.status != "pending":
+        if proposal.status not in allowed_statuses:
             raise ChapterPipelineError(
                 f"候选计划状态为 {proposal.status}，不能继续执行"
             )

@@ -19,12 +19,33 @@
 
 /* 斜杠命令面板：沿用旧工作台的白底、细边框与低干扰层级。 */
 .composer-command-wrap { position: relative; }
-.skill-command-menu { position: absolute; z-index: 20; left: 0; right: 0; bottom: calc(100% + 8px); overflow: hidden; border: 1px solid var(--border, #dedede); border-radius: 14px; background: #fff; box-shadow: 0 10px 28px rgba(0, 0, 0, .10); padding: 6px; }
-.skill-command-menu button { display: grid; width: 100%; gap: 4px; border: 0; border-radius: 9px; background: transparent; padding: 10px 12px; text-align: left; color: var(--text, #161616); cursor: pointer; }
+.skill-command-menu { position: absolute; z-index: 20; left: 0; right: 0; bottom: calc(100% + 8px); max-height: min(296px, 52vh); overflow-y: auto; border: 1px solid var(--border, #dedede); border-radius: 14px; background: #fff; box-shadow: 0 10px 28px rgba(0, 0, 0, .10); padding: 6px; }
+.skill-command-menu button { display: grid; width: 100%; gap: 3px; border: 0; border-radius: 9px; background: transparent; padding: 8px 10px; text-align: left; color: var(--text, #161616); cursor: pointer; }
 .skill-command-menu button:hover, .skill-command-menu button.active { background: #f3f3f3; }
-.skill-command-menu strong { font-size: 13px; }
-.skill-command-menu span, .skill-command-empty { color: var(--muted, #777); font-size: 12px; line-height: 1.45; }
+.skill-command-title { display:flex; align-items:baseline; justify-content:space-between; gap:12px; min-width:0; }
+.skill-command-title strong { overflow:hidden; color:var(--text, #161616); font-size:13px; text-overflow:ellipsis; white-space:nowrap; }
+.skill-command-title code { flex:0 0 auto; color:#8a8a8a; font-family:inherit; font-size:11px; }
+.skill-command-summary, .skill-command-detail, .skill-command-empty { color: var(--muted, #777); font-size: 12px; line-height: 1.4; }
+.skill-command-summary { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.skill-command-detail { display:-webkit-box; overflow:hidden; padding-top:2px; border-top:1px solid #e7e7e7; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
 .skill-command-empty { padding: 12px; }
+.selected-skill-row { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 8px; }
+.selected-skill-row span { display:inline-flex; align-items:center; gap:5px; border:1px solid #d6d6d6; border-radius:999px; padding:4px 8px; color:#555; background:#fafafa; font-size:12px; }
+.selected-skill-row button { border:0; background:transparent; padding:0; color:#777; cursor:pointer; font:inherit; font-size:15px; line-height:1; }
+
+/* 建书弹窗的 Skill 选择器使用框内提示，避免标题和占位文本重复。 */
+.create-skill-fields { display:grid; gap:9px; margin:1px 0 19px; }
+.create-skill-select { position:relative; }
+.create-skill-select::after { content:""; position:absolute; top:50%; right:14px; width:7px; height:7px; border-right:1.5px solid #777; border-bottom:1.5px solid #777; transform:translateY(-70%) rotate(45deg); pointer-events:none; }
+.create-skill-select select { box-sizing:border-box; width:100%; min-height:44px; appearance:none; border:1px solid var(--line, #dedede); border-radius:10px; outline:0; padding:10px 40px 10px 13px; background:#fafafa; color:#555; cursor:pointer; transition:border-color .15s ease, background .15s ease, box-shadow .15s ease; }
+.create-skill-select select:hover { border-color:#c7c7c7; background:#fff; }
+.create-skill-select select:focus { border-color:#a8a8a8; background:#fff; box-shadow:0 0 0 3px #eeeeee; }
+.create-skill-select select:disabled { color:#999; cursor:default; background:#f6f6f6; }
+.create-skill-select:has(select:disabled)::after { border-color:#aaa; }
+.create-selected-skills { margin:0; }
+.create-selected-skills span { padding:5px 9px; background:#f7f7f7; color:#444; }
+.create-selected-skills button { display:grid; width:18px; height:18px; place-items:center; border-radius:50%; }
+.create-selected-skills button:hover { background:#e7e7e7; color:#222; }
 
 .plan-skill-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .plan-skill-row span { border: 1px solid #d9d9d9; border-radius: 999px; padding: 3px 8px; color: #5d5d5d; font-size: 11px; font-weight: 400; }

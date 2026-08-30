@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Generic, Mapping, TypeVar
 
+from ...context import TokenEstimator, require_within_budget
 from ...llm import (
     LlmEventSink,
     LlmEvent,
@@ -17,6 +18,7 @@ from ...llm import (
     run_structured_worker,
     run_with_retry,
 )
+from ...skills import CreativeTaskContext, SkillMaterializer
 from ..exceptions import NovelAgentError
 
 
@@ -37,6 +39,7 @@ class BaseNovelAgent(Generic[OutputT]):
         retry_policy: WorkerRetryPolicy | None = None,
         sdk_settings: WorkerSettings | None = None,
         event_sinks: tuple[LlmEventSink, ...] = (),
+        skill_materializer: SkillMaterializer | None = None,
     ) -> None:
         if sdk_settings is None:
             raise ValueError("小说 Worker 必须提供 SDK WorkerSettings")
@@ -45,6 +48,52 @@ class BaseNovelAgent(Generic[OutputT]):
         self._sdk_settings = sdk_settings
         self._sdk_retry_policy = retry_policy or WorkerRetryPolicy()
         self._event_sinks = event_sinks
+        self._skill_materializer = skill_materializer
+
+    async def _with_skills(
+        self,
+        prompt: str,
+        *,
+        creative_task: CreativeTaskContext | None,
+        objective: str,
+        total_token_budget: int | None = None,
+    ) -> str:
+        """为一次 invocation 独立 Resolve，并附加原子 Skill 上下文。"""
+
+        if creative_task is None or not creative_task.applied_skills:
+            return prompt
+        if self._skill_materializer is None:
+            raise RuntimeError("CreativeTask 含 Skill，但 Agent 未配置 SkillMaterializer")
+        skill_token_budget: int | None = None
+        if total_token_budget is not None:
+            catalog = self._skill_materializer.catalog(creative_task)
+            skill_token_budget = max(
+                0,
+                total_token_budget
+                - TokenEstimator.estimate(prompt)
+                - TokenEstimator.estimate(catalog)
+                - 16,
+            )
+        materialized = await self._skill_materializer.materialize(
+            creative_task,
+            objective=objective,
+            token_budget=skill_token_budget,
+        )
+        event = LlmEvent(
+            LlmEventType.SKILL_RESOLVED,
+            self._agent_id,
+            self._skill_materializer.observation(creative_task, materialized),
+        )
+        for sink in self._event_sinks:
+            await sink.on_event(event)
+        rendered = f"{prompt}\n\n{materialized.render()}"
+        if total_token_budget is not None:
+            require_within_budget(
+                rendered,
+                budget=total_token_budget,
+                label=f"{self._name} 初始上下文（含 Skill metadata catalog）",
+            )
+        return rendered
 
     async def _generate(self, prompt: str) -> OutputT:
         """运行一次专业 Worker，并把运行时失败转换为领域异常。"""
@@ -58,6 +107,7 @@ class BaseNovelAgent(Generic[OutputT]):
         *,
         repair_instruction: str | None = None,
         sdk_settings: WorkerSettings | None = None,
+        agent_id: str | None = None,
     ) -> ValidatedT:
         """将模型调用、结构转换和领域校验纳入同一个有限重试边界。"""
 
@@ -66,6 +116,7 @@ class BaseNovelAgent(Generic[OutputT]):
             converter,
             repair_instruction=repair_instruction,
             sdk_settings=sdk_settings,
+            agent_id=agent_id,
         )
 
     async def _generate_validated_with_sdk(
@@ -75,10 +126,12 @@ class BaseNovelAgent(Generic[OutputT]):
         *,
         repair_instruction: str | None,
         sdk_settings: WorkerSettings | None = None,
+        agent_id: str | None = None,
     ) -> ValidatedT:
         """无工具 Worker 直接使用 SDK，并在领域校验失败后重投一次。"""
 
-        output_type = NOVEL_OUTPUT_TYPES[self._agent_id]
+        active_agent_id = agent_id or self._agent_id
+        output_type = NOVEL_OUTPUT_TYPES[active_agent_id]
         active_settings = sdk_settings or self._sdk_settings
         repair_raw_output: str | None = None
 
@@ -93,8 +146,11 @@ class BaseNovelAgent(Generic[OutputT]):
             if context.is_repair:
                 event = LlmEvent(
                     LlmEventType.MODEL_REPAIRING,
-                    self._agent_id,
-                    {"error": context.repair_error or "结构化输出校验失败", "has_raw_output": repair_raw_output is not None},
+                    active_agent_id,
+                    {
+                        "error": context.repair_error or "结构化输出校验失败",
+                        "has_raw_output": repair_raw_output is not None,
+                    },
                 )
                 for sink in self._event_sinks:
                     await sink.on_event(event)
@@ -107,7 +163,9 @@ class BaseNovelAgent(Generic[OutputT]):
                     tracing_enabled=True,
                     # 只有 Writer 的 content 能安全成为最终正文预览。Reviser、
                     # Analyzer 等仍在校验完成前保持静默，避免预览未提交改稿。
-                    stream_text_field="content" if self._agent_id == "novel-writer" else None,
+                    stream_text_field=(
+                        "content" if active_agent_id == "novel-writer" else None
+                    ),
                 )
             except StructuredOutputError as exc:
                 repair_raw_output = exc.raw_output
@@ -115,7 +173,7 @@ class BaseNovelAgent(Generic[OutputT]):
             return converter(output.model_dump())
 
         return await run_with_retry(
-            worker_name=self._agent_id,
+            worker_name=active_agent_id,
             operation=operation,
             policy=self._sdk_retry_policy,
         )

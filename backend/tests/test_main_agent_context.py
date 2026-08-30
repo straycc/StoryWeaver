@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import unittest
+from hashlib import sha256
 from types import SimpleNamespace
 
 from storyweaver.api.main_agent_context import MainAgentContextBuilder, WorkflowContextReader
 from storyweaver.application.models import ChatMessage, ChatSession
 from storyweaver.persistence.creative_control import CreativeControl
+from storyweaver.skills import AppliedSkill, CreativeTaskContext
 
 
 class _Sessions:
@@ -65,9 +67,20 @@ class _CreativeControls:
 class _MemoryRetriever:
     def __init__(self, memories=()) -> None:
         self._memories = memories
+        self.calls: list[dict[str, object]] = []
 
-    async def retrieve(self, *, query: str, book_id: str | None):
-        del query, book_id
+    async def retrieve(
+        self,
+        *,
+        query: str,
+        book_id: str | None,
+        recent_context: str = "",
+    ):
+        self.calls.append({
+            "query": query,
+            "book_id": book_id,
+            "recent_context": recent_context,
+        })
         return self._memories
 
 
@@ -109,13 +122,14 @@ class MainAgentContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("request:current", package.trace.protected_source_ids)
 
     async def test_conversation_memory_is_traceable_but_not_creative_constraint(self) -> None:
-        self.builder._memory_retriever = _MemoryRetriever((  # type: ignore[assignment]
+        retriever = _MemoryRetriever((
             SimpleNamespace(
                 memory_id="memory-1",
                 description="偏好克制悬疑",
                 content="讨论剧情时优先保留悬念，不急于揭晓真相。",
             ),
         ))
+        self.builder._memory_retriever = retriever  # type: ignore[assignment]
         session = ChatSession(
             session_id="session-1", title="测试", created_at="now", updated_at="now", book_id="book-1",
             messages=(ChatMessage("current", "user", "之后保持悬疑感", "now", sequence=1),),
@@ -134,6 +148,62 @@ class MainAgentContextTests(unittest.IsolatedAsyncioTestCase):
             "conversation-memory:memory-1",
             package.trace.protected_source_ids,
         )
+
+    async def test_short_follow_up_uses_recent_dialogue_for_memory_retrieval(self) -> None:
+        retriever = _MemoryRetriever()
+        self.builder._memory_retriever = retriever  # type: ignore[assignment]
+        session = ChatSession(
+            session_id="session-1", title="测试", created_at="now", updated_at="now", book_id="book-1",
+            messages=(
+                ChatMessage("old-user", "user", "我们采用哪条主角路线？", "now", sequence=1),
+                ChatMessage("old-assistant", "assistant", "第二个方向是被长辈遮瞒的身份线。", "now", sequence=2),
+                ChatMessage("current", "user", "身份线", "now", sequence=3),
+            ),
+        )
+
+        await self.builder.build(
+            session=session,
+            current_request="身份线",
+            current_sequence=3,
+            current_job_id="current",
+        )
+
+        self.assertEqual(len(retriever.calls), 1)
+        self.assertEqual(retriever.calls[0]["query"], "身份线")
+        self.assertIn("第二个方向是被长辈遮瞒的身份线", retriever.calls[0]["recent_context"])
+
+    async def test_only_skill_metadata_is_exposed_to_main_agent(self) -> None:
+        content = "---\nname: chapter-planning\ndescription: 章节规划方法。\n---\n\n这里是完整且不应进入 Main Agent 的秘密正文。"
+        task = CreativeTaskContext(
+            request="借助 Skill 讨论下一章",
+            applied_skills=(
+                AppliedSkill(
+                    skill_id="chapter-planning",
+                    name="chapter-planning",
+                    description="章节规划方法。",
+                    source="builtin",
+                    content=content,
+                    content_hash=sha256(content.encode("utf-8")).hexdigest(),
+                ),
+            ),
+        )
+        session = ChatSession(
+            session_id="session-1", title="测试", created_at="now", updated_at="now", book_id="book-1",
+            messages=(ChatMessage("current", "user", "借助 Skill 讨论下一章", "now", sequence=1),),
+        )
+
+        package = await self.builder.build(
+            session=session,
+            current_request="借助 Skill 讨论下一章",
+            current_sequence=1,
+            current_job_id="current",
+            creative_task=task,
+        )
+
+        self.assertIn("chapter-planning", package.rendered_context)
+        self.assertIn("章节规划方法", package.rendered_context)
+        self.assertNotIn("秘密正文", package.rendered_context)
+        self.assertIn("skill-catalog", package.trace.selected_source_ids)
 
 
 if __name__ == "__main__":

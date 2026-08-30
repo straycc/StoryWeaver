@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 from uuid import uuid4
 
@@ -48,6 +48,44 @@ def _json_value(text: str, expected: type[list[Any]] | type[dict[str, Any]]) -> 
 TextGenerator = Callable[[str], Awaitable[str]]
 
 
+def _bounded_recent_context(value: str, *, max_chars: int = 4000) -> str:
+    """即使调用方未使用统一 formatter，也不允许辅助上下文无界增长。"""
+
+    normalized = value.strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return "…" + normalized[-(max_chars - 1) :]
+
+
+def format_recent_dialogue(
+    messages: Iterable[tuple[str, str]],
+    *,
+    max_messages: int = 8,
+    max_chars: int = 4000,
+) -> str:
+    """把最近对话压到稳定上限，供记忆提取和检索消解指代。"""
+
+    if max_messages < 1 or max_chars < 1:
+        raise ValueError("最近对话限制必须大于 0")
+    normalized = [
+        f"{role.strip()}：{' '.join(content.split())}"
+        for role, content in messages
+        if role.strip() and content.strip()
+    ][-max_messages:]
+    selected: list[str] = []
+    remaining = max_chars
+    for line in reversed(normalized):
+        separator_size = 1 if selected else 0
+        if len(line) + separator_size <= remaining:
+            selected.append(line)
+            remaining -= len(line) + separator_size
+            continue
+        if not selected and remaining > 1:
+            selected.append("…" + line[-(remaining - 1) :])
+        break
+    return "\n".join(reversed(selected))
+
+
 class LongTermMemoryExtractor:
     """从已完成的普通聊天回合中自动提取稳定信息。"""
 
@@ -63,7 +101,9 @@ class LongTermMemoryExtractor:
         session_id: str,
         user_message_id: str,
         book_id: str | None,
+        recent_context: str = "",
     ) -> MemoryExtractionResult:
+        recent_context = _bounded_recent_context(recent_context)
         existing = self._available_records(book_id)[:200]
         catalog = "\n".join(
             f"- {item.memory_id} | {item.memory_type.value} | "
@@ -73,13 +113,18 @@ class LongTermMemoryExtractor:
         prompt = (
             "你是长期记忆提取器。只提取用户明确表达或明确确认、未来仍有用的信息。\n"
             "不要提取普通问题、一次性任务、助手自行提出但用户未确认的创意，也不要把聊天内容写成小说正史。\n"
+            "最近对话只用于理解当前用户消息中的代词、省略和确认对象；"
+            "不得把最近对话本身当作本轮新增记忆来源。\n"
+            "当前助手回复只用于理解本轮结果；助手新扩写、推断或建议的内容，"
+            "除非当前用户消息已经明确确认，否则不得保存。\n"
             "返回 JSON 数组；没有新信息时返回 []。每项字段：\n"
             "memory_type: user_preference|feedback|project_directive|reference\n"
             "scope_type: global|book；通用偏好用 global，当前作品特有要求用 book\n"
             "name: 简短稳定标识；description: 一行目录摘要；content: 完整可执行说明；"
             "importance: 1-5；supersedes_id: 冲突旧记忆 ID 或 null。\n"
             f"当前 book_id：{book_id or '无'}\n\n已有记忆：\n{catalog}\n\n"
-            f"用户：{user_message}\n助手：{assistant_message}"
+            f"最近对话（仅用于消解指代）：\n{recent_context or '（无）'}\n\n"
+            f"当前目标用户消息：{user_message}\n当前助手回复：{assistant_message}"
         )
         try:
             items = _json_value(await self.generate_text(prompt), list)
@@ -223,7 +268,9 @@ class LongTermMemoryRetriever:
         *,
         query: str,
         book_id: str | None,
+        recent_context: str = "",
     ) -> tuple[LongTermMemoryRecord, ...]:
+        recent_context = _bounded_recent_context(recent_context)
         records = list(
             self.store.list_records(
                 scope_type=MemoryScopeType.GLOBAL,
@@ -250,8 +297,10 @@ class LongTermMemoryRetriever:
         prompt = (
             "根据当前请求，从长期记忆目录选择明确相关的记忆。"
             f"最多返回 {self.limit} 个 memory_id，只返回 JSON 字符串数组；"
-            "没有相关项返回 []。\n\n"
-            f"当前请求：{query}\n\n记忆目录：\n{catalog}"
+            "没有相关项返回 []。当前请求是主要判断依据；"
+            "最近对话只用于理解代词、省略和承接关系，不能仅因历史中提到某事就选择记忆。\n\n"
+            f"当前请求：{query}\n\n最近对话（仅用于消解指代）：\n"
+            f"{recent_context or '（无）'}\n\n记忆目录：\n{catalog}"
         )
         try:
             selected_ids = _json_value(await self.generate_text(prompt), list)
@@ -265,7 +314,7 @@ class LongTermMemoryRetriever:
                     break
             return tuple(selected)
         except Exception:
-            return self._fallback(records, query)
+            return self._fallback(records, query, recent_context)
 
     def load_selected(
         self,
@@ -299,17 +348,24 @@ class LongTermMemoryRetriever:
         self,
         records: list[LongTermMemoryRecord],
         query: str,
+        recent_context: str = "",
     ) -> tuple[LongTermMemoryRecord, ...]:
         query_terms = self._terms(query)
+        context_terms = self._terms(recent_context)
         scored = []
         for item in records:
-            overlap = len(
-                query_terms
-                & self._terms(f"{item.name} {item.description} {item.content}")
+            memory_terms = self._terms(
+                f"{item.name} {item.description} {item.content}"
             )
-            scored.append((overlap, item.importance, item.updated_at, item))
-        scored.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
-        relevant = [row[3] for row in scored if row[0] > 0]
+            direct_overlap = len(query_terms & memory_terms)
+            context_overlap = len(context_terms & memory_terms)
+            # 当前请求的命中权重大于历史上下文，避免旧话题主导降级结果。
+            score = direct_overlap * 3 + context_overlap
+            scored.append(
+                (score, direct_overlap, item.importance, item.updated_at, item)
+            )
+        scored.sort(key=lambda row: (row[0], row[1], row[2], row[3]), reverse=True)
+        relevant = [row[4] for row in scored if row[0] > 0]
         return tuple(relevant[: self.limit])
 
     @staticmethod

@@ -5,8 +5,7 @@ from .base import BaseNovelAgent
 from .chapter_analyzer import ChapterAnalyzerAgent
 from .planner import PlannerAgent
 from .reviewer import ReviewerAgent
-from .reviser import ReviserAgent
-from .writer import WriterAgent
+from .writing import WritingAgent
 
 __all__ = [
     "ArchitectAgent",
@@ -14,6 +13,5 @@ __all__ = [
     "ChapterAnalyzerAgent",
     "PlannerAgent",
     "ReviewerAgent",
-    "ReviserAgent",
-    "WriterAgent",
+    "WritingAgent",
 ]

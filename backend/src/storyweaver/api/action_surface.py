@@ -17,12 +17,33 @@ from ..persistence import (
 from ..application.workspace import ChatWorkspaceApplication
 from .main_agent import ConversationDecision, MainAgent
 from .main_agent_context import MainAgentContextBuilder
-from .action_schemas import validate_action_parameters
-from ..skills import SkillRegistry
+from .capabilities import get_capability, validate_capability_parameters
+from .creative_discussion import CreativeDiscussionService
+from ..skills import (
+    CreativeTaskContext,
+    SkillRegistry,
+    SkillService,
+    creative_task_from_data,
+    creative_task_to_data,
+)
 from ..llm import LlmEventSink
 
 
 SubmitJob = Callable[..., Awaitable[Any]]
+
+
+def should_route_explicit_skill_reply(
+    decision: ConversationDecision,
+    creative_task: CreativeTaskContext | None,
+) -> bool:
+    """显式选择 Skill 的普通回复不得绕过专业创作能力。"""
+
+    return bool(
+        creative_task is not None
+        and creative_task.applied_skills
+        and decision.kind == "reply"
+        and decision.action is None
+    )
 
 
 class ActionDispatcher:
@@ -35,9 +56,15 @@ class ActionDispatcher:
         self._workspace = workspace
         self._submit_job = submit_job
         self._skills: SkillRegistry | None = None
+        self._skill_service: SkillService | None = None
 
-    def configure_skills(self, skills: SkillRegistry) -> None:
+    def configure_skills(
+        self,
+        skills: SkillRegistry,
+        skill_service: SkillService,
+    ) -> None:
         self._skills = skills
+        self._skill_service = skill_service
 
     def available_skills(self) -> tuple[object, ...]:
         """返回适合创作门户展示的项目级 Skill。
@@ -47,20 +74,46 @@ class ActionDispatcher:
         """
         if self._skills is None:
             return ()
-        return tuple(item for item in self._skills.list() if item.source == "project")
+        return tuple(item for item in self._skills.list() if item.source == "builtin")
 
     async def dispatch(self, *, action: str, session_id: str, book_id: str | None,
-                       parameters: Mapping[str, Any], action_proposal_id: str | None = None) -> Any:
+                       parameters: Mapping[str, Any], action_proposal_id: str | None = None,
+                       creative_task: CreativeTaskContext | None = None) -> Any:
         # 所有入口先落到统一 DTO，杜绝按钮和自然语言绕开参数校验。
         normalized_parameters = dict(parameters)
         # 旧批次弹窗仍使用 chapter_count；在边界处一次性兼容，内部只认 count。
         if action == "write_batch" and "count" not in normalized_parameters:
             normalized_parameters["count"] = normalized_parameters.pop("chapter_count", None)
-        parameters = validate_action_parameters(action, normalized_parameters)
+        parameters = validate_capability_parameters(action, normalized_parameters)
         if action == "prepare_chapter_plan":
+            instruction = self._text(parameters.get("instruction"))
             return await self._submit_job(job_type="prepare_chapter", book_id=self._require_book(book_id), payload={
-                "user_instruction": self._instruction_with_skills(self._text(parameters.get("instruction"))), "session_id": session_id,
+                "user_instruction": instruction,
+                "creative_task_context": self._snapshot_or_activate(
+                    creative_task=creative_task,
+                    request=instruction or "规划下一章",
+                    skill_ids=parameters.get("skill_ids"),
+                ),
+                "session_id": session_id,
             })
+        if action == "run_next_chapter_workflow":
+            instruction = self._text(parameters.get("instruction"))
+            return await self._submit_job(
+                job_type="prepare_chapter",
+                book_id=self._require_book(book_id),
+                payload={
+                    "user_instruction": instruction,
+                    "creative_task_context": self._snapshot_or_activate(
+                        creative_task=creative_task,
+                        request=instruction or "启动下一章完整工作流",
+                        skill_ids=parameters.get("skill_ids"),
+                    ),
+                    # Proposal 本身就是暂停与恢复边界；该标记用于观测最初
+                    # 是单节点规划还是完整工作流请求。
+                    "workflow_mode": "run_next_chapter_workflow",
+                    "session_id": session_id,
+                },
+            )
         if action == "revise_chapter_plan":
             proposal_id = self.resolve_plan_id(book_id, parameters.get("proposal_id"), session_id)
             return await self._submit_job(job_type="revise_plan", book_id=self._require_book(book_id), payload={
@@ -73,16 +126,55 @@ class ActionDispatcher:
                 "proposal_id": proposal_id, "session_id": session_id,
                 **({"action_proposal_id": action_proposal_id} if action_proposal_id else {}),
             })
+        if action == "approve_chapter_plan":
+            proposal_id = self.resolve_plan_id(
+                book_id, parameters.get("proposal_id"), session_id,
+                allowed_statuses=frozenset({"pending"}),
+            )
+            return await self._submit_job(
+                job_type="approve_plan",
+                book_id=self._require_book(book_id),
+                payload={"proposal_id": proposal_id, "session_id": session_id},
+            )
+        if action == "write_from_plan":
+            proposal_id = self.resolve_plan_id(
+                book_id, parameters.get("proposal_id"), session_id,
+                allowed_statuses=frozenset({"approved"}),
+            )
+            return await self._submit_job(
+                job_type="write_from_plan",
+                book_id=self._require_book(book_id),
+                payload={
+                    "proposal_id": proposal_id,
+                    "session_id": session_id,
+                    **(
+                        {"action_proposal_id": action_proposal_id}
+                        if action_proposal_id
+                        else {}
+                    ),
+                },
+            )
         if action == "rewrite_chapter":
             chapter_number = int(parameters.get("chapter_number") or 0)
             if chapter_number < 1:
                 raise ValueError("重写操作必须指定有效章节号")
+            instruction = self._text(parameters.get("instruction"))
             return await self._submit_job(job_type="rewrite_chapter", book_id=self._require_book(book_id), payload={
-                "chapter_number": chapter_number, "user_instruction": self._text(parameters.get("instruction")),
+                "chapter_number": chapter_number, "user_instruction": instruction,
+                "creative_task_context": self._snapshot_or_activate(
+                    creative_task=creative_task,
+                    request=instruction or f"重写第 {chapter_number} 章",
+                    skill_ids=parameters.get("skill_ids"),
+                ),
                 "session_id": session_id, **({"action_proposal_id": action_proposal_id} if action_proposal_id else {}),
             })
         if action == "cancel_chapter_plan":
-            proposal_id = self.resolve_plan_id(book_id, parameters.get("proposal_id"), session_id)
+            proposal_id = self.resolve_plan_id(
+                book_id,
+                parameters.get("proposal_id"),
+                session_id,
+                allowed_statuses=frozenset({"pending", "approved"}),
+            )
             return await self._submit_job(job_type="cancel_plan", book_id=self._require_book(book_id), payload={
                 "proposal_id": proposal_id, "session_id": session_id,
             })
@@ -90,9 +182,41 @@ class ActionDispatcher:
             count = int(parameters.get("count") or parameters.get("chapter_count") or 0)
             if count < 1:
                 raise ValueError("连续创作必须指定正整数章节数")
+            instruction = self._text(parameters.get("instruction"))
             return await self._submit_job(job_type="write_batch", book_id=self._require_book(book_id), payload={
-                "count": count, "user_instruction": self._text(parameters.get("instruction")), "session_id": session_id,
+                "count": count, "user_instruction": instruction,
+                "creative_task_context": self._snapshot_or_activate(
+                    creative_task=creative_task,
+                    request=instruction or f"连续创作 {count} 章",
+                    skill_ids=parameters.get("skill_ids"),
+                ),
+                "session_id": session_id,
             })
+        if action == "create_novel":
+            frozen_task = self._snapshot_or_activate(
+                creative_task=creative_task,
+                request=str(parameters.get("premise") or "创建小说"),
+                skill_ids=(),
+            )
+            return await self._submit_job(
+                job_type="session_action",
+                book_id=None,
+                payload={
+                    "session_id": session_id,
+                    "content": "确认根据上述创作简报创建作品",
+                    "action": "create_novel",
+                    "book_id": None,
+                    "action_payload": {
+                        **dict(parameters),
+                        "creative_task_context": frozen_task,
+                    },
+                    **(
+                        {"action_proposal_id": action_proposal_id}
+                        if action_proposal_id
+                        else {}
+                    ),
+                },
+            )
         raise ValueError(f"不支持的业务动作：{action}")
 
     async def confirm(self, proposal_id: str) -> ActionProposal:
@@ -100,9 +224,17 @@ class ActionDispatcher:
         if proposal.status != "pending":
             raise ValueError(f"该操作当前为 {proposal.status}，不能确认")
         self._assert_not_expired(proposal)
+        parameters = dict(proposal.payload)
+        frozen_task_data = parameters.pop("creative_task_context", None)
+        frozen_task = (
+            creative_task_from_data(frozen_task_data)
+            if frozen_task_data is not None
+            else None
+        )
         job = await self.dispatch(
             action=proposal.action_type, session_id=proposal.session_id, book_id=proposal.book_id,
-            parameters=proposal.payload, action_proposal_id=proposal.proposal_id,
+            parameters=parameters, action_proposal_id=proposal.proposal_id,
+            creative_task=frozen_task,
         )
         return self._proposals.confirm(proposal.proposal_id, job_id=job.job_id)
 
@@ -112,28 +244,52 @@ class ActionDispatcher:
         return proposal
 
     def _assert_not_expired(self, proposal: ActionProposal) -> None:
-        if proposal.action_type != "confirm_and_write_chapter":
+        if proposal.action_type not in {"confirm_and_write_chapter", "write_from_plan"}:
             return
         try:
-            self.resolve_plan_id(proposal.book_id, proposal.payload.get("proposal_id"), proposal.session_id)
+            self.resolve_plan_id(
+                proposal.book_id,
+                proposal.payload.get("proposal_id"),
+                proposal.session_id,
+                allowed_statuses=(
+                    frozenset({"approved"})
+                    if proposal.action_type == "write_from_plan"
+                    else frozenset({"pending"})
+                ),
+            )
         except (KeyError, ValueError):
             self._proposals.expire(proposal.proposal_id)
             raise ValueError("关联章节计划已失效，不能确认旧操作")
 
-    def resolve_plan_id(self, book_id: str | None, value: object, session_id: str) -> str:
+    def resolve_plan_id(
+        self,
+        book_id: str | None,
+        value: object,
+        session_id: str,
+        *,
+        allowed_statuses: frozenset[str] = frozenset({"pending"}),
+    ) -> str:
         candidate = self._text(value)
         if not candidate:
-            candidate = self._latest_pending_plan_id(session_id)
+            candidate = self._latest_plan_id(session_id, allowed_statuses)
         if not candidate:
             raise ValueError("当前没有可确认的候选章节计划，请先生成计划")
         proposal = self._workspace.novels.load_chapter_plan_proposal(book_id=self._require_book(book_id), proposal_id=candidate)
-        if proposal.status != "pending":
-            raise ValueError("候选章节计划已不再等待确认")
+        if proposal.status not in allowed_statuses:
+            expected = "、".join(sorted(allowed_statuses))
+            raise ValueError(f"候选章节计划状态为 {proposal.status}，需要状态：{expected}")
         return candidate
 
-    def _latest_pending_plan_id(self, session_id: str) -> str | None:
+    def _latest_plan_id(
+        self,
+        session_id: str,
+        allowed_statuses: frozenset[str],
+    ) -> str | None:
         for event in reversed(self._workspace.sessions.list_events(session_id)):
-            if event.event_type.startswith("chapter_plan_") and event.payload.get("status") == "pending":
+            if (
+                event.event_type.startswith("chapter_plan_")
+                and event.payload.get("status") in allowed_statuses
+            ):
                 value = event.payload.get("proposal_id")
                 if value:
                     return str(value)
@@ -141,9 +297,22 @@ class ActionDispatcher:
 
     @staticmethod
     def data(proposal: ActionProposal) -> dict[str, Any]:
-        return {"action_proposal_id": proposal.proposal_id, "book_id": proposal.book_id, "action_type": proposal.action_type,
-                "payload": dict(proposal.payload), "summary": proposal.summary, "status": proposal.status,
-                "job_id": proposal.job_id, "created_at": proposal.created_at, "confirmed_at": proposal.confirmed_at}
+        payload = dict(proposal.payload)
+        frozen_task_data = payload.pop("creative_task_context", None)
+        applied_skills: list[dict[str, str]] = []
+        if frozen_task_data is not None:
+            task = creative_task_from_data(frozen_task_data)
+            applied_skills = [
+                {"skill_id": item.skill_id, "content_hash": item.content_hash}
+                for item in task.applied_skills
+            ]
+        return {"action_proposal_id": proposal.proposal_id, "session_id": proposal.session_id,
+                "book_id": proposal.book_id, "action_type": proposal.action_type,
+                "payload": payload, "applied_skills": applied_skills,
+                "summary": proposal.summary, "status": proposal.status,
+                "job_id": proposal.job_id, "created_at": proposal.created_at,
+                "confirmed_at": proposal.confirmed_at,
+                "expires_at": proposal.expires_at, "updated_at": proposal.updated_at}
 
     @staticmethod
     def _require_book(book_id: str | None) -> str:
@@ -163,17 +332,30 @@ class ActionDispatcher:
             raise ValueError(f"{field} 不能为空")
         return text
 
-    def _instruction_with_skills(self, instruction: str | None) -> str | None:
-        if self._skills is None:
-            return instruction
-        cleaned, skills = self._skills.resolve_requested(instruction)
-        if not skills:
-            return cleaned
-        guidance = "\n\n".join(
-            f"[已启用 Skill：{item.skill_id} · {item.content_hash}]\n{item.body}"
-            for item in skills
-        )
-        return f"{cleaned or '无额外用户要求'}\n\n{guidance}"
+    def _activate(self, *, request: str, skill_ids: object) -> dict[str, object]:
+        if self._skill_service is None:
+            raise RuntimeError("SkillService 尚未配置")
+        ids = tuple(str(item) for item in skill_ids) if isinstance(skill_ids, list) else ()
+        try:
+            return creative_task_to_data(
+                self._skill_service.activate(request=request, skill_ids=ids)
+            )
+        except KeyError as exc:
+            # Main Agent Action 与直接 API 使用同一种可展示参数错误。
+            raise ValueError(str(exc)) from exc
+
+    def _snapshot_or_activate(
+        self,
+        *,
+        creative_task: CreativeTaskContext | None,
+        request: str,
+        skill_ids: object,
+    ) -> dict[str, object]:
+        """优先沿用上游 Job Snapshot；只有入口尚未冻结时才 Activate。"""
+
+        if creative_task is not None:
+            return creative_task_to_data(creative_task)
+        return self._activate(request=request, skill_ids=skill_ids)
 
 
 class MainAgentActionSurface:
@@ -182,16 +364,19 @@ class MainAgentActionSurface:
     def __init__(self, *, agent: MainAgent, proposals: ActionProposalRepository,
                  dispatcher: ActionDispatcher, workspace: ChatWorkspaceApplication,
                  context_builder: MainAgentContextBuilder,
+                 creative_discussion: CreativeDiscussionService | None = None,
                  context_snapshots: ContextSnapshotRepository | None = None) -> None:
         self._agent = agent
         self._proposals = proposals
         self._dispatcher = dispatcher
         self._workspace = workspace
         self._context_builder = context_builder
+        self._creative_discussion = creative_discussion
         self._context_snapshots = context_snapshots
 
     async def handle(self, *, session_id: str, content: str,
                      current_job_id: str | None = None,
+                     creative_task: CreativeTaskContext | None = None,
                      event_sinks: Sequence[LlmEventSink] = ()) -> dict[str, Any]:
         session = self._workspace.sessions.load_session(session_id)
         # 用户输入先持久化；即使意图模型暂时失败，也不会丢失这次会话事实。
@@ -203,7 +388,9 @@ class MainAgentActionSurface:
         if slash == "list":
             skills = self._dispatcher.available_skills()
             reply = "当前没有可用 Skill。" if not skills else "可用 Skill：\n" + "\n".join(
-                f"- `{item.skill_id}`：{item.description}" for item in skills
+                f"- {item.display_name} (`{item.skill_id}`)："
+                f"{item.short_description}"
+                for item in skills
             ) + "\n\n使用：`/skill <skill-id> <创作要求>`"
             self._reply(session_id, reply, user_message=user_message)
             return {"kind": "reply", "reply": reply}
@@ -216,7 +403,7 @@ class MainAgentActionSurface:
             try:
                 job = await self._dispatcher.dispatch(
                     action="prepare_chapter_plan", session_id=session_id, book_id=session.book_id,
-                    parameters={"instruction": f"@{skill_id} {instruction}"},
+                    parameters={"instruction": instruction, "skill_ids": [skill_id]},
                 )
             except ValueError as exc:
                 reply = f"Skill 命令无效：{exc}"
@@ -228,6 +415,7 @@ class MainAgentActionSurface:
         # 明确的中文查询命令不值得交给模型猜参数；先确定性解析，模糊表达再交 Main Agent。
         explicit = self._explicit_query_decision(content)
         context_trace: dict[str, Any] | None = None
+        rendered_context = ""
         if explicit is not None:
             decision = explicit
         else:
@@ -236,8 +424,10 @@ class MainAgentActionSurface:
                 current_request=content,
                 current_sequence=user_message.sequence,
                 current_job_id=current_job_id,
+                creative_task=creative_task,
             )
             context_trace = package.trace_data()
+            rendered_context = package.rendered_context
             if self._context_snapshots is not None:
                 self._context_snapshots.save(
                     agent_role="main_agent",
@@ -254,7 +444,7 @@ class MainAgentActionSurface:
             )
         if decision.action:
             try:
-                decision.parameters = validate_action_parameters(decision.action, decision.parameters)
+                decision.parameters = validate_capability_parameters(decision.action, decision.parameters)
             except ValueError as exc:
                 reply = f"我理解了你的意图，但参数还不完整：{exc}"
                 self._reply(session_id, reply,
@@ -266,30 +456,110 @@ class MainAgentActionSurface:
                         user_message=user_message, context_trace=context_trace)
             return {"kind": "query", "reply": reply}
         if decision.kind == "action":
-            if not session.book_id:
-                self._reply(session_id, "请先在当前会话绑定一部作品，再进行章节规划或写作。",
+            capability = get_capability(str(decision.action))
+            if capability.requires_book and not session.book_id:
+                self._reply(session_id, "请先在当前会话绑定一部作品，再执行这项创作能力。",
                             user_message=user_message, context_trace=context_trace)
                 return {"kind": "clarify"}
+            if decision.action == "creative_discussion":
+                if self._creative_discussion is None:
+                    raise RuntimeError("专业创作讨论能力尚未配置")
+                discussion = await self._creative_discussion.discuss(
+                    context=rendered_context,
+                    objective=str(decision.parameters["objective"]),
+                    creative_task=creative_task,
+                    event_sinks=event_sinks,
+                )
+                reply = discussion.reply
+                if discussion.skill_resolution is not None:
+                    context_trace = {
+                        **(context_trace or {}),
+                        "skill_resolution": discussion.skill_resolution,
+                    }
+                self._reply(session_id, reply, user_message=user_message,
+                            context_trace=context_trace)
+                return {"kind": "reply", "reply": reply}
+            if decision.action == "create_novel":
+                if session.book_id:
+                    reply = "当前会话已经绑定作品。请新建一个会话，再根据新书设定创建另一部作品。"
+                    self._reply(session_id, reply, user_message=user_message,
+                                context_trace=context_trace)
+                    return {"kind": "clarify", "reply": reply}
+                frozen_parameters = dict(decision.parameters)
+                if creative_task is not None:
+                    frozen_parameters["creative_task_context"] = creative_task_to_data(
+                        creative_task
+                    )
+                proposal = self._proposals.create(
+                    session_id=session_id,
+                    book_id=None,
+                    action_type="create_novel",
+                    payload=frozen_parameters,
+                    summary=f"创建小说《{decision.parameters['title']}》",
+                )
+                self._workspace.sessions.append_event(
+                    session_id,
+                    event_type="action_proposal_pending",
+                    payload=self._dispatcher.data(proposal),
+                )
+                reply = f"我已把上述讨论整理成《{decision.parameters['title']}》的创作简报，请确认后创建作品。"
+                self._reply(session_id, reply, user_message=user_message,
+                            context_trace=context_trace)
+                return {"kind": "proposal", "proposal": self._dispatcher.data(proposal)}
             if decision.action in {"prepare_chapter_plan", "revise_chapter_plan"}:
                 job = await self._dispatcher.dispatch(action=str(decision.action), session_id=session_id,
-                                                      book_id=session.book_id, parameters=decision.parameters)
+                                                      book_id=session.book_id, parameters=decision.parameters,
+                                                      creative_task=creative_task)
                 reply = "已开始生成候选章节计划。完成后请检查计划卡片，再确认是否写入正文。"
                 self._reply(session_id, reply,
                             user_message=user_message, context_trace=context_trace)
                 return {"kind": "job", "job_id": job.job_id, "reply": reply}
-            if decision.action in {"confirm_and_write_chapter", "rewrite_chapter"}:
+            if decision.action in {"cancel_chapter_plan", "approve_chapter_plan"}:
+                job = await self._dispatcher.dispatch(
+                    action=str(decision.action), session_id=session_id,
+                    book_id=session.book_id, parameters=decision.parameters,
+                )
+                reply = (
+                    "候选计划已进入批准流程；正文不会自动生成。"
+                    if decision.action == "approve_chapter_plan"
+                    else "已开始取消当前候选章节计划。"
+                )
+                self._reply(session_id, reply, user_message=user_message,
+                            context_trace=context_trace)
+                return {"kind": "job", "job_id": job.job_id, "reply": reply}
+            if decision.action == "run_next_chapter_workflow":
+                job = await self._dispatcher.dispatch(
+                    action="run_next_chapter_workflow", session_id=session_id,
+                    book_id=session.book_id, parameters=decision.parameters,
+                    creative_task=creative_task,
+                )
+                reply = "完整章节工作流已启动；我会先生成候选计划，并在计划确认点暂停。"
+                self._reply(session_id, reply, user_message=user_message,
+                            context_trace=context_trace)
+                return {"kind": "job", "job_id": job.job_id, "reply": reply}
+            if decision.action in {"confirm_and_write_chapter", "write_from_plan", "rewrite_chapter", "write_batch"}:
                 frozen_parameters = dict(decision.parameters)
-                if decision.action == "confirm_and_write_chapter":
+                if decision.action in {"confirm_and_write_chapter", "write_from_plan"}:
                     # 创建时即解析并冻结候选计划，确认时还会再次检查其仍为 pending。
                     try:
                         frozen_parameters["proposal_id"] = self._dispatcher.resolve_plan_id(
                             session.book_id, frozen_parameters.get("proposal_id"), session_id,
+                            allowed_statuses=(
+                                frozenset({"approved"})
+                                if decision.action == "write_from_plan"
+                                else frozenset({"pending"})
+                            ),
                         )
                     except ValueError:
                         reply = "当前没有可确认的候选章节计划。你可以先说“生成下一章计划”，或继续讨论创作方向。"
                         self._reply(session_id, reply,
                                     user_message=user_message, context_trace=context_trace)
                         return {"kind": "clarify", "reply": reply}
+                elif creative_task is not None:
+                    # 重写确认跨越 ActionProposal，必须携带 Chat Job 已冻结的 Snapshot。
+                    frozen_parameters["creative_task_context"] = (
+                        creative_task_to_data(creative_task)
+                    )
                 proposal = self._proposals.create(session_id=session_id, book_id=session.book_id,
                     action_type=str(decision.action), payload=frozen_parameters,
                     summary=self._action_summary(decision, session.book_id))
@@ -297,6 +567,27 @@ class MainAgentActionSurface:
                 self._reply(session_id, f"我已准备好执行：{proposal.summary}\n请在下方确认后再开始。",
                             user_message=user_message, context_trace=context_trace)
                 return {"kind": "proposal", "proposal": self._dispatcher.data(proposal)}
+        if should_route_explicit_skill_reply(decision, creative_task):
+            if self._creative_discussion is None:
+                raise RuntimeError("专业创作讨论能力尚未配置")
+            discussion = await self._creative_discussion.discuss(
+                context=rendered_context,
+                objective=content,
+                creative_task=creative_task,
+                event_sinks=event_sinks,
+            )
+            if discussion.skill_resolution is not None:
+                context_trace = {
+                    **(context_trace or {}),
+                    "skill_resolution": discussion.skill_resolution,
+                }
+            self._reply(
+                session_id,
+                discussion.reply,
+                user_message=user_message,
+                context_trace=context_trace,
+            )
+            return {"kind": "reply", "reply": discussion.reply}
         reply = decision.reply.strip() or "我理解了。你可以继续说明希望推进的人物、冲突或章节目标。"
         self._reply(session_id, reply,
                     user_message=user_message, context_trace=context_trace)
@@ -389,15 +680,19 @@ class MainAgentActionSurface:
 
     def _pending_plan_reply(self, session_id: str, book_id: str) -> str:
         for event in reversed(self._workspace.sessions.list_events(session_id)):
-            if not event.event_type.startswith("chapter_plan_") or event.payload.get("status") != "pending":
+            if (
+                not event.event_type.startswith("chapter_plan_")
+                or event.payload.get("status") not in {"pending", "approved"}
+            ):
                 continue
             proposal_id = str(event.payload.get("proposal_id") or "")
             if not proposal_id:
                 continue
             proposal = self._workspace.novels.load_chapter_plan_proposal(book_id=book_id, proposal_id=proposal_id)
-            if proposal.status == "pending":
-                return f"当前待确认：第 {proposal.chapter_number} 章计划 V{proposal.version}\n目标：{proposal.plan.goal}\n结尾悬念：{proposal.plan.ending_hook}"
-        return "当前没有待确认的章节计划。"
+            if proposal.status in {"pending", "approved"}:
+                label = "待确认" if proposal.status == "pending" else "已批准、尚未写作"
+                return f"当前{label}：第 {proposal.chapter_number} 章计划 V{proposal.version}\n目标：{proposal.plan.goal}\n结尾悬念：{proposal.plan.ending_hook}"
+        return "当前没有待确认或已批准的章节计划。"
 
     def _review_reply(self, project: Any, book_id: str, chapter_value: object) -> str:
         chapter_number = self._chapter_number(chapter_value, default=project.state.last_committed_chapter)
@@ -497,5 +792,11 @@ class MainAgentActionSurface:
     def _action_summary(decision: ConversationDecision, book_id: str) -> str:
         if decision.action == "confirm_and_write_chapter":
             return "确认当前候选章节计划并生成正文"
+        if decision.action == "write_from_plan":
+            return "根据已批准计划生成正文"
+        if decision.action == "write_batch":
+            return f"连续创作 {decision.parameters.get('count')} 章"
+        if decision.action == "create_novel":
+            return f"创建小说《{decision.parameters.get('title')}》"
         chapter = decision.parameters.get("chapter_number")
         return f"重写第 {chapter} 章" if chapter else "重写指定章节"

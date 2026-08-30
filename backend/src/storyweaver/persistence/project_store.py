@@ -226,6 +226,8 @@ class PostgresStoryProjectRepository:
                             proposal.version != current.version
                             or proposal.plan != current.plan
                             or proposal.user_instruction != current.user_instruction
+                            or proposal.creative_task_context
+                            != current.creative_task_context
                             or proposal.feedback_history != current.feedback_history
                         )
                         row.version = proposal.version

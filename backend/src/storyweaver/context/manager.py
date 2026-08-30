@@ -9,7 +9,12 @@ from typing import Any
 
 from ..llm import LlmMessage, LlmMessageRole
 from ..memory.long_term import LongTermMemoryType
-from ..memory.services import LongTermMemoryRetriever, _json_value, _response_text
+from ..memory.services import (
+    LongTermMemoryRetriever,
+    _json_value,
+    _response_text,
+    format_recent_dialogue,
+)
 from ..application.models import ChatMessage, ChatSession, TranscriptEvent
 from ..application.ports import ChatSessionRepository
 from .policy import ChatContextPolicy
@@ -64,13 +69,25 @@ class SessionContextManager:
             for item in session.messages
             if item.action == "chat" and item.sequence > binding_sequence
         )
-        current_query = next(
-            (item.content for item in reversed(chat_messages) if item.role == "user"),
-            "",
+        current_index = next(
+            (
+                index
+                for index in range(len(chat_messages) - 1, -1, -1)
+                if chat_messages[index].role == "user"
+            ),
+            None,
+        )
+        current_query = (
+            chat_messages[current_index].content if current_index is not None else ""
+        )
+        recent_context = format_recent_dialogue(
+            (item.role, item.content)
+            for item in (chat_messages[:current_index] if current_index is not None else ())
         )
         memories = await self.memory_retriever.retrieve(
             query=current_query,
             book_id=session.book_id,
+            recent_context=recent_context,
         )
         summary = await self._ensure_summary(
             session=session,

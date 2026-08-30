@@ -141,10 +141,21 @@ class PersistenceJobsTests(unittest.TestCase):
             updated_at="2026-08-23T00:00:00+00:00",
         )
         store.save_plan_proposal(proposal)
+        approved = replace(
+            proposal,
+            status="approved",
+            updated_at="2026-08-23T00:02:00+00:00",
+        )
+        store.save_plan_proposal(approved)
+        self.assertEqual(
+            store.load_plan_proposal(BOOK_ID, proposal.proposal_id).status,
+            "approved",
+        )
         store.save_plan_proposal(
             replace(
-                proposal,
+                approved,
                 version=2,
+                status="pending",
                 feedback_history=("加强雨夜压迫感",),
                 updated_at="2026-08-23T00:05:00+00:00",
             )

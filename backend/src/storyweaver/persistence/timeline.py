@@ -13,7 +13,8 @@ class TimelineProjector:
     VISIBLE_TYPES = frozenset({
         "message_added", "book_bound", "story_timeline_rewritten",
         "action_started", "action_completed", "action_failed",
-        "chapter_plan_prepared", "chapter_plan_revised", "chapter_plan_confirmed",
+        "chapter_plan_prepared", "chapter_plan_revised", "chapter_plan_approved",
+        "chapter_plan_confirmed",
         "chapter_plan_rejected", "chapter_plan_cancelled", "chapter_plan_expired",
         "action_proposal_pending", "action_proposal_confirmed", "action_proposal_cancelled",
     })

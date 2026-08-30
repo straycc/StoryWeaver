@@ -1,6 +1,9 @@
 ---
-name: Wuxia Serial Writing
+name: wuxia-serial-writing
 description: 武侠连载章节的江湖氛围、人物对峙、线索推进与章末钩子写作方法。
+metadata:
+  display_name: "武侠连载写作"
+  short_description: "强化江湖氛围、人物试探、线索推进、武学代价与章末钩子"
 ---
 
 # 武侠连载写作

@@ -24,10 +24,14 @@ TRANSCRIPT_EVENT_TYPES = frozenset(
         "memory_extracted",
         "chapter_plan_prepared",
         "chapter_plan_revised",
+        "chapter_plan_approved",
         "chapter_plan_confirmed",
         "chapter_plan_rejected",
         "chapter_plan_cancelled",
         "chapter_plan_expired",
+        "action_proposal_pending",
+        "action_proposal_confirmed",
+        "action_proposal_cancelled",
     }
 )
 

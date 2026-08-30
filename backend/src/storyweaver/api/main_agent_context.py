@@ -20,7 +20,8 @@ from ..context import (
     select_context,
 )
 from ..persistence import ActionProposalRepository, CreativeControlRepository, JobRepository
-from ..memory.services import LongTermMemoryRetriever
+from ..memory.services import LongTermMemoryRetriever, format_recent_dialogue
+from ..skills import CreativeTaskContext, render_skill_catalog
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,9 +93,10 @@ class WorkflowContextReader:
                 )
             except (KeyError, ValueError):
                 continue
-            if proposal.status == "pending":
+            if proposal.status in {"pending", "approved"}:
+                label = "待确认" if proposal.status == "pending" else "已批准、待写作"
                 return (
-                    f"第 {proposal.chapter_number} 章候选计划 V{proposal.version}："
+                    f"第 {proposal.chapter_number} 章候选计划 V{proposal.version}（{label}）："
                     f"{self._compact(proposal.plan.goal, 280)}"
                 )
         return None
@@ -143,6 +145,7 @@ class MainAgentContextBuilder:
         current_request: str,
         current_sequence: int,
         current_job_id: str | None,
+        creative_task: CreativeTaskContext | None = None,
     ) -> MainAgentContextPackage:
         if current_sequence < 1:
             raise ValueError("current_sequence 必须为正数")
@@ -153,6 +156,16 @@ class MainAgentContextBuilder:
             items, "request:current", "current_request", current_request,
             protected=True, priority=100, reason="本轮用户请求只能出现一次",
         )
+        if creative_task is not None and creative_task.applied_skills:
+            self._append(
+                items,
+                "skill-catalog",
+                "skill_catalog",
+                render_skill_catalog(creative_task),
+                protected=False,
+                priority=85,
+                reason="只向 Main Agent 暴露本次已选 Skill metadata，用于能力路由",
+            )
         self._append_session_summary(items, session)
         self._append_book_digest(items, session.book_id)
         workflow = self._workflow.read(
@@ -162,17 +175,22 @@ class MainAgentContextBuilder:
         )
         self._append_workflow(items, workflow)
         self._append_creative_control(items, session.book_id)
-        retrieved_memory_ids = await self._append_conversation_memories(
-            items,
-            current_request=current_request,
-            book_id=session.book_id,
-        )
 
-        # 显式排除当前消息；不能依赖“append 前读取 session”的调用顺序。
+        # 显式排除当前消息；历史同时用于 Memory 指代解析和最终上下文候选。
         history = [
             item for item in session.messages
             if item.sequence < current_sequence and item.action == "chat"
         ][-self._policy.recent_message_limit :]
+        recent_context = format_recent_dialogue(
+            (message.role, message.content) for message in history
+        )
+        retrieved_memory_ids = await self._append_conversation_memories(
+            items,
+            current_request=current_request,
+            book_id=session.book_id,
+            recent_context=recent_context,
+        )
+
         for message in history:
             self._append(
                 items,
@@ -223,13 +241,21 @@ class MainAgentContextBuilder:
         *,
         current_request: str,
         book_id: str | None,
+        recent_context: str,
     ) -> tuple[str, ...]:
         """按需补入自动会话记忆，绝不把它升级为创作硬约束。"""
 
         retriever = self._memory_retriever
-        if retriever is None or not self._should_retrieve_memory(current_request):
+        if retriever is None or not self._should_retrieve_memory(
+            current_request,
+            has_recent_context=bool(recent_context),
+        ):
             return ()
-        memories = await retriever.retrieve(query=current_request, book_id=book_id)
+        memories = await retriever.retrieve(
+            query=current_request,
+            book_id=book_id,
+            recent_context=recent_context,
+        )
         selected: list[str] = []
         for memory in memories:
             self._append(
@@ -247,7 +273,7 @@ class MainAgentContextBuilder:
         return tuple(selected)
 
     @staticmethod
-    def _should_retrieve_memory(content: str) -> bool:
+    def _should_retrieve_memory(content: str, *, has_recent_context: bool = False) -> bool:
         """用确定性触发词控制检索成本，不为判断本身增加模型调用。"""
 
         markers = (
@@ -255,7 +281,11 @@ class MainAgentContextBuilder:
             "不要", "必须", "以后", "希望", "先别", "保持", "人物",
             "情节", "剧情", "主角", "方向", "延续", "继续",
         )
-        return any(marker in content for marker in markers)
+        if any(marker in content for marker in markers):
+            return True
+        # 很短的回复通常承接上一轮，例如“身份线”“就按第二个”。这类请求
+        # 需要让 Retriever 借助最近对话消解含义，再决定是否返回长期记忆。
+        return has_recent_context and len("".join(content.split())) <= 24
 
     def _append_session_summary(self, items: list[ContextItem], session: ChatSession) -> None:
         summary = self._workspace.sessions.latest_summary(session.session_id)

@@ -19,6 +19,7 @@ from ..memory import (
     LongTermMemoryRetriever,
     MemoryScopeType,
     LongTermMemoryStatus,
+    format_recent_dialogue,
 )
 from ..novel_creation.application import NovelApplicationSettings, NovelService
 from ..novel_creation.exceptions import ProjectAlreadyExistsError, ProjectPersistenceError
@@ -30,6 +31,7 @@ from ..novel_creation.models import (
 from ..novel_creation.pipeline import CreateNovelPipeline
 from ..observability import logging_context
 from ..skills import applied_skill_markers
+from ..skills import creative_task_from_data
 from .models import ChatMessage, ChatSession
 from .ports import ChatSessionRepository
 
@@ -199,13 +201,15 @@ class ChatWorkspaceApplication:
 
         if book_id is not None:
             self.bind_book(session_id, book_id)
+        # 未绑定作品的会话可以先讨论新书设定，再通过确认提案创建作品；已有
+        # 作品的会话仍禁止悄悄切换到另一部新书。
         may_bind_created_book = (
             action in {"create_novel", "create_example"}
-            and not self._has_conversation_activity(session_id)
+            and session.book_id is None
         )
         if action in {"create_novel", "create_example"} and not may_bind_created_book:
             raise ValueError(
-                "当前会话已有内容；创建新小说前请先新建空会话"
+                "当前会话已经绑定作品；创建新小说前请先新建会话"
             )
         if append_user_message:
             session = self.sessions.append_message(
@@ -497,7 +501,15 @@ class ChatWorkspaceApplication:
             request = self._create_request(payload, example=action == "create_example")
             book_id = CreateNovelPipeline.build_book_id(request)
             try:
-                project = await self.novels.create_project(request)
+                task_value = payload.get("creative_task_context")
+                project = await self.novels.create_project(
+                    request,
+                    (
+                        creative_task_from_data(task_value)
+                        if task_value is not None
+                        else None
+                    ),
+                )
                 created = True
             except ProjectAlreadyExistsError:
                 project = self.novels.store.load_project(book_id)
@@ -1209,12 +1221,19 @@ class ChatWorkspaceApplication:
     ) -> None:
         if self.memory_extractor is None:
             return
+        preceding_messages: list[tuple[str, str]] = []
+        for message in session.messages:
+            if message.message_id == user_message.message_id:
+                break
+            if message.action == "chat":
+                preceding_messages.append((message.role, message.content))
         result = await self.memory_extractor.extract(
             user_message=user_message.content,
             assistant_message=assistant_message.content,
             session_id=session.session_id,
             user_message_id=user_message.message_id,
             book_id=session.book_id,
+            recent_context=format_recent_dialogue(preceding_messages),
         )
         self.sessions.append_event(
             session.session_id,
@@ -1427,7 +1446,7 @@ class ChatWorkspaceApplication:
                 )
             except (KeyError, ValueError, ProjectPersistenceError):
                 continue
-            if proposal.status == "pending":
+            if proposal.status in {"pending", "approved"}:
                 return proposal
         return None
 
@@ -1477,7 +1496,18 @@ class ChatWorkspaceApplication:
             "target_words": project.metadata.chapter_target_words,
             "user_instruction": proposal.user_instruction,
             # 计划持久化的是注入后的指令，这里只投影标识和版本哈希，不向 UI 暴露 Skill 正文。
-            "applied_skills": list(applied_skill_markers(proposal.user_instruction)),
+            "applied_skills": (
+                [
+                    {
+                        "skill_id": item.skill_id,
+                        "content_hash": item.content_hash,
+                        "name": item.name,
+                    }
+                    for item in proposal.creative_task_context.applied_skills
+                ]
+                if proposal.creative_task_context is not None
+                else list(applied_skill_markers(proposal.user_instruction))
+            ),
             "feedback_history": list(proposal.feedback_history),
             "selected_memories": list(proposal.selected_memory_descriptions),
             "created_at": proposal.created_at,

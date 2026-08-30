@@ -15,14 +15,16 @@ from ..persistence.jobs import Job, JobRepository
 from ..persistence.action_proposals import ActionProposalRepository
 from ..persistence.creative_control import CreativeControlRepository
 from ..llm import LlmEvent, LlmEventSink, LlmEventType
+from ..skills import CreativeTaskContext, creative_task_from_data
 from .live_preview import LivePreviewHub
 
 
 class _JobLlmEventSink(LlmEventSink):
     """把 Main Agent 的安全文本字段投影到进程内临时预览。"""
 
-    def __init__(self, previews: LivePreviewHub, job_id: str) -> None:
+    def __init__(self, previews: LivePreviewHub, jobs: JobRepository, job_id: str) -> None:
         self._previews = previews
+        self._jobs = jobs
         self._job_id = job_id
 
     async def on_event(self, event: LlmEvent) -> None:
@@ -30,7 +32,13 @@ class _JobLlmEventSink(LlmEventSink):
         data = dict(event.data)
         agent_id = str(event.worker_id)
         field = str(data.get("field") or "reply")
-        if event_type == LlmEventType.STREAM_STARTED.value:
+        if event_type == LlmEventType.SKILL_RESOLVED.value:
+            self._jobs.append_event(
+                self._job_id,
+                "skill_resolved",
+                {"agent_id": agent_id, **data},
+            )
+        elif event_type == LlmEventType.STREAM_STARTED.value:
             await self._previews.start(self._job_id, agent_id=agent_id, field=field)
         elif event_type == LlmEventType.TEXT_DELTA.value:
             await self._previews.append(
@@ -189,7 +197,10 @@ class JobSupervisor:
                 return await self._action_surface.handle(
                     session_id=str(payload["session_id"]), content=str(payload.get("content") or ""),
                     current_job_id=job.job_id,
-                    event_sinks=(_JobLlmEventSink(self._live_previews, job.job_id),),
+                    creative_task=self._creative_task(payload),
+                    event_sinks=(
+                        _JobLlmEventSink(self._live_previews, self._jobs, job.job_id),
+                    ),
                 )
             workspace = self._require_workspace()
             result = await workspace.send_message(
@@ -219,13 +230,17 @@ class JobSupervisor:
             }
         if job.job_type == "create_book":
             request = CreateNovelRequest(**payload["request"])
-            project = await self._service.create_project(request)
+            project = await self._service.create_project(
+                request,
+                self._creative_task(payload),
+            )
             return {"book_id": project.metadata.book_id, "status": "created"}
         if job.job_type == "prepare_chapter":
             proposal = await self._service.prepare_next_chapter(
                 book_id=self._require_book(job),
                 user_instruction=payload.get("user_instruction"),
                 batch_context=self._batch_context(payload.get("batch_context")),
+                creative_task=self._creative_task(payload),
             )
             self._append_plan_event(job, "chapter_plan_prepared", proposal)
             return {"proposal_id": proposal.proposal_id, "chapter_number": proposal.chapter_number, "status": proposal.status}
@@ -237,6 +252,34 @@ class JobSupervisor:
             # proposal_id/status；否则会出现一张字段为空的“确认计划”卡片。
             proposal = self._service.load_chapter_plan_proposal(
                 book_id=self._require_book(job), proposal_id=str(payload["proposal_id"]),
+            )
+            self._append_plan_event(job, "chapter_plan_confirmed", proposal)
+            if result.committed and self._creative_controls is not None:
+                self._creative_controls.consume_after_commit(
+                    book_id=self._require_book(job), chapter_number=result.chapter_number,
+                )
+            self._append_chapter_result_message(job, result)
+            return self._chapter_result(result)
+        if job.job_type == "approve_plan":
+            proposal = self._service.approve_chapter_plan(
+                book_id=self._require_book(job),
+                proposal_id=str(payload["proposal_id"]),
+            )
+            self._append_plan_event(job, "chapter_plan_approved", proposal)
+            self._expire_related_action_proposals(job, str(payload["proposal_id"]))
+            return {
+                "proposal_id": proposal.proposal_id,
+                "chapter_number": proposal.chapter_number,
+                "status": proposal.status,
+            }
+        if job.job_type == "write_from_plan":
+            result = await self._service.write_from_plan(
+                book_id=self._require_book(job),
+                proposal_id=str(payload["proposal_id"]),
+            )
+            proposal = self._service.load_chapter_plan_proposal(
+                book_id=self._require_book(job),
+                proposal_id=str(payload["proposal_id"]),
             )
             self._append_plan_event(job, "chapter_plan_confirmed", proposal)
             if result.committed and self._creative_controls is not None:
@@ -264,6 +307,7 @@ class JobSupervisor:
             record, proposal = await self._service.prepare_rewrite_chapter(
                 book_id=self._require_book(job), chapter_number=int(payload["chapter_number"]),
                 user_instruction=payload.get("user_instruction"),
+                creative_task=self._creative_task(payload),
             )
             self._append_plan_event(job, "chapter_plan_prepared", proposal)
             return {"rewrite_id": record.rewrite_id, "proposal_id": proposal.proposal_id, "chapter_number": proposal.chapter_number}
@@ -271,6 +315,7 @@ class JobSupervisor:
             results = await self._service.write_chapters(
                 book_id=self._require_book(job), count=int(payload["count"]),
                 user_instruction=payload.get("user_instruction"),
+                creative_task=self._creative_task(payload),
                 on_chapter_committed=(
                     lambda result: self._creative_controls.consume_after_commit(
                         book_id=self._require_book(job), chapter_number=result.chapter_number,
@@ -294,7 +339,9 @@ class JobSupervisor:
             simulation = None
             for index in range(count):
                 simulation = await self._roleplay.run_turn(
-                    turn_id=turn.turn_id, job_id=job.job_id,
+                    turn_id=turn.turn_id,
+                    job_id=job.job_id,
+                    creative_task=self._creative_task(payload),
                     emit=lambda event_type, event_payload: self._jobs.append_event(job.job_id, event_type, event_payload),
                 )
                 # 自动旁观只在场景明确结束或达到本次三回合上限时停止；不再维护游戏化紧张度。
@@ -441,6 +488,8 @@ class JobSupervisor:
 
         direct_write_jobs = {
             "prepare_chapter",
+            "approve_plan",
+            "write_from_plan",
             "confirm_plan",
             "revise_plan",
             "cancel_plan",
@@ -466,6 +515,11 @@ class JobSupervisor:
     @staticmethod
     def _batch_context(value: object) -> BatchPlanningContext | None:
         return BatchPlanningContext(**value) if isinstance(value, dict) else None
+
+    @staticmethod
+    def _creative_task(payload: Mapping[str, Any]) -> CreativeTaskContext | None:
+        value = payload.get("creative_task_context")
+        return None if value is None else creative_task_from_data(value)
 
     @staticmethod
     def _chapter_result(result: Any) -> dict[str, Any]:

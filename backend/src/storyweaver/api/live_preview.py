@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -18,7 +18,6 @@ class _Preview:
     text: str = ""
     agent_id: str = ""
     field: str = "text"
-    subscribers: set[asyncio.Queue[dict[str, Any]]] = dataclass_field(default_factory=set)
 
 
 class LivePreviewHub:
@@ -30,6 +29,9 @@ class LivePreviewHub:
 
     def __init__(self) -> None:
         self._previews: dict[tuple[str, str], _Preview] = {}
+        # SSE 往往早于模型首个文本分片建立，因此订阅必须挂在 Job 上，不能只
+        # 挂在一个尚未创建的 Preview 上。之后该 Job 新建任何字段都能推送。
+        self._subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
         self._lock = asyncio.Lock()
 
     @asynccontextmanager
@@ -40,11 +42,11 @@ class LivePreviewHub:
         # 队列满时退化为一条最新全文快照，浏览器仍可恢复到正确文本。
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=128)
         async with self._lock:
+            self._subscribers.setdefault(job_id, set()).add(queue)
             snapshots: list[dict[str, Any]] = []
             for (preview_job_id, field), preview in self._previews.items():
                 if preview_job_id != job_id:
                     continue
-                preview.subscribers.add(queue)
                 if preview.text:
                     snapshots.append(self._event(
                         "preview_snapshot", job_id, preview.agent_id, field, text=preview.text,
@@ -53,9 +55,11 @@ class LivePreviewHub:
             yield queue, tuple(snapshots)
         finally:
             async with self._lock:
-                for (preview_job_id, _), preview in tuple(self._previews.items()):
-                    if preview_job_id == job_id:
-                        preview.subscribers.discard(queue)
+                subscribers = self._subscribers.get(job_id)
+                if subscribers is not None:
+                    subscribers.discard(queue)
+                    if not subscribers:
+                        self._subscribers.pop(job_id, None)
 
     async def start(self, job_id: str, *, agent_id: str, field: str) -> None:
         await self._start(job_id, agent_id=agent_id, field=field)
@@ -79,8 +83,15 @@ class LivePreviewHub:
             preview = self._previews.setdefault(key, _Preview())
             preview.agent_id = agent_id
             preview.field = field
+            # 同一 Job 可能先由 Main Agent 路由，再由专业 Worker 生成正式回复。
+            # 新阶段不能把上一阶段的临时文本继续拼进本阶段预览。
+            if preview.text:
+                preview.text = ""
+                self._broadcast_unlocked(job_id, preview, self._event(
+                    "preview_reset", job_id, agent_id, field,
+                ))
             event = self._event("preview_started", job_id, agent_id, field)
-            self._broadcast_unlocked(preview, event)
+            self._broadcast_unlocked(job_id, preview, event)
 
     async def _append(self, job_id: str, *, agent_id: str, field: str, delta: str) -> None:
         async with self._lock:
@@ -88,7 +99,7 @@ class LivePreviewHub:
             preview.agent_id = agent_id
             preview.field = field
             preview.text += delta
-            self._broadcast_unlocked(preview, self._event(
+            self._broadcast_unlocked(job_id, preview, self._event(
                 "preview_delta", job_id, preview.agent_id, field, delta=delta,
             ))
 
@@ -98,7 +109,7 @@ class LivePreviewHub:
             if preview is None:
                 return
             preview.text = ""
-            self._broadcast_unlocked(preview, self._event(
+            self._broadcast_unlocked(job_id, preview, self._event(
                 "preview_reset", job_id, agent_id, field,
             ))
 
@@ -109,7 +120,7 @@ class LivePreviewHub:
             preview = self._previews.get((job_id, field))
             if preview is None:
                 return
-            self._broadcast_unlocked(preview, self._event(
+            self._broadcast_unlocked(job_id, preview, self._event(
                 "preview_completed", job_id, agent_id, field,
             ))
 
@@ -119,8 +130,13 @@ class LivePreviewHub:
                 if key[0] == job_id:
                     self._previews.pop(key, None)
 
-    def _broadcast_unlocked(self, preview: _Preview, event: dict[str, Any]) -> None:
-        for queue in tuple(preview.subscribers):
+    def _broadcast_unlocked(
+        self,
+        job_id: str,
+        preview: _Preview,
+        event: dict[str, Any],
+    ) -> None:
+        for queue in tuple(self._subscribers.get(job_id, ())):
             try:
                 queue.put_nowait(event)
             except asyncio.QueueFull:

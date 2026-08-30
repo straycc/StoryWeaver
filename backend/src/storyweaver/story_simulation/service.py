@@ -11,6 +11,7 @@ from ..persistence.context_snapshots import ContextSnapshotRepository
 from ..novel_creation.repository import StoryProjectRepository
 from ..persistence.simulations import SimulationRepository
 from ..novel_creation.models import StoryState
+from ..skills import CreativeTaskContext
 from .runtime import RoleplayRuntime
 from .models import SimulationCharacter, SimulationCharacterState, SimulationSession, SimulationState, SimulationStateDelta
 from .reducer import SimulationStateReducer
@@ -56,13 +57,22 @@ class RoleplayService:
         now = datetime.now(timezone.utc).isoformat()
         return self.simulations.create(SimulationSession(str(uuid4()), book_id, book_version, base_chapter_number, mode, user_character_id, "active", 0, 1, snapshot, {"location": location, "opening_direction": opening_direction}, SimulationState(base_state.current_time, location, opening_direction, None, "ongoing", ids, tuple(initial_characters)), now, now))
 
-    async def run_turn(self, *, turn_id: str, job_id: str, emit: Callable[[str, dict[str, Any]], None]) -> SimulationSession:
+    async def run_turn(
+        self,
+        *,
+        turn_id: str,
+        job_id: str,
+        creative_task: CreativeTaskContext | None = None,
+        emit: Callable[[str, dict[str, Any]], None],
+    ) -> SimulationSession:
         turn = self.simulations.start_turn(turn_id); simulation = self.simulations.get(turn.simulation_id)
         emit("simulation_context_ready", {"simulation_id": simulation.simulation_id, "turn_number": turn.turn_number})
         try:
             result = await self.runtime.run_turn(
                 simulation=simulation, turn=turn, job_id=job_id,
-                history=self.simulations.list_turns(simulation.simulation_id), emit=emit,
+                history=self.simulations.list_turns(simulation.simulation_id),
+                creative_task=creative_task,
+                emit=emit,
             )
             output = result.output
             blocks = [item.model_dump() for item in output.blocks]
