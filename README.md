@@ -53,8 +53,8 @@ STORYWEAVER_LLM_BASE_URL=https://api.deepseek.com
 STORYWEAVER_LLM_MODEL=deepseek-v4-flash
 STORYWEAVER_LLM_API_KEY=your-api-key
 
-# 小说创作通常建议关闭思考模式，降低延迟与 Token 消耗。
-STORYWEAVER_LLM_THINKING=disabled
+# 可选：关闭思考模式可以降低延迟与 Token 消耗；默认预算支持思考模式。
+# STORYWEAVER_LLM_THINKING=disabled
 STORYWEAVER_LLM_JSON_MODE=auto
 
 ```

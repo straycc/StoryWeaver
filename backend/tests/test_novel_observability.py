@@ -88,6 +88,32 @@ class NovelRunObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(progress[1][2]["response_kind"], "tool_calls")
         self.assertNotIn("raw_response", progress[1][2])
 
+    async def test_reports_research_round_as_completed_decision(self) -> None:
+        """检索回合不是无效输出，日志应明确它完成了检索决策。"""
+
+        output: list[str] = []
+        observer = NovelRunObserver(output=output.append)
+
+        await observer.on_event(
+            LlmEvent(LlmEventType.RUN_STARTED, "novel-planner", {"max_steps": 3})
+        )
+        await observer.on_event(
+            LlmEvent(
+                LlmEventType.MODEL_COMPLETED,
+                "novel-planner",
+                {
+                    "step": 1,
+                    "input_tokens": 2785,
+                    "output_tokens": 3377,
+                    "elapsed_seconds": 27.23,
+                    "response_kind": "research",
+                },
+            )
+        )
+
+        self.assertIn("完成检索决策", output[1])
+        self.assertNotIn("未返回有效结果", output[1])
+
     async def test_failed_run_is_recorded(self) -> None:
         timestamps = deque([20.0, 21.0])
         observer = NovelRunObserver(

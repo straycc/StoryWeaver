@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, Sequence
 
-from agents import Agent, Runner, ToolsToFinalOutputResult
+from agents import Agent, ModelSettings, Runner, ToolsToFinalOutputResult
 from agents.run import RunConfig
 from agents.tool import FunctionTool
 from pydantic import BaseModel
@@ -19,6 +20,27 @@ from .sdk import WorkerExecutionError, WorkerSettings, _WorkerHooks, _emit
 
 
 _SENTINEL = "__storyweaver_research_complete__"
+
+
+def _report_model_settings(
+    model_settings: ModelSettings,
+    *,
+    is_repair: bool,
+) -> ModelSettings:
+    """为收敛型 Report 调用派生模型参数，不污染 Research 的原始配置。
+
+    DeepSeek 的隐藏推理和可见交付共享输出额度。首次交付保留低强度推理；
+    结构或领域校验失败后的修复只需按错误改正结果，因此关闭思考模式。
+    这些兼容端点参数集中在公共运行器中，业务 Agent 无需感知。
+    """
+
+    extra_body = dict(model_settings.extra_body or {})
+    if is_repair:
+        extra_body["thinking"] = {"type": "disabled"}
+        extra_body.pop("reasoning_effort", None)
+    else:
+        extra_body["reasoning_effort"] = "low"
+    return replace(model_settings, extra_body=extra_body)
 
 
 async def run_research(
@@ -147,7 +169,10 @@ async def run_report(
                 + f"\n检索已经结束。不得查询或模拟查询；必须且只能调用 {submit_tool_name} 一次交付结果。"
             ),
             model=settings.model,
-            model_settings=settings.model_settings,
+            model_settings=_report_model_settings(
+                settings.model_settings,
+                is_repair=retry.is_repair,
+            ),
             tools=[submit_tool],
             tool_use_behavior={"stop_at_tool_names": [submit_tool_name]},
         )

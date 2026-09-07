@@ -46,7 +46,7 @@ class ChatContextPolicy:
 class ContextBudget:
     """一次 Worker 调用的分区预算，单位均为估算 Token。"""
 
-    operational_window: int = 32_000
+    operational_window: int = 64_000
     fixed_context: int = 2_000
     initial_dynamic_context: int = 6_000
     runtime_tool_context: int = 0
@@ -159,7 +159,7 @@ class AgentContextPolicy:
 
 def default_agent_context_policies(
     *,
-    operational_window: int = 32_000,
+    operational_window: int = 64_000,
     safety_reserve: int = 4_000,
     fixed_context: int = 2_000,
 ) -> dict[str, AgentContextPolicy]:
@@ -189,7 +189,7 @@ def default_agent_context_policies(
     return {
         "planner": AgentContextPolicy(
             role="planner",
-            budget=budget(initial=4_000, runtime=4_000, evidence=4_000, output=2_000),
+            budget=budget(initial=4_000, runtime=4_000, evidence=4_000, output=32_000),
             retrieval=RetrievalPolicy(
                 enabled=True, two_phase=True, max_tool_calls=4,
                 max_research_turns=2, per_tool_result_tokens=900,
@@ -198,11 +198,11 @@ def default_agent_context_policies(
         ),
         "writer": AgentContextPolicy(
             role="writer",
-            budget=budget(initial=6_000, output=12_000),
+            budget=budget(initial=6_000, output=32_000),
         ),
         "reviewer": AgentContextPolicy(
             role="reviewer",
-            budget=budget(initial=10_000, runtime=6_000, evidence=6_000, output=3_000),
+            budget=budget(initial=10_000, runtime=6_000, evidence=6_000, output=32_000),
             retrieval=RetrievalPolicy(
                 enabled=True, two_phase=True, max_tool_calls=6,
                 max_research_turns=2, per_tool_result_tokens=1_000,
@@ -211,7 +211,7 @@ def default_agent_context_policies(
         ),
         "reviewer_verification": AgentContextPolicy(
             role="reviewer_verification",
-            budget=budget(initial=10_000, runtime=3_000, evidence=3_000, output=3_000),
+            budget=budget(initial=10_000, runtime=3_000, evidence=3_000, output=32_000),
             retrieval=RetrievalPolicy(
                 enabled=True, two_phase=True, max_tool_calls=3,
                 max_research_turns=1, per_tool_result_tokens=900,
@@ -220,11 +220,11 @@ def default_agent_context_policies(
         ),
         "reviser": AgentContextPolicy(
             role="reviser",
-            budget=budget(initial=12_000, output=6_000),
+            budget=budget(initial=12_000, output=32_000),
         ),
         "analyzer": AgentContextPolicy(
             role="analyzer",
-            budget=budget(initial=15_000, runtime=4_000, evidence=4_000, output=6_000),
+            budget=budget(initial=15_000, runtime=4_000, evidence=4_000, output=32_000),
             retrieval=RetrievalPolicy(
                 enabled=True, two_phase=True, max_tool_calls=4,
                 max_research_turns=2, per_tool_result_tokens=900,

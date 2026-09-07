@@ -16,6 +16,9 @@ frontend/dist/
 frontend/.vite/
 *.egg-info/
 
+# 模型 A/B 评测的正文、Prompt、盲评密钥和原始结果仅保留在本地。
+backend/evals/results/
+
 # CLI / 本地 UI 默认生成的项目与会话数据
 data/
 

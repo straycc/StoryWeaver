@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from math import ceil
 from typing import Any
 
 from ...context import (
@@ -26,7 +25,6 @@ from ..models import ChapterContext, ChapterDraft, ReviewIssue, ReviewReport
 from ..serialization import (
     decode_chapter_draft,
     dumps_json,
-    loads_json,
     to_data,
 )
 from ..validation import ChapterDraftValidator
@@ -262,28 +260,10 @@ class WritingAgent(BaseNovelAgent[dict[str, Any]]):
         )
 
     def _output_token_limit(self, context: ChapterContext) -> int:
-        """按目标字数计算初稿输出额度，并受写作模式预算约束。"""
+        """为 high-thinking 写作保留完整输出额度，不再按正文字数压缩推理空间。"""
 
-        target_words = 0
-        constraints = next(
-            (
-                item
-                for item in context.entries
-                if item.source_type == "book_constraints"
-            ),
-            None,
-        )
-        if constraints is not None:
-            value = loads_json(constraints.content)
-            if isinstance(value, dict):
-                raw_target = value.get("chapter_target_words")
-                if isinstance(raw_target, int) and not isinstance(raw_target, bool):
-                    target_words = raw_target
-        estimated = ceil(target_words * 1.8 * 1.5) + 1_024
-        return min(
-            self._writer_context_policy.budget.output_reserve,
-            max(6_144, estimated),
-        )
+        del context
+        return self._writer_context_policy.budget.output_reserve
 
     def _record_revision_context_snapshot(
         self,

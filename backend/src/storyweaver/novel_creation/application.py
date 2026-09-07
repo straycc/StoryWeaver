@@ -128,8 +128,8 @@ class NovelApplicationSettings:
     model: str
     api_key: str | None = field(default=None, repr=False)
     temperature: float = 0.8
-    timeout_seconds: float = 180.0
-    reviewer_turn_timeout_seconds: float = 60.0
+    timeout_seconds: float = 300.0
+    reviewer_turn_timeout_seconds: float = 300.0
     reasoning_effort: str | None = None
     thinking: str | None = None
     json_mode: str = "auto"
@@ -141,7 +141,7 @@ class NovelApplicationSettings:
     analyzer_temperature: float = 0.1
     context_token_budget: int = 6000
     model_context_window: int = 1_000_000
-    context_operational_window: int = 32_000
+    context_operational_window: int = 64_000
     context_safety_reserve: int = 4_000
     context_fixed_token_budget: int = 2_000
     planner_context_token_budget: int = 4_000
@@ -163,11 +163,12 @@ class NovelApplicationSettings:
     analyzer_max_tool_calls: int = 4
     analyzer_max_research_turns: int = 2
     analyzer_tool_result_token_limit: int = 900
-    planner_output_token_limit: int = 2_000
-    reviewer_output_token_limit: int = 3_000
-    writer_output_token_limit: int = 12_000
-    reviser_output_token_limit: int = 6_144
-    analyzer_output_token_limit: int = 6_144
+    architect_output_token_limit: int = 32_000
+    planner_output_token_limit: int = 32_000
+    reviewer_output_token_limit: int = 32_000
+    writer_output_token_limit: int = 32_000
+    reviser_output_token_limit: int = 32_000
+    analyzer_output_token_limit: int = 32_000
     review_policy: str = "strict"
     review_minimum_score: int = 80
     review_minimum_target_ratio: float = 0.5
@@ -239,6 +240,7 @@ class NovelApplicationSettings:
             "analyzer_max_tool_calls",
             "analyzer_max_research_turns",
             "analyzer_tool_result_token_limit",
+            "architect_output_token_limit",
             "planner_output_token_limit",
             "reviewer_output_token_limit",
             "writer_output_token_limit",
@@ -292,10 +294,10 @@ class NovelApplicationSettings:
             model=model,
             api_key=api_key,
             temperature=_read_float("STORYWEAVER_LLM_TEMPERATURE", 0.8),
-            timeout_seconds=_read_float("STORYWEAVER_LLM_TIMEOUT", 180.0),
+            timeout_seconds=_read_float("STORYWEAVER_LLM_TIMEOUT", 300.0),
             reviewer_turn_timeout_seconds=_read_float(
                 "STORYWEAVER_REVIEWER_TURN_TIMEOUT",
-                60.0,
+                300.0,
             ),
             reasoning_effort=reasoning_effort.strip() if reasoning_effort else None,
             thinking=thinking.strip().lower() if thinking else None,
@@ -311,7 +313,7 @@ class NovelApplicationSettings:
                 6000,
             ),
             model_context_window=_read_int("STORYWEAVER_MODEL_CONTEXT_WINDOW", 1_000_000),
-            context_operational_window=_read_int("STORYWEAVER_CONTEXT_OPERATIONAL_WINDOW", 32_000),
+            context_operational_window=_read_int("STORYWEAVER_CONTEXT_OPERATIONAL_WINDOW", 64_000),
             context_safety_reserve=_read_int("STORYWEAVER_CONTEXT_SAFETY_RESERVE", 4_000),
             context_fixed_token_budget=_read_int("STORYWEAVER_CONTEXT_FIXED_BUDGET", 2_000),
             planner_context_token_budget=_read_int("STORYWEAVER_PLANNER_CONTEXT_BUDGET", 4_000),
@@ -333,11 +335,12 @@ class NovelApplicationSettings:
             analyzer_max_tool_calls=_read_int("STORYWEAVER_ANALYZER_MAX_TOOL_CALLS", 4),
             analyzer_max_research_turns=_read_int("STORYWEAVER_ANALYZER_RESEARCH_TURNS", 2),
             analyzer_tool_result_token_limit=_read_int("STORYWEAVER_ANALYZER_TOOL_RESULT_LIMIT", 900),
-            planner_output_token_limit=_read_int("STORYWEAVER_PLANNER_OUTPUT_LIMIT", 2_000),
-            reviewer_output_token_limit=_read_int("STORYWEAVER_REVIEWER_OUTPUT_LIMIT", 3_000),
-            writer_output_token_limit=_read_int("STORYWEAVER_WRITER_OUTPUT_LIMIT", 12_000),
-            reviser_output_token_limit=_read_int("STORYWEAVER_REVISER_OUTPUT_LIMIT", 6_144),
-            analyzer_output_token_limit=_read_int("STORYWEAVER_ANALYZER_OUTPUT_LIMIT", 6_144),
+            architect_output_token_limit=_read_int("STORYWEAVER_ARCHITECT_OUTPUT_LIMIT", 32_000),
+            planner_output_token_limit=_read_int("STORYWEAVER_PLANNER_OUTPUT_LIMIT", 32_000),
+            reviewer_output_token_limit=_read_int("STORYWEAVER_REVIEWER_OUTPUT_LIMIT", 32_000),
+            writer_output_token_limit=_read_int("STORYWEAVER_WRITER_OUTPUT_LIMIT", 32_000),
+            reviser_output_token_limit=_read_int("STORYWEAVER_REVISER_OUTPUT_LIMIT", 32_000),
+            analyzer_output_token_limit=_read_int("STORYWEAVER_ANALYZER_OUTPUT_LIMIT", 32_000),
             review_policy=os.getenv("STORYWEAVER_REVIEW_POLICY", "strict").strip(),
             review_minimum_score=_read_int(
                 "STORYWEAVER_REVIEW_MINIMUM_SCORE",
@@ -826,6 +829,7 @@ def build_novel_service(
             name="小说架构师",
             instructions=ARCHITECT_SYSTEM_PROMPT,
             temperature=settings.architect_temperature,
+            output_token_limit=settings.architect_output_token_limit,
         ),
         event_sinks=hooks,
         skill_materializer=skill_materializer,

@@ -169,13 +169,14 @@ class NovelRunObserver:
                 float(event.data.get("elapsed_seconds") or 0.0),
             )
             response_kind = str(event.data.get("response_kind") or "unknown")
-            result_label = (
-                f"请求工具 {tool_call_count} 个"
-                if response_kind == "tool_calls"
-                else "输出最终结果"
-                if response_kind == "final"
-                else "未返回有效结果"
-            )
+            if response_kind == "tool_calls":
+                result_label = f"请求工具 {tool_call_count} 个"
+            elif response_kind == "research":
+                result_label = "完成检索决策"
+            elif response_kind == "final":
+                result_label = "输出最终结果"
+            else:
+                result_label = "未返回有效结果"
             payload = {
                 "agent_id": worker_id,
                 "display_name": display_name,

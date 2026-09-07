@@ -232,7 +232,7 @@ class ChapterContextBuilderTests(unittest.TestCase):
         self.assertIn(state_entry.source_id, trace.protected_source_ids)
         self.assertIn("character:stranger", trace.excluded_source_ids)
 
-    def test_writer_output_limit_is_dynamic_but_never_exceeds_policy_reserve(self) -> None:
+    def test_writer_uses_full_policy_output_reserve_for_reasoning(self) -> None:
         context, _ = ChapterContextBuilder(token_budget=10000).build(
             project=create_history_project(),
             plan=create_next_plan(),
@@ -262,8 +262,8 @@ class ChapterContextBuilderTests(unittest.TestCase):
 
         output_limit = writing._output_token_limit(context)
 
-        self.assertGreaterEqual(output_limit, 6_144)
-        self.assertLessEqual(output_limit, policy.budget.output_reserve)
+        self.assertEqual(output_limit, policy.budget.output_reserve)
+        self.assertEqual(output_limit, 32_000)
         self.assertIs(writing._sdk_settings, writer_settings)
         self.assertIs(writing._reviser_settings, reviser_settings)
 
