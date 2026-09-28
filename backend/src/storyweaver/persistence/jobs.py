@@ -67,7 +67,7 @@ class JobRepository:
         )
         with self.database.session() as session:
             try:
-                with session.begin():
+                with self.database.write_transaction(session):
                     session.add(row)
                     session.flush()
                     self._append(session, row.job_id, "job_queued", {
@@ -111,10 +111,10 @@ class JobRepository:
 
     def append_event(self, job_id: str, event_type: str, payload: Mapping[str, Any] | None = None) -> JobEvent:
         with self.database.session() as session:
-            with session.begin():
-                # `_append()` 使用 max(sequence) + 1。所有公开追加入口必须先锁
-                # 同一 Job 行，才能让阶段、取消和模型事件串行分配序号。
-                if session.get(JobRow, job_id, with_for_update=True) is None:
+            with self.database.write_transaction(session):
+                # `_append()` 使用 max(sequence) + 1；写事务先取得写资格，
+                # 保证阶段、取消和模型事件串行分配序号。
+                if session.get(JobRow, job_id) is None:
                     raise KeyError(f"Job 不存在：{job_id}")
                 return self._append(session, job_id, event_type, dict(payload or {}))
 
@@ -131,8 +131,8 @@ class JobRepository:
 
         now = self._now()
         with self.database.session() as session:
-            with session.begin():
-                rows = session.scalars(select(JobRow).where(JobRow.status.in_(ACTIVE_JOB_STATUSES)).with_for_update()).all()
+            with self.database.write_transaction(session):
+                rows = session.scalars(select(JobRow).where(JobRow.status.in_(ACTIVE_JOB_STATUSES))).all()
                 for row in rows:
                     row.status = "interrupted"
                     row.error = "服务重启导致模型调用中断；请显式重试该任务"
@@ -150,8 +150,8 @@ class JobRepository:
         event_type: str,
     ) -> Job:
         with self.database.session() as session:
-            with session.begin():
-                row = session.get(JobRow, job_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                row = session.get(JobRow, job_id)
                 if row is None:
                     raise KeyError(f"Job 不存在：{job_id}")
                 row.status = status

@@ -84,6 +84,8 @@ async def run_structured_worker(
             instructions=(
                 settings.instructions
                 + "\n只返回一个完整 JSON 对象，不要输出 Markdown、代码围栏或说明文字。"
+                + "\n输出必须符合以下 JSON Schema；这是返回值结构，不是需要原样输出的内容：\n"
+                + json.dumps(output_type.model_json_schema(), ensure_ascii=False)
             ),
             model=settings.model,
             model_settings=settings.model_settings,

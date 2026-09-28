@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, TypeAlias
+from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -70,12 +70,25 @@ class CreateNovelParameters(_ActionParameters):
     title: str = Field(min_length=1, max_length=200)
     genre: str = Field(min_length=1, max_length=100)
     premise: str = Field(min_length=1, max_length=4000)
-    protagonist: str = Field(min_length=1, max_length=1000)
-    central_conflict: str = Field(min_length=1, max_length=2000)
-    tone: str = Field(min_length=1, max_length=500)
+    # 这些内容是建书时的补充要求；留空时由 Architect 在候选资料中提出建议。
+    protagonist: str = Field(default="", max_length=1000)
+    central_conflict: str = Field(default="", max_length=2000)
+    tone: str = Field(default="", max_length=500)
     target_chapters: int = Field(ge=1, le=10000)
     chapter_target_words: int = Field(ge=200, le=100000)
     language: str = Field(default="zh", min_length=1, max_length=32)
+
+
+class ConfirmFoundationParameters(_ActionParameters):
+    """确认动作只接收候选内容，版本锁由 Proposal Repository 负责。"""
+
+    candidate: dict[str, Any]
+
+
+class ApplyFoundationRevisionParameters(ConfirmFoundationParameters):
+    """确认后的 Foundation 修订同样只接收候选快照。"""
+
+    scope: Literal["outline", "setting"]
 
 
 class RunNextChapterWorkflowParameters(_CreativeActionParameters):
@@ -126,6 +139,7 @@ ActionParameters: TypeAlias = (
     QueryBookStateParameters | QueryStoryProgressParameters | QueryCompletedChaptersParameters |
     QueryChapterParameters | QueryPendingPlanParameters | QueryRecentReviewParameters |
     QueryOpenForeshadowingsParameters | QueryTextParameters |
-    CreativeDiscussionParameters | CreateNovelParameters |
+    CreativeDiscussionParameters | CreateNovelParameters | ConfirmFoundationParameters |
+    ApplyFoundationRevisionParameters |
     RunNextChapterWorkflowParameters
 )

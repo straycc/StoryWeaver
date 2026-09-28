@@ -65,7 +65,7 @@ class ContextSnapshotRepository:
             rendered_context=rendered_context, trace_json=dict(trace), created_at=now,
         )
         with self.database.session() as session:
-            with session.begin():
+            with self.database.write_transaction(session):
                 session.add(row)
         return self._decode(row)
 

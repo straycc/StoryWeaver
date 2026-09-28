@@ -5,25 +5,21 @@ import {
   type Json,
   type Simulation,
   type SimulationTurn,
-  type SkillOption,
 } from "../../api";
+import { RoundedSelect } from "../../RoundedSelect";
 
 const text = (value: unknown) =>
   typeof value === "string" ? value : value == null ? "" : String(value);
 const json = (value: unknown): Json =>
   value && typeof value === "object" ? (value as Json) : {};
 const requestId = () => crypto.randomUUID();
-const skillName = (skill: SkillOption | undefined, fallback: string) =>
-  skill?.display_name || skill?.name || fallback;
 
 /** 角色剧场嵌入既有工作台，避免使用另一套路由外壳。 */
 export function SimulationWorkspace({
   bookId,
-  skills = [],
   onError,
 }: {
   bookId: string | null;
-  skills?: SkillOption[];
   onError: (message: string) => void;
 }) {
   const [screen, setScreen] = useState<"list" | "create" | "stage">("list");
@@ -70,7 +66,6 @@ export function SimulationWorkspace({
     return (
       <SimulationStage
         simulationId={selectedId}
-        skills={skills}
         onBack={() => {
           setScreen("list");
           void refresh();
@@ -247,34 +242,22 @@ function SimulationCreate({
       </header>
       <form className="simulation-form embedded" onSubmit={submit}>
         <div className="simulation-grid">
-          <label>
-            基准章节
-            <select
-              value={form.base_chapter_number}
-              onChange={(e) =>
-                setForm({
-                  ...form,
-                  base_chapter_number: Number(e.target.value),
-                })
-              }
-            >
-              {chapters.map((chapter) => (
-                <option
-                  key={text(chapter.chapter_number)}
-                  value={Number(chapter.chapter_number)}
-                >
-                  第 {text(chapter.chapter_number)} 章 · {text(chapter.title)}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            互动方式
-            <select value={mode} onChange={(e) => setMode(e.target.value)}>
-              <option value="observer">旁观推演</option>
-              <option value="roleplay">角色扮演</option>
-            </select>
-          </label>
+          <div className="simulation-select-field">
+            <span>基准章节</span>
+            <RoundedSelect label="基准章节" value={String(form.base_chapter_number)} onChange={(value) =>
+              setForm({ ...form, base_chapter_number: Number(value) })
+            } options={chapters.map((chapter) => ({
+              value: text(chapter.chapter_number),
+              label: `第 ${text(chapter.chapter_number)} 章 · ${text(chapter.title)}`,
+            }))} />
+          </div>
+          <div className="simulation-select-field">
+            <span>互动方式</span>
+            <RoundedSelect label="互动方式" value={mode} onChange={setMode} options={[
+              { value: "observer", label: "旁观推演" },
+              { value: "roleplay", label: "角色扮演" },
+            ]} />
+          </div>
         </div>
         <fieldset>
           <legend>
@@ -307,20 +290,16 @@ function SimulationCreate({
           </div>
         </fieldset>
         {mode === "roleplay" && (
-          <label>
-            你扮演
-            <select value={actor} onChange={(e) => setActor(e.target.value)}>
-              <option value="">请选择参与人物</option>
-              {participants.map((character) => (
-                <option
-                  key={text(character.character_id)}
-                  value={text(character.character_id)}
-                >
-                  {text(character.name)}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="simulation-select-field">
+            <span>你扮演</span>
+            <RoundedSelect label="你扮演" value={actor} onChange={setActor} options={[
+              { value: "", label: "请选择参与人物" },
+              ...participants.map((character) => ({
+                value: text(character.character_id),
+                label: text(character.name),
+              })),
+            ]} />
+          </div>
         )}
         <fieldset>
           <legend>可选：新增沙盒人物（可添加多名）</legend>
@@ -450,12 +429,10 @@ function SimulationCreate({
 
 function SimulationStage({
   simulationId,
-  skills,
   onBack,
   onError,
 }: {
   simulationId: string;
-  skills: SkillOption[];
   onBack: () => void;
   onError: (message: string) => void;
 }) {
@@ -467,7 +444,6 @@ function SimulationStage({
   const [busy, setBusy] = useState(false);
   const [pendingInput, setPendingInput] = useState("");
   const [runError, setRunError] = useState("");
-  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
   const [lifecycleNote, setLifecycleNote] = useState("");
   const load = useCallback(async () => {
     try {
@@ -541,14 +517,12 @@ function SimulationStage({
           !automatic && simulation.mode === "roleplay" && targetCharacterId
             ? targetCharacterId
             : null,
-        skill_ids: selectedSkillIds,
       };
       const result = automatic
         ? await api.continueSimulation(simulationId, body)
         : await api.submitSimulationTurn(simulationId, body);
       setInput("");
       setTargetCharacterId("");
-      setSelectedSkillIds([]);
       watch(result.job_id);
     } catch (error) {
       setBusy(false);
@@ -623,37 +597,20 @@ function SimulationStage({
           <span className={`simulation-status status-${simulation.status}`}>
             {statusLabel(simulation.status)}
           </span>
-          <select
-            value={simulation.mode}
-            disabled={!isActive}
-            onChange={(e) =>
-              void updateMode(
-                e.target.value,
-                e.target.value === "roleplay"
-                  ? simulation.user_character_id ||
-                      text(presentCharacters[0]?.character_id)
-                  : null,
-              )
-            }
-          >
-            <option value="observer">旁观</option>
-            <option value="roleplay">扮演</option>
-          </select>
+          <RoundedSelect label="互动方式" value={simulation.mode} disabled={!isActive} onChange={(value) =>
+            void updateMode(value, value === "roleplay"
+              ? simulation.user_character_id || text(presentCharacters[0]?.character_id)
+              : null)
+          } options={[
+            { value: "observer", label: "旁观" },
+            { value: "roleplay", label: "扮演" },
+          ]} />
           {simulation.mode === "roleplay" && (
-            <select
-              value={simulation.user_character_id || ""}
-              disabled={!isActive}
-              onChange={(e) => void updateMode("roleplay", e.target.value)}
-            >
-              {presentCharacters.map((item) => (
-                <option
-                  key={text(item.character_id)}
-                  value={text(item.character_id)}
-                >
-                  {text(item.name)}
-                </option>
-              ))}
-            </select>
+            <RoundedSelect label="扮演人物" value={simulation.user_character_id || ""} disabled={!isActive}
+              onChange={(value) => void updateMode("roleplay", value)}
+              options={presentCharacters.map((item) => ({
+                value: text(item.character_id), label: text(item.name),
+              }))} />
           )}
           {!isCompleted && (
             <button className="secondary-button" onClick={() => void changeLifecycle(isActive ? "pause" : "resume")}>
@@ -750,43 +707,6 @@ function SimulationStage({
       </div>
       {!isCompleted && <div className="simulation-composer">
         <div className="simulation-composer-controls">
-          {skills.length > 0 && (
-            <select
-              aria-label="选择创作 Skill"
-              value=""
-              disabled={busy || !isActive || selectedSkillIds.length >= 16}
-              onChange={(event) => {
-                const skillId = event.target.value;
-                if (skillId)
-                  setSelectedSkillIds((old) =>
-                    old.includes(skillId) ? old : [...old, skillId],
-                  );
-              }}
-            >
-              <option value="">添加 Skill…</option>
-              {skills
-                .filter((item) => !selectedSkillIds.includes(item.id))
-                .map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {skillName(item, item.id)}
-                  </option>
-                ))}
-            </select>
-          )}
-          {selectedSkillIds.map((skillId) => (
-            <button
-              type="button"
-              className="secondary-button"
-              key={skillId}
-              onClick={() =>
-                setSelectedSkillIds((old) =>
-                  old.filter((item) => item !== skillId),
-                )
-              }
-            >
-              {skillName(skills.find((item) => item.id === skillId), skillId)} ×
-            </button>
-          ))}
           {simulation.mode === "observer" && (
             <button
               className="secondary-button simulation-continue"
@@ -797,29 +717,16 @@ function SimulationStage({
             </button>
           )}
           {simulation.mode === "roleplay" && (
-            <label className="target-character">
-              对谁说
-              <select
-                value={targetCharacterId}
-                disabled={busy || !isActive}
-                onChange={(e) => setTargetCharacterId(e.target.value)}
-              >
-                <option value="">交给场景决定</option>
-                {presentCharacters
-                  .filter(
-                    (item) =>
-                      text(item.character_id) !== simulation.user_character_id,
-                  )
-                  .map((item) => (
-                    <option
-                      key={text(item.character_id)}
-                      value={text(item.character_id)}
-                    >
-                      {text(item.name)}
-                    </option>
-                  ))}
-              </select>
-            </label>
+            <div className="target-character">
+              <span>对谁说</span>
+              <RoundedSelect label="对谁说" value={targetCharacterId} disabled={busy || !isActive}
+                onChange={setTargetCharacterId}
+                options={[
+                  { value: "", label: "交给场景决定" },
+                  ...presentCharacters.filter((item) => text(item.character_id) !== simulation.user_character_id)
+                    .map((item) => ({ value: text(item.character_id), label: text(item.name) })),
+                ]} />
+            </div>
           )}
         </div>
         <div className="simulation-input-shell">

@@ -18,6 +18,8 @@ from storyweaver.novel_creation import (
     ChapterResult,
     ContextEntry,
     ContextTrace,
+    CreateNovelRequest,
+    NovelFoundationValidator,
     ReviewIssue,
     ReviewReport,
     StoryHook,
@@ -70,6 +72,23 @@ class NovelModelTests(unittest.TestCase):
                 foundation,
                 characters=(foundation.characters[0], foundation.characters[0]),
             )
+
+    def test_unspecified_protagonist_does_not_require_a_name_match(self) -> None:
+        request = CreateNovelRequest(
+            title="雨夜旅馆",
+            genre="悬疑",
+            premise="年轻侦探进入废弃旅馆调查失踪案。",
+            protagonist="",
+            central_conflict="",
+            tone="",
+            target_chapters=6,
+            chapter_target_words=1200,
+        )
+
+        NovelFoundationValidator().validate(
+            request=request,
+            foundation=create_foundation(),
+        )
 
     def test_context_and_trace_round_trip(self) -> None:
         entry = ContextEntry(

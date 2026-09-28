@@ -5,7 +5,13 @@ export interface Session {
   session_id: string; title: string; book_id: string | null; message_count: number;
   messages: Array<Json & { sequence?: number }>; timeline: TimelineEvent[];
   paging: { has_more: boolean; next_before_sequence: number | null };
+  selected_model?: ModelSelection | null;
+  reasoning_level?: ReasoningLevel;
 }
+export interface ModelSelection { provider_id: string; model_id: string; }
+export type ReasoningLevel = "default" | "off" | "low" | "medium" | "high" | "max";
+export interface ModelProvider { id: string; name: string; base_url: string; models: string[]; has_api_key: boolean; reasoning_levels_by_model: Record<string, ReasoningLevel[]>; }
+export interface ModelConfig { providers: ModelProvider[]; default_provider: string | null; default_model: string | null; }
 export interface SessionSummary { session_id: string; title: string; book_id: string | null; message_count: number; updated_at: string; }
 export interface ProjectSummary { book_id: string; title: string; genre: string; target_chapters: number; }
 export interface SkillOption { id: string; name: string; display_name: string; description: string; short_description: string; }
@@ -24,6 +30,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  modelConfig: () => request<ModelConfig>("/models/config"),
+  saveModelProvider: (value: Omit<ModelProvider, "has_api_key" | "reasoning_levels_by_model"> & { api_key?: string; clear_key?: boolean }) => request<ModelConfig>(`/models/providers/${encodeURIComponent(value.id)}`, { method: "PUT", body: JSON.stringify(value) }),
+  deleteModelProvider: (id: string) => request<ModelConfig>(`/models/providers/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  setDefaultModel: (value: ModelSelection) => request<ModelConfig>("/models/default", { method: "PUT", body: JSON.stringify(value) }),
+  testModel: (value: ModelSelection) => request<{ ok: boolean }>("/models/test", { method: "POST", body: JSON.stringify(value) }),
+  selectSessionModel: (id: string, value: ModelSelection) => request<ModelSelection>(`/sessions/${encodeURIComponent(id)}/model`, { method: "PUT", body: JSON.stringify(value) }),
+  selectSessionReasoning: (id: string, level: ReasoningLevel) => request<{ level: ReasoningLevel }>(`/sessions/${encodeURIComponent(id)}/reasoning`, { method: "PUT", body: JSON.stringify({ level }) }),
   bootstrap: () => request<{ model: string; sessions: SessionSummary[]; projects: ProjectSummary[]; actions: Record<string, string>; skills?: SkillOption[] }>("/bootstrap"),
   createSession: (book_id: string | null = null) => request<Session>("/sessions", { method: "POST", body: JSON.stringify({ book_id }) }),
   deleteSession: (id: string) => request<{ ok: boolean }>(`/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }),
@@ -32,8 +45,18 @@ export const api = {
   send: (id: string, value: Json) => request<{ job_id: string }>(`/sessions/${encodeURIComponent(id)}/messages`, { method: "POST", body: JSON.stringify(value) }),
   retryAction: (id: string, runId: string) => request<{ job_id: string }>(`/sessions/${encodeURIComponent(id)}/actions/${encodeURIComponent(runId)}/retry`, { method: "POST" }),
   actionProposals: (id: string) => request<{ proposals: ActionProposal[] }>(`/sessions/${encodeURIComponent(id)}/action-proposals`),
-  confirmActionProposal: (id: string) => request<{ job_id: string }>(`/action-proposals/${encodeURIComponent(id)}/confirm`, { method: "POST" }),
+  confirmActionProposal: (id: string, version?: number) => request<{ job_id: string }>(`/action-proposals/${encodeURIComponent(id)}/confirm`, {
+    method: "POST",
+    ...(version ? { body: JSON.stringify({ version }) } : {}),
+  }),
   cancelActionProposal: (id: string) => request<{ proposal: ActionProposal }>(`/action-proposals/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
+  regenerateFoundationProposal: (id: string) => request<{ job_id: string }>(`/action-proposals/${encodeURIComponent(id)}/regenerate`, { method: "POST" }),
+  updateFoundationProposal: (id: string, version: number, patch: Json) => request<{ proposal: ActionProposal }>(`/action-proposals/${encodeURIComponent(id)}/foundation`, {
+    method: "PATCH", body: JSON.stringify({ version, patch }),
+  }),
+  createFoundationRevision: (bookId: string, sessionId: string, scope: "outline" | "setting") => request<{ proposal: ActionProposal }>(`/books/${encodeURIComponent(bookId)}/foundation-revisions`, {
+    method: "POST", body: JSON.stringify({ session_id: sessionId, scope }),
+  }),
   getProject: (id: string) => request<Json>(`/books/${encodeURIComponent(id)}`),
   getBook: (id: string) => request<Json>(`/books/${encodeURIComponent(id)}`),
   deleteBook: (id: string) => request<{ ok: boolean; book_id: string; unbound_session_ids: string[] }>(`/books/${encodeURIComponent(id)}`, { method: "DELETE" }),

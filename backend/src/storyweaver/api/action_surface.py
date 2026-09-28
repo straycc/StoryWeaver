@@ -217,12 +217,84 @@ class ActionDispatcher:
                     ),
                 },
             )
+        if action == "confirm_foundation":
+            candidate = parameters.get("candidate")
+            if not isinstance(candidate, Mapping):
+                raise ValueError("基础资料候选缺少完整内容")
+            return await self._submit_job(
+                job_type="confirm_foundation",
+                book_id=None,
+                payload={
+                    "session_id": session_id,
+                    "candidate": dict(candidate),
+                    **(
+                        {"action_proposal_id": action_proposal_id}
+                        if action_proposal_id
+                        else {}
+                    ),
+                },
+            )
+        if action == "apply_foundation_revision":
+            candidate = parameters.get("candidate")
+            if not isinstance(candidate, Mapping):
+                raise ValueError("基础资料修订候选缺少完整内容")
+            return await self._submit_job(
+                job_type="apply_foundation_revision",
+                book_id=self._require_book(book_id),
+                payload={
+                    "session_id": session_id,
+                    "candidate": dict(candidate),
+                    "scope": parameters["scope"],
+                    **(
+                        {"action_proposal_id": action_proposal_id}
+                        if action_proposal_id
+                        else {}
+                    ),
+                },
+            )
         raise ValueError(f"不支持的业务动作：{action}")
 
-    async def confirm(self, proposal_id: str) -> ActionProposal:
+    async def confirm(
+        self,
+        proposal_id: str,
+        *,
+        expected_version: int | None = None,
+    ) -> ActionProposal:
         proposal = self._proposals.get(proposal_id)
         if proposal.status != "pending":
             raise ValueError(f"该操作当前为 {proposal.status}，不能确认")
+        if proposal.action_type in {"confirm_foundation", "apply_foundation_revision"}:
+            actual_version = int(proposal.payload.get("version") or 1)
+            if expected_version is None or expected_version != actual_version:
+                raise ValueError("基础资料已更新，请刷新后确认当前版本")
+            claimed = self._proposals.claim_foundation_confirmation(
+                proposal_id,
+                expected_version=expected_version,
+            )
+            try:
+                job = await self.dispatch(
+                    action=claimed.action_type,
+                    session_id=claimed.session_id,
+                    book_id=claimed.book_id,
+                    # Proposal 还包含版本、原始表单和可选 Skill 快照；发布动作
+                    # 只需要候选本身，避免把持久化元数据暴露为动作参数。
+                    parameters={
+                        "candidate": claimed.payload.get("candidate"),
+                        **(
+                            {"scope": claimed.payload.get("scope")}
+                            if claimed.action_type == "apply_foundation_revision"
+                            else {}
+                        ),
+                    },
+                    action_proposal_id=claimed.proposal_id,
+                )
+            except Exception:
+                self._proposals.release_foundation_claim(proposal_id)
+                raise
+            return self._proposals.attach_confirmation_job(
+                proposal_id,
+                job_id=job.job_id,
+            )
         self._assert_not_expired(proposal)
         parameters = dict(proposal.payload)
         frozen_task_data = parameters.pop("creative_task_context", None)

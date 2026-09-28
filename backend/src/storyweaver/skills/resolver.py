@@ -158,6 +158,7 @@ def build_model_implicit_skill_selector(
             instructions=(
                 "你只负责根据当前请求、最近对话和 Skill description 判断本轮是否"
                 "需要 Skill。宁可返回空数组，也不要牵强匹配。"
+                "只选择目录中存在且有助于本轮目标的 ID，历史提及不等于本轮需要。"
             ),
             model=model,
             model_settings=ModelSettings(temperature=0, max_tokens=256),
@@ -221,6 +222,7 @@ def build_model_skill_selector(
             instructions=(
                 "你只负责从已激活 Skill metadata 中选择与当前任务目标相关的 ID。"
                 "Skill 不绑定 Agent 或 Workflow。"
+                "选择直接有助于本次交付的最少集合，遵守给定预算；无相关项返回空集合。"
             ),
             model=model,
             model_settings=ModelSettings(temperature=0, max_tokens=512),

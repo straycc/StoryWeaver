@@ -1,4 +1,4 @@
-"""角色剧场 PostgreSQL 仓储。"""
+"""角色剧场 SQLite 仓储。"""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ class SimulationRepository:
 
     def create(self, session_value: SimulationSession) -> SimulationSession:
         with self.database.session() as session:
-            with session.begin():
+            with self.database.write_transaction(session):
                 session.add(SimulationSessionRow(
                     simulation_id=session_value.simulation_id, book_id=session_value.book_id,
                     base_book_version=session_value.base_book_version, base_chapter_number=session_value.base_chapter_number,
@@ -89,14 +89,14 @@ class SimulationRepository:
                      target_character_id: str | None = None) -> SimulationTurn:
         with self.database.session() as session:
             try:
-                with session.begin():
+                with self.database.write_transaction(session):
                     existing = session.scalar(select(SimulationTurnRow).where(
                         SimulationTurnRow.simulation_id == simulation_id,
                         SimulationTurnRow.client_request_id == client_request_id,
                     ))
                     if existing is not None:
                         return turn_from_row(existing)
-                    owner = session.get(SimulationSessionRow, simulation_id, with_for_update=True)
+                    owner = session.get(SimulationSessionRow, simulation_id)
                     if owner is None:
                         raise KeyError("角色剧场不存在")
                     if owner.status != "active":
@@ -122,8 +122,8 @@ class SimulationRepository:
 
     def start_turn(self, turn_id: str) -> SimulationTurn:
         with self.database.session() as session:
-            with session.begin():
-                row = session.get(SimulationTurnRow, turn_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                row = session.get(SimulationTurnRow, turn_id)
                 if row is None:
                     raise KeyError("模拟回合不存在")
                 if row.status == "queued":
@@ -134,11 +134,11 @@ class SimulationRepository:
                     output: dict[str, object], delta: dict[str, object], context_snapshot_id: str | None,
                     snapshot_links: tuple[tuple[str, str | None, str | None, int], ...] = ()) -> SimulationSession:
         with self.database.session() as session:
-            with session.begin():
-                turn = session.get(SimulationTurnRow, turn_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                turn = session.get(SimulationTurnRow, turn_id)
                 if turn is None:
                     raise KeyError("模拟回合不存在")
-                owner = session.get(SimulationSessionRow, turn.simulation_id, with_for_update=True)
+                owner = session.get(SimulationSessionRow, turn.simulation_id)
                 if owner is None or owner.version != expected_version:
                     raise ValueError("模拟版本冲突")
                 owner.current_state_json = _data(state)
@@ -169,8 +169,8 @@ class SimulationRepository:
                                   links: tuple[tuple[str, str | None, str | None, int], ...]) -> None:
         """写入 V2 回合的完整快照关联；旧主快照字段仍由 commit_turn 维护。"""
         with self.database.session() as session:
-            with session.begin():
-                turn = session.get(SimulationTurnRow, turn_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                turn = session.get(SimulationTurnRow, turn_id)
                 if turn is None:
                     raise KeyError("模拟回合不存在")
                 session.query(ContextSnapshotRow).filter(
@@ -192,15 +192,15 @@ class SimulationRepository:
 
     def fail_turn(self, turn_id: str) -> None:
         with self.database.session() as session:
-            with session.begin():
-                row = session.get(SimulationTurnRow, turn_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                row = session.get(SimulationTurnRow, turn_id)
                 if row is not None and row.status in {"queued", "running"}:
                     row.status = "failed"
 
     def update_mode(self, *, simulation_id: str, expected_version: int, mode: str, user_character_id: str | None) -> SimulationSession:
         with self.database.session() as session:
-            with session.begin():
-                row = session.get(SimulationSessionRow, simulation_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                row = session.get(SimulationSessionRow, simulation_id)
                 if row is None:
                     raise KeyError("角色剧场不存在")
                 if row.version != expected_version:
@@ -210,8 +210,8 @@ class SimulationRepository:
 
     def set_status(self, simulation_id: str, status: str) -> SimulationSession:
         with self.database.session() as session:
-            with session.begin():
-                row = session.get(SimulationSessionRow, simulation_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                row = session.get(SimulationSessionRow, simulation_id)
                 if row is None:
                     raise KeyError("角色剧场不存在")
                 active_turn = session.scalar(
@@ -227,8 +227,8 @@ class SimulationRepository:
 
     def delete(self, simulation_id: str) -> None:
         with self.database.session() as session:
-            with session.begin():
-                row = session.get(SimulationSessionRow, simulation_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                row = session.get(SimulationSessionRow, simulation_id)
                 if row is None:
                     raise KeyError("角色剧场不存在")
                 session.delete(row)

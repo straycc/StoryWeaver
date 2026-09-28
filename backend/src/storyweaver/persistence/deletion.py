@@ -39,7 +39,7 @@ class BookDeletionResult:
     unbound_session_ids: tuple[str, ...]
 
 
-class PostgresDeletionRepository:
+class SQLAlchemyDeletionRepository:
     """集中处理跨聚合删除，避免 API 层拼接多个非原子仓储调用。"""
 
     def __init__(self, database: Database) -> None:
@@ -49,8 +49,8 @@ class PostgresDeletionRepository:
         """删除会话及其事件、操作提案，但保留已提取的长期记忆。"""
 
         with self.database.session() as session:
-            with session.begin():
-                row = session.get(ChatSessionRow, session_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                row = session.get(ChatSessionRow, session_id)
                 if row is None:
                     raise KeyError(f"会话不存在：{session_id}")
                 active_jobs = session.scalars(
@@ -59,7 +59,7 @@ class PostgresDeletionRepository:
                 if any(item.payload_json.get("session_id") == session_id for item in active_jobs):
                     raise DeletionConflictError("当前会话仍有任务正在执行，请等待任务结束或取消任务后再删除")
 
-                # 显式删除依赖，使 SQLite 测试和 PostgreSQL 的行为保持一致。
+                # 在同一事务中显式删除关联记录。
                 session.execute(delete(ActionProposalRow).where(ActionProposalRow.session_id == session_id))
                 session.execute(delete(ChatSessionEventRow).where(ChatSessionEventRow.session_id == session_id))
                 session.delete(row)
@@ -68,8 +68,8 @@ class PostgresDeletionRepository:
         """删除作品域数据，并把历史对话安全地改为未绑定状态。"""
 
         with self.database.session() as session:
-            with session.begin():
-                book = session.get(BookRow, book_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                book = session.get(BookRow, book_id)
                 if book is None:
                     raise KeyError(f"项目不存在：{book_id}")
                 active_job = session.scalar(select(JobRow).where(
@@ -83,7 +83,6 @@ class PostgresDeletionRepository:
                     select(ChatSessionRow)
                     .where(ChatSessionRow.book_id == book_id)
                     .order_by(ChatSessionRow.created_at)
-                    .with_for_update()
                 ).all()
                 for chat_session in bound_sessions:
                     self._append_unbind_event(session, chat_session)

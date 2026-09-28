@@ -1,7 +1,6 @@
 # 本地密钥与环境配置
 .env
 .env.*
-!.env.example
 .claude/
 
 # Python 缓存和构建产物
@@ -15,6 +14,8 @@ frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 *.egg-info/
+/backend/evals/
+
 
 # 模型 A/B 评测的正文、Prompt、盲评密钥和原始结果仅保留在本地。
 backend/evals/results/
@@ -28,11 +29,8 @@ runtime/*
 
 # 本地归档内容不进入源码仓库
 archive/
-/docs/
+docs/
 
-# 新环境使用 database/schema.sql 初始化
-alembic/
-alembic.ini
 # 本地虚拟环境
 .venv/
 venv/

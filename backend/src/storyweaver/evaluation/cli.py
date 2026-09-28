@@ -18,9 +18,10 @@ from ..novel_creation.application import (
     PROJECT_ROOT,
     NovelApplicationSettings,
     build_novel_service,
-    load_env_file,
 )
-from ..persistence import Database, DatabaseSettings, PostgresStoryProjectRepository
+from ..model_config import ModelCatalog
+from ..persistence.database import database_url_from_env
+from ..persistence import Database, DatabaseSettings, SQLAlchemyStoryProjectRepository
 from .case_loader import load_evaluation_case
 from .graders import PairwiseModelGrader, build_quality_summary
 from .models import EvaluationCase, EvaluationRunResult
@@ -173,7 +174,6 @@ async def _grade_result(
 
 
 async def run(args: argparse.Namespace) -> int:
-    load_env_file()
     case = load_evaluation_case(args.case)
     if case.experiment.skill_ids:
         raise SystemExit(
@@ -187,8 +187,9 @@ async def run(args: argparse.Namespace) -> int:
             f"--chapters 必须在 1 到 {case.request.target_chapters} 之间"
         )
 
+    configured_provider, configured_model, configured_key = ModelCatalog().selection()
     settings = replace(
-        NovelApplicationSettings.from_env(),
+        NovelApplicationSettings(base_url=configured_provider.base_url, model=configured_model, api_key=configured_key),
         writer_temperature=case.experiment.temperature,
     )
     provider = OpenAICompatibleProviderSettings(
@@ -240,9 +241,7 @@ async def run(args: argparse.Namespace) -> int:
         _progress(f"评分状态：{'completed' if succeeded else 'failed'}")
         return 0 if succeeded else 2
 
-    database_url = os.getenv("STORYWEAVER_DATABASE_URL", "").strip()
-    if not database_url:
-        raise SystemExit("缺少 STORYWEAVER_DATABASE_URL，无法创建隔离评测作品")
+    database_url = database_url_from_env(evaluation=True)
 
     bare_writer = BareNovelWriter(
         WorkerSettings(
@@ -261,8 +260,10 @@ async def run(args: argparse.Namespace) -> int:
         progress=_progress,
     )
     database = Database(DatabaseSettings(database_url))
-    _progress("[preflight] 检查 PostgreSQL 连接与数据库结构")
+    _progress("[preflight] 检查 SQLite 连接与数据库结构")
     try:
+        database.acquire_instance_lock()
+        database.create_schema()
         with database.engine.connect() as connection:
             connection.execute(text("SELECT 1"))
         if not inspect(database.engine).has_table("books"):
@@ -270,11 +271,11 @@ async def run(args: argparse.Namespace) -> int:
     except Exception as exc:
         database.dispose()
         raise SystemExit(
-            "PostgreSQL 预检失败，评测尚未发起任何模型调用："
+            "SQLite 预检失败，评测尚未发起任何模型调用："
             f"{type(exc).__name__}: {exc}"
         ) from exc
-    _progress("[preflight] PostgreSQL 可用，开始评测")
-    projects = PostgresStoryProjectRepository(database)
+    _progress("[preflight] SQLite 可用，开始评测")
+    projects = SQLAlchemyStoryProjectRepository(database)
 
     def service_factory(_case_directory: Path, observer):
         return build_novel_service(

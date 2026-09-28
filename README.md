@@ -2,7 +2,7 @@
 
 StoryWeaver 是一个面向长篇连载创作的 Agent 小说工作台。模型负责规划、写作、审查与状态提取；确定性业务层负责质量门禁、正史归约、Hook 治理、事务提交与任务生命周期。
 
-> 当前主路径：**React + FastAPI + PostgreSQL + OpenAI Agents SDK + Pydantic**。
+> 当前主路径：**React + FastAPI + SQLite + OpenAI Agents SDK + Pydantic**。
 
 ## 核心能力
 
@@ -34,32 +34,19 @@ Planner → Writer → Reviewer → Reviser → Analyzer
                      QualityGate / HookManager / StateReducer
                                             │
                                             ▼
-                                      PostgreSQL
+                                      SQLite
 ```
 
 - **OpenAI Agents SDK**：模型调用、工具循环、结构化交付与 Trace。
 - **Pydantic**：工具参数、主 Agent 决策和 Worker 输出校验。
 - **StoryWeaver 领域层**：上下文、质量规则、正史归约、Hook 治理与提交事务。
-- **PostgreSQL**：作品、章节、计划、候选稿、会话、记忆、Job 和事件的唯一运行时事实源。
+- **SQLite**：作品、章节、计划、候选稿、会话、记忆、Job 和事件的唯一运行时事实源。
 
 ## 快速开始
 
 ### 1. 配置模型
 
-在项目根目录创建 `.env`：
-
-```env
-STORYWEAVER_LLM_BASE_URL=https://api.deepseek.com
-STORYWEAVER_LLM_MODEL=deepseek-v4-flash
-STORYWEAVER_LLM_API_KEY=your-api-key
-
-# 可选：关闭思考模式可以降低延迟与 Token 消耗；默认预算支持思考模式。
-# STORYWEAVER_LLM_THINKING=disabled
-STORYWEAVER_LLM_JSON_MODE=auto
-
-```
-
-`.env` 已被 Git 忽略，禁止提交真实 API Key。
+启动工作台后点击侧栏底部的齿轮，添加 OpenAI 兼容供应商、API 地址、模型 ID 和密钥。新对话默认使用已设置的默认模型，可在输入框切换；已识别的推理模型还可以按对话选择思考等级，任务提交后固定当时的选择。本地运行时，配置保存在当前用户目录的 `~/.storyweaver/models.yaml`，密钥单独保存在 `~/.storyweaver/.credentials.yaml`，不会写入项目的 `data/`。首次在设置界面保存供应商后才会创建文件。后端创建密钥文件时设置仅当前用户可读写。模型配置只从这两个文件读取，不再读取项目根目录的 `.env`；不需要保留 `.env` 才能启动。
 
 ### 2. Docker Compose 启动
 
@@ -73,23 +60,15 @@ docker compose up --build
 - FastAPI：<http://127.0.0.1:8000>
 - 健康检查：<http://127.0.0.1:8000/api/v1/health>
 
-Compose 会启动 PostgreSQL、API 与前端；API 容器启动时会自动执行 `database/schema.sql`，为新数据库创建当前表结构。
+Compose 启动 API 与前端，数据库保存在宿主机的 `data/storyweaver.db`，模型配置保存在 `data/model-config/`（映射到容器用户目录）。本地 Python 启动和 Compose 启动使用不同的模型配置目录。首次启动自动建表。不要同时启动使用同一数据库的本地服务与容器。
 
 ### 3. 本地开发启动
 
-先启动 PostgreSQL：
+在项目根目录安装依赖并启动后端：
 
 ```bash
-docker compose up -d postgres
-```
-
-配置环境变量并初始化：
-
-```bash
-export PYTHONPATH=backend/src
-export STORYWEAVER_DATABASE_URL='postgresql+psycopg://storyweaver:storyweaver@localhost:5432/storyweaver'
-docker compose exec -T postgres psql -U storyweaver -d storyweaver -v ON_ERROR_STOP=1 < database/schema.sql
-python -m storyweaver.api.server
+pip install -r requirements.txt
+PYTHONPATH=backend/src python -m storyweaver.api.server
 ```
 
 另开终端启动前端：
@@ -100,41 +79,37 @@ npm install
 npm run dev
 ```
 
-PowerShell：
+PowerShell 启动后端：
 
 ```powershell
 $env:PYTHONPATH = "backend/src"
-$env:STORYWEAVER_DATABASE_URL = "postgresql+psycopg://storyweaver:storyweaver@localhost:5432/storyweaver"
+python -m storyweaver.api.server
 ```
 
-## 数据库初始化
+## 本地数据库与备份
 
-仓库发布一份当前完整的 PostgreSQL Schema：
-
-```text
-database/schema.sql
-```
-
-它适用于空数据库，也可以重复执行：
+默认数据库为项目根目录下的 `data/storyweaver.db`。首次启动会自动创建目录与表，无需单独安装数据库服务。如需覆盖数据库路径，可在启动命令前设置环境变量：
 
 ```bash
-docker compose exec -T postgres psql -U storyweaver -d storyweaver -v ON_ERROR_STOP=1 < database/schema.sql
+STORYWEAVER_DATABASE_PATH=./data/storyweaver.db
+STORYWEAVER_EVALUATION_DATABASE_PATH=./data/evaluation.db
 ```
 
-PowerShell：
+相对路径始终相对于项目根目录，支持 `~`。评测默认使用独立数据库。旧 `STORYWEAVER_DATABASE_URL` 已停用，请删除旧配置并设置新路径；本版本不迁移 PostgreSQL 数据。
 
-```powershell
-Get-Content database/schema.sql | docker compose exec -T postgres psql -U storyweaver -d storyweaver -v ON_ERROR_STOP=1
-```
+SQLite 启用 WAL、外键约束和 5 秒锁等待。服务仅支持单进程（`workers=1`），同一数据库通过文件锁阻止重复启动。模型调用在事务外执行，关键写入使用短事务。同一本作品只允许一个活动写入任务。
 
-`schema.sql` 只负责创建缺失表和索引，不会自动将旧结构升级为新结构。开发期间如需重建空库：
+数据库使用 `user_version` 记录结构版本；未知版本或未标记的旧库会拒绝启动，不会自动覆盖。`create_all()` 仅负责空库初始化，未来结构变更需要显式升级。
+
+运行期间可使用 SQLite 备份接口备份已提交数据：
 
 ```bash
-docker compose down -v
-docker compose up -d postgres
+PYTHONPATH=backend/src python -m storyweaver.persistence.backup
+# 可选：指定一个尚不存在的备份文件
+PYTHONPATH=backend/src python -m storyweaver.persistence.backup --output ./data/backups/manual.db
 ```
 
-> `docker compose down -v` 会删除本地 PostgreSQL 数据卷。
+默认备份存入 `data/backups/`。不要在应用运行期间只复制 `.db` 文件，最新提交可能仍在 `-wal` 文件中。恢复时先关闭服务，保留现有数据库及旁边的 WAL/SHM 文件作为故障备份，再用完整备份替换主数据库，并移走原来的 WAL/SHM 文件后启动。`data/` 已被 Git 忽略，删除或移动项目时请保留作品和备份。
 
 ## 创作流程
 
@@ -264,11 +239,12 @@ runtime/
 
 ## 测试
 
-后端测试使用 unittest 与 SDK Fake/Scripted 模型，不调用真实模型：
+后端测试由 pytest 统一收集 unittest 与函数测试，使用 SDK Fake/Scripted 模型，不调用真实模型：
 
 ```bash
+pip install -r requirements-dev.txt
 export PYTHONPATH=backend/src:backend/tests
-python -m unittest discover -s backend/tests
+python -m pytest backend/tests -q
 ```
 
 前端构建校验：
@@ -289,12 +265,12 @@ StoryWeaver/
 │   │   ├── application/      # 会话、Timeline、工作区编排
 │   │   ├── novel_creation/   # Pipeline、Agent、Hook、质量门禁、状态归约
 │   │   ├── llm/              # OpenAI Agents SDK 与结构化输出
-│   │   ├── persistence/      # PostgreSQL 表、Repository、事务
+│   │   ├── persistence/      # SQLite 表、Repository、事务
 │   │   ├── memory/  skills/  evaluation/  observability/
 │   └── tests/
 ├── frontend/                 # React + TypeScript + Vite
 ├── skills/                   # 项目级创作 Skill
-├── database/schema.sql       # 空 PostgreSQL 的完整初始 Schema
+├── data/                     # 本地数据库与备份（首次运行生成）
 ├── docs/
 ├── runtime/                  # 本地运行产物（Git 忽略）
 ├── Dockerfile
@@ -303,12 +279,12 @@ StoryWeaver/
 └── README.md
 ```
 
-`data/` 是被忽略的历史本地文件保留区；服务不会读取、迁移或修改其中内容。
+`data/` 保存本地 SQLite 数据库和备份，已被 Git 忽略；其中历史文件不会自动迁移或删除。
 
 ## 技术栈与边界
 
 - Python 3.11、asyncio、OpenAI Agents SDK、Pydantic 2、Tenacity
-- FastAPI、Uvicorn、SSE、PostgreSQL 16、SQLAlchemy 2、Alembic、psycopg
+- FastAPI、Uvicorn、SSE、SQLite、SQLAlchemy 2
 - React、TypeScript、Vite、Docker Compose
 - 单用户、单 FastAPI 实例、进程内 JobSupervisor；不包含认证、多租户、分布式队列或多实例 Worker。
 - 服务重启会将运行中的 Job 标记为 `interrupted`；已原子提交章节不会重复写入，模型调用本身不承诺 exactly-once。

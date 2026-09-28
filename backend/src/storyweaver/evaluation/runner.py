@@ -746,7 +746,7 @@ class EvaluationRunner:
 
     @staticmethod
     def _execution_case(case: EvaluationCase, run_id: str) -> EvaluationCase:
-        """为 PostgreSQL 中的评测作品生成独立 ID，并给 Architect 同源资料。"""
+        """为 SQLite 中的评测作品生成独立 ID，并给 Architect 同源资料。"""
 
         suffix = run_id[-8:]
         supplemental = case.render_supplemental_brief()

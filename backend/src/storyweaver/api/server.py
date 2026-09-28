@@ -7,21 +7,21 @@ from pathlib import Path
 
 import uvicorn
 
-from ..novel_creation.application import NovelApplicationSettings, load_env_file
+from ..novel_creation.application import NovelApplicationSettings
+from ..model_config import ModelCatalog
 from ..observability import configure_logging, shutdown_logging
 from .app import create_app
+from ..persistence.database import database_url_from_env
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
 def main() -> None:
-    load_env_file()
-    database_url = os.getenv("STORYWEAVER_DATABASE_URL", "").strip()
-    if not database_url:
-        raise SystemExit("缺少 STORYWEAVER_DATABASE_URL；请先配置 PostgreSQL 连接并执行 database/schema.sql")
-    settings = NovelApplicationSettings.from_env()
-    app = create_app(settings=settings, database_url=database_url)
+    catalog = ModelCatalog()
+    database_url = database_url_from_env()
+    settings = NovelApplicationSettings(base_url="http://127.0.0.1:11434/v1", model="unconfigured", api_key=None)
+    app = create_app(settings=settings, database_url=database_url, model_catalog=catalog)
     configure_logging(
         log_directory=PROJECT_ROOT / "runtime" / "logs",
         level=os.getenv("STORYWEAVER_LOG_LEVEL", "INFO"),

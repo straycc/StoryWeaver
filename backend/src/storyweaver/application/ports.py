@@ -1,4 +1,4 @@
-"""应用层持久化端口。正式实现由 PostgreSQL 提供。"""
+"""应用层持久化端口。正式实现由 SQLite 提供。"""
 
 from __future__ import annotations
 

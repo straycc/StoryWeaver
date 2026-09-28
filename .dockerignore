@@ -1,0 +1,13 @@
+# 排除本地数据、密钥和构建缓存。
+.git
+.env
+.env.*
+data
+runtime
+.venv
+venv
+**/__pycache__
+**/.pytest_cache
+frontend/node_modules
+frontend/dist
+backend/evals/results

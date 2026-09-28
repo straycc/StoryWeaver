@@ -151,11 +151,30 @@ class CreateNovelPipeline:
     ) -> NovelProject:
         """创建并发布项目；Architect 或校验失败时不会触碰正式目录。"""
 
+        candidate = await self.prepare(request, creative_task)
+        return self.publish(candidate)
+
+    async def prepare(
+        self,
+        request: CreateNovelRequest,
+        creative_task: CreativeTaskContext | None = None,
+    ) -> NovelProject:
+        """生成尚未发布的基础资料候选，不写入正式作品。"""
+
         foundation = (
             await self._architect.create(request, creative_task)
             if creative_task is not None
             else await self._architect.create(request)
         )
+        return self.assemble(request, foundation)
+
+    def assemble(
+        self,
+        request: CreateNovelRequest,
+        foundation: NovelFoundation,
+    ) -> NovelProject:
+        """根据已校验的基础资料组装可供作者确认的候选项目。"""
+
         if not isinstance(foundation, NovelFoundation):
             raise TypeError("Architect.create 必须返回 NovelFoundation")
         self._validator.validate(request=request, foundation=foundation)
@@ -177,10 +196,19 @@ class CreateNovelPipeline:
             book_id=book_id,
             foundation=foundation,
         )
-        return self._store.create_project(
+        return NovelProject(
             metadata=metadata,
             foundation=foundation,
-            initial_state=initial_state,
+            state=initial_state,
+        )
+
+    def publish(self, candidate: NovelProject) -> NovelProject:
+        """一次性发布作者已确认的基础资料和初始状态。"""
+
+        return self._store.create_project(
+            metadata=candidate.metadata,
+            foundation=candidate.foundation,
+            initial_state=candidate.state,
         )
 
     @classmethod
@@ -220,7 +248,12 @@ class CreateNovelPipeline:
             current_location="未指定起始地点",
             characters=characters,
             facts=(),
-            hooks=foundation.initial_hooks,
+            # Foundation 中的 initial_hooks 是待埋设的创作计划。保留在状态索引
+            # 供 Planner 选择，但标记为 deferred，正文实际呈现后才推进为活跃伏笔。
+            hooks=tuple(
+                replace(hook, status="deferred")
+                for hook in foundation.initial_hooks
+            ),
         )
 
     def _timestamp(self) -> str:
@@ -262,7 +295,7 @@ class WriteNextChapterPipeline:
         self._draft_validator = draft_validator or ChapterDraftValidator()
         self._state_reducer = state_reducer or NovelStateReducer()
         self._creative_control_provider = creative_control_provider
-        # 采用鸭子类型，领域 Pipeline 不反向依赖 PostgreSQL ORM。
+        # 采用鸭子类型，领域 Pipeline 不反向依赖 SQLite ORM。
         self._context_snapshot_sink = context_snapshot_sink
         self._review_policy = review_policy
         self._quality_gate = quality_gate or ReviewQualityGate()

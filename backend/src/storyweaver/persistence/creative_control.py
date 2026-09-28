@@ -38,8 +38,8 @@ class CreativeControlRepository:
         if current_focus_mode is not None and current_focus_mode not in {"single_chapter", "persistent"}:
             raise ValueError("current_focus_mode 只支持 single_chapter 或 persistent")
         with self.database.session() as session:
-            with session.begin():
-                row = session.get(BookRow, book_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                row = session.get(BookRow, book_id)
                 now = datetime.now(timezone.utc).isoformat()
                 if row is None:
                     raise KeyError(f"作品不存在：{book_id}")
@@ -75,8 +75,8 @@ class CreativeControlRepository:
         """只在目标章节成功进入正史后清理一次性焦点。"""
 
         with self.database.session() as session:
-            with session.begin():
-                row = session.get(BookRow, book_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                row = session.get(BookRow, book_id)
                 if row is None:
                     return CreativeControl(book_id, "", "", "single_chapter", None, "")
                 control = dict(row.creative_control_json or {})

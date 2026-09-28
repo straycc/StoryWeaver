@@ -86,7 +86,6 @@ from .application import (
     NovelApplicationSettings,
     NovelService,
     build_novel_service,
-    load_env_file,
 )
 from .observability import NovelRunObserver, UsageSummary, WorkerRunMetric
 
@@ -168,5 +167,4 @@ __all__ = [
     "WriteNextChapterPipeline",
     "Writing",
     "build_novel_service",
-    "load_env_file",
 ]

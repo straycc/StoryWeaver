@@ -33,29 +33,12 @@ from ..state_reducer import NovelStateReducer
 from .base import BaseNovelAgent
 
 
-CHAPTER_ANALYZER_SYSTEM_PROMPT = """你是 StoryWeaver 的章节状态分析器。
-你不评价文风，也不续写正文；只从最终正文中提取本章已经发生的状态变化。
-
-约束：
-1. source_chapter 必须等于输入章节号。
-2. 只记录正文明确发生的变化，不把计划中尚未发生的内容写入状态。
-3. 新事实、角色学习和伏笔推进必须使用稳定 ID。
-4. 不修改不存在的角色、事实或伏笔；新事实不得预先失效。
-   new_facts.fact_id 不得与输入 existing_fact_index 或 recent_reserved_fact_ids 中的任何 ID 重复；
-   已有事实仍然成立时不输出它，已有事实失效时仅写入 invalidated_fact_ids。
-5. learned_fact_ids 只能引用 current_state.current_facts 中已有的 fact_id，
-   或本次 new_facts 中同时声明的 fact_id；不能只让角色学习一个未声明的新 ID。
-6. 只返回 JSON 对象，不返回解释、Markdown 或 JSON Schema。
-7. new_hooks 每章最多只能有一项；如正文是在推进已有线索，必须写入 hook_updates，
-   不得为同一人物、物品或谜团另建名称相近的新伏笔。
-8. 输入 chapter_plan.hook_plan.resolve_hook_ids 是本章计划回收的伏笔。仅当正文已经给出
-   明确答案、真相或结果时，将对应 hook_updates.status 写为 resolved；未实际兑现时不得伪造 resolved。
-9. 初始上下文只提供相关和近期正史索引。只有正文涉及的事实或伏笔不在索引中时，
-   才调用只读工具核验；工具预算为 4 次，研究最多 2 回合，不得为凑次数检索。
-
-JSON 必须包含：source_chapter、chapter_summary、character_updates、new_facts、
-invalidated_fact_ids、new_hooks、hook_updates、new_time、new_location。
-character_updates、new_facts、invalidated_fact_ids、new_hooks、hook_updates 均为数组。
+CHAPTER_ANALYZER_SYSTEM_PROMPT = """你是章节状态分析器，只从最终正文提取已发生的变化，不续写、不评文风、不把计划或猜测当正史。
+摘要保留关键事件、因果、人物决定与未解决后果；缺少依据时按需核验，不重复查询。
+已有事实仍有效时不重复新增，失效时标记 invalidated_fact_ids；新 ID 不得复用已有或保留 ID。
+角色只能学习已有或本次同时新增的事实；物品和知识输出变化量，不输出完整状态。
+推进旧伏笔使用 hook_updates，不重复新建；每章新伏笔最多一项，只有正文实际兑现才能标记 resolved。
+按交付 Schema 返回候选增量，source_chapter 使用当前章节号；嵌套对象遵守以下契约：
 
 character_updates 每项只能包含：character_id、location、status、current_goal、
 emotion、add_possessions、remove_possessions、learned_fact_ids。

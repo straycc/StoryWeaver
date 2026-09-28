@@ -5,19 +5,20 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
-from typing import Any
+from contextlib import asynccontextmanager, nullcontext
+from dataclasses import replace
+from typing import Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..novel_creation.application import PROJECT_ROOT, NovelApplicationSettings, build_novel_service
 from ..novel_creation.exceptions import BookBusyError, NovelCreationError
 from ..novel_creation.observability import NovelRunObserver
-from ..novel_creation.pipeline import CreateNovelPipeline
 from ..novel_creation.serialization import to_data
-from ..persistence import ActionProposalRepository, ContextSnapshotRepository, CreativeControlRepository, Database, DatabaseSettings, DeletionConflictError, JobRepository, PostgresChatSessionRepository, PostgresDeletionRepository, PostgresLongTermMemoryStore, PostgresStoryProjectRepository
+from ..persistence import ActionProposalRepository, ContextSnapshotRepository, CreativeControlRepository, Database, DatabaseSettings, DeletionConflictError, JobRepository, SQLAlchemyChatSessionRepository, SQLAlchemyDeletionRepository, SQLAlchemyLongTermMemoryStore, SQLAlchemyStoryProjectRepository
+from ..persistence.action_proposals import MAX_FOUNDATION_GENERATION_ATTEMPTS
 from ..persistence import SimulationRepository
 from ..story_simulation.service import RoleplayService
 from ..story_simulation.agent import (CHARACTER_SYSTEM_PROMPT, DIRECTOR_SYSTEM_PROMPT,
@@ -25,6 +26,8 @@ from ..story_simulation.agent import (CHARACTER_SYSTEM_PROMPT, DIRECTOR_SYSTEM_P
 from ..story_simulation.runtime import RoleplayRuntime
 from ..story_simulation.service import public_state
 from ..llm import OpenAICompatibleProviderSettings, WorkerSettings
+from ..model_config import ModelCatalog, ModelConfigurationError, RoutedModel
+from ..model_config.store import ProviderConfig, bind_model
 from agents import ModelSettings
 from ..observability import ModelFailureDiagnosticWriter
 from ..application.workspace import ChatWorkspaceApplication, build_chat_workspace
@@ -100,8 +103,150 @@ class SessionMessageBody(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProviderBody(ProviderConfig):
+    api_key: str | None = None
+    clear_key: bool = False
+
+
+class ModelSelectionBody(BaseModel):
+    provider_id: str
+    model_id: str
+
+
+class ReasoningSelectionBody(BaseModel):
+    level: Literal["default", "off", "low", "medium", "high", "max"]
+
+
 class ConfirmActionProposalBody(BaseModel):
     proposal_id: str
+
+
+class ConfirmFoundationProposalBody(BaseModel):
+    version: int = Field(ge=1)
+
+
+class _FoundationEditBody(BaseModel):
+    """作者只可提交故事语义字段，拒绝系统结构字段。"""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class CharacterFoundationPatch(_FoundationEditBody):
+    character_id: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=200)
+    role: str = Field(min_length=1, max_length=2000)
+    personality: list[str] = Field(min_length=1, max_length=20)
+    motivation: str = Field(min_length=1, max_length=4000)
+    long_term_goal: str = Field(min_length=1, max_length=4000)
+    conflict: str = Field(min_length=1, max_length=4000)
+    speech_style: str = Field(min_length=1, max_length=2000)
+    knowledge_boundaries: list[str] = Field(default_factory=list, max_length=30)
+
+
+class OutlineFoundationPatch(_FoundationEditBody):
+    node_id: str = Field(min_length=1)
+    title: str = Field(min_length=1, max_length=300)
+    chapter_start: int = Field(ge=1)
+    chapter_end: int = Field(ge=1)
+    goal: str = Field(min_length=1, max_length=4000)
+    expected_changes: list[str] = Field(default_factory=list, max_length=30)
+
+
+class HookFoundationPatch(_FoundationEditBody):
+    hook_id: str = Field(min_length=1)
+    name: str = Field(default="", max_length=300)
+    description: str = Field(min_length=1, max_length=4000)
+    importance: int = Field(ge=1, le=5)
+    expected_payoff: str = Field(min_length=1, max_length=4000)
+
+
+class FoundationPatch(_FoundationEditBody):
+    premise: str | None = Field(default=None, min_length=1, max_length=8000)
+    world_setting: str | None = Field(default=None, min_length=1, max_length=8000)
+    central_conflict: str | None = Field(default=None, min_length=1, max_length=8000)
+    ending_direction: str | None = Field(default=None, min_length=1, max_length=8000)
+    writing_rules: list[str] | None = Field(default=None, min_length=1, max_length=40)
+    characters: list[CharacterFoundationPatch] | None = None
+    outline: list[OutlineFoundationPatch] | None = None
+    initial_hooks: list[HookFoundationPatch] | None = None
+
+
+class UpdateFoundationProposalBody(BaseModel):
+    version: int = Field(ge=1)
+    patch: FoundationPatch
+
+
+class CreateFoundationRevisionBody(BaseModel):
+    session_id: str = Field(min_length=1)
+    scope: Literal["outline", "setting"]
+
+
+def _apply_foundation_patch(foundation: Any, patch: FoundationPatch) -> Any:
+    """合并作者可编辑字段，系统 ID、状态及进度始终来自原候选。"""
+
+    updates: dict[str, Any] = {}
+    for field_name in (
+        "premise",
+        "world_setting",
+        "central_conflict",
+        "ending_direction",
+    ):
+        value = getattr(patch, field_name)
+        if value is not None:
+            updates[field_name] = value
+    if patch.writing_rules is not None:
+        updates["writing_rules"] = tuple(patch.writing_rules)
+    if patch.characters is not None:
+        existing = {item.character_id: item for item in foundation.characters}
+        submitted = {item.character_id for item in patch.characters}
+        if submitted != set(existing) or len(submitted) != len(patch.characters):
+            raise ValueError("当前版本不支持新增或删除人物，请保留已有全部人物")
+        updates["characters"] = tuple(
+            replace(
+                existing[item.character_id],
+                name=item.name,
+                role=item.role,
+                personality=tuple(item.personality),
+                motivation=item.motivation,
+                long_term_goal=item.long_term_goal,
+                conflict=item.conflict,
+                speech_style=item.speech_style,
+                knowledge_boundaries=tuple(item.knowledge_boundaries),
+            )
+            for item in patch.characters
+        )
+    if patch.outline is not None:
+        existing = {item.node_id: item for item in foundation.outline}
+        submitted = {item.node_id for item in patch.outline}
+        if submitted != set(existing) or len(submitted) != len(patch.outline):
+            raise ValueError("当前版本不支持新增或删除总纲节点，请保留已有全部节点")
+        updates["outline"] = tuple(
+            replace(
+                existing[item.node_id],
+                title=item.title,
+                chapter_start=item.chapter_start,
+                chapter_end=item.chapter_end,
+                goal=item.goal,
+                expected_changes=tuple(item.expected_changes),
+            )
+            for item in patch.outline
+        )
+    if patch.initial_hooks is not None:
+        existing = {item.hook_id: item for item in foundation.initial_hooks}
+        submitted = {item.hook_id for item in patch.initial_hooks}
+        if submitted != set(existing) or len(submitted) != len(patch.initial_hooks):
+            raise ValueError("当前版本不支持新增或删除伏笔，请保留已有全部伏笔")
+        updates["initial_hooks"] = tuple(
+            replace(
+                existing[item.hook_id],
+                name=item.name,
+                description=item.description,
+                importance=item.importance,
+                expected_payoff=item.expected_payoff,
+            )
+            for item in patch.initial_hooks
+        )
+    return replace(foundation, **updates)
 
 
 class CreativeControlBody(BaseModel):
@@ -145,11 +290,11 @@ class SimulationModeBody(BaseModel):
     user_character_id: str | None = None
 
 
-def create_app(*, settings: NovelApplicationSettings, database_url: str) -> FastAPI:
+def create_app(*, settings: NovelApplicationSettings, database_url: str, model_catalog: ModelCatalog | None = None) -> FastAPI:
     """创建单实例 API；调用方必须以单 Uvicorn worker 启动。"""
 
     database = Database(DatabaseSettings(database_url))
-    store = PostgresStoryProjectRepository(database)
+    store = SQLAlchemyStoryProjectRepository(database)
     jobs = JobRepository(database)
     action_proposals = ActionProposalRepository(database)
     context_snapshots = ContextSnapshotRepository(database)
@@ -165,9 +310,9 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
     creative_controls = CreativeControlRepository(database)
-    sessions = PostgresChatSessionRepository(database)
-    deletions = PostgresDeletionRepository(database)
-    memories = PostgresLongTermMemoryStore(database)
+    sessions = SQLAlchemyChatSessionRepository(database)
+    deletions = SQLAlchemyDeletionRepository(database)
+    memories = SQLAlchemyLongTermMemoryStore(database)
     live_previews = LivePreviewHub()
 
     def emit_run_event(run_id: str, event_type: str, payload: Mapping[str, Any]) -> None:
@@ -197,15 +342,17 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         event_sink=emit_run_event,
         live_preview_sink=emit_live_preview,
     )
+    shared_model = RoutedModel(model_catalog) if model_catalog else OpenAICompatibleProviderSettings(
+        base_url=settings.base_url, model_name=settings.model, api_key=settings.api_key,
+    ).create_provider().get_model(settings.model)
     service = build_novel_service(
         settings,
         store=store,
         observer=observer,
         creative_control_provider=creative_controls.get,
         context_snapshot_sink=context_snapshots,
+        model_override=shared_model,
     )
-    provider = OpenAICompatibleProviderSettings(base_url=settings.base_url, model_name=settings.model, api_key=settings.api_key).create_provider()
-    shared_model = provider.get_model(settings.model)
     skill_invocations = SkillInvocationResolver(
         registry=skills,
         selector=build_model_implicit_skill_selector(
@@ -275,10 +422,40 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         sessions=sessions,
         memory_store=memories,
         novels=service,
+        action_proposals=action_proposals,
+        model_override=shared_model,
     )
+
+    def effective_model_selection(session_id: str) -> tuple[str, str] | None:
+        selected = sessions.selected_model(session_id)
+        if model_catalog is None:
+            return selected
+        config = model_catalog.public()
+        providers = config["providers"]
+        if selected and any(item["id"] == selected[0] and selected[1] in item["models"] for item in providers):
+            return selected
+        if config["default_provider"] and config["default_model"]:
+            return str(config["default_provider"]), str(config["default_model"])
+        if providers:
+            return str(providers[0]["id"]), str(providers[0]["models"][0])
+        return None
+
+    def model_binding(payload: Mapping[str, Any]):
+        if model_catalog is None:
+            return nullcontext()
+        session_id = payload.get("session_id")
+        selected = effective_model_selection(str(session_id)) if session_id else None
+        provider, model_id, _key = model_catalog.selection(*(selected or (None, None)))
+        model = model_catalog.create_model(provider.id, model_id)
+        level = sessions.selected_reasoning(str(session_id)) if session_id else "default"
+        if level not in model_catalog.reasoning_levels(provider, model_id):
+            level = "default"
+        return bind_model(model, reasoning_level=level, reasoning_family=model_catalog.reasoning_family(provider, model_id))
+
     supervisor = JobSupervisor(
         service=service, jobs=jobs, workspace=workspace,
         creative_controls=creative_controls, roleplay=roleplay, live_previews=live_previews,
+        bind_model_for_payload=model_binding,
     )
     dispatcher = ActionDispatcher(
         proposals=action_proposals, jobs=jobs, workspace=workspace, submit_job=supervisor.submit,
@@ -288,7 +465,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         jobs=jobs, proposals=action_proposals, workspace=workspace,
     )
     action_surface = MainAgentActionSurface(
-        agent=MainAgent(settings), proposals=action_proposals, dispatcher=dispatcher, workspace=workspace,
+        agent=MainAgent(settings, model=shared_model), proposals=action_proposals, dispatcher=dispatcher, workspace=workspace,
         context_builder=MainAgentContextBuilder(
             workspace=workspace,
             creative_controls=creative_controls,
@@ -308,10 +485,17 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        supervisor.interrupt_orphaned_jobs()
-        yield
-        await supervisor.shutdown()
-        database.dispose()
+        try:
+            database.acquire_instance_lock()
+            database.create_schema()
+            supervisor.interrupt_orphaned_jobs()
+            sessions.prune_duplicate_empty_sessions()
+            yield
+        finally:
+            try:
+                await supervisor.shutdown()
+            finally:
+                database.dispose()
 
     app = FastAPI(title="StoryWeaver API", version="1", lifespan=lifespan)
     app.state.database = database
@@ -331,6 +515,50 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     app.state.simulations = simulations
     app.state.roleplay = roleplay
 
+    @app.exception_handler(ModelConfigurationError)
+    async def model_configuration_error(_request: Request, exc: ModelConfigurationError) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.get("/api/v1/models/config")
+    async def get_model_config() -> dict[str, Any]:
+        return model_catalog.public() if model_catalog else {"providers": [], "default_provider": None, "default_model": None}
+
+    @app.put("/api/v1/models/providers/{provider_id}")
+    async def save_model_provider(provider_id: str, body: ProviderBody) -> dict[str, Any]:
+        if model_catalog is None:
+            raise HTTPException(status_code=409, detail="当前服务未启用模型配置")
+        if provider_id != body.id:
+            raise HTTPException(status_code=422, detail="供应商 ID 不一致")
+        return model_catalog.upsert(ProviderConfig.model_validate(body.model_dump(exclude={"api_key", "clear_key"})), api_key=body.api_key, clear_key=body.clear_key)
+
+    @app.delete("/api/v1/models/providers/{provider_id}")
+    async def delete_model_provider(provider_id: str) -> dict[str, Any]:
+        if model_catalog is None:
+            raise HTTPException(status_code=409, detail="当前服务未启用模型配置")
+        try:
+            return model_catalog.delete(provider_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="供应商不存在") from exc
+
+    @app.put("/api/v1/models/default")
+    async def set_default_model(body: ModelSelectionBody) -> dict[str, Any]:
+        if model_catalog is None:
+            raise HTTPException(status_code=409, detail="当前服务未启用模型配置")
+        return model_catalog.set_default(body.provider_id, body.model_id)
+
+    @app.post("/api/v1/models/test")
+    async def test_model(body: ModelSelectionBody) -> dict[str, bool]:
+        if model_catalog is None:
+            raise HTTPException(status_code=409, detail="当前服务未启用模型配置")
+        provider, model_id, key = model_catalog.selection(body.provider_id, body.model_id)
+        from openai import AsyncOpenAI
+        try:
+            async with AsyncOpenAI(base_url=provider.base_url, api_key=key or "local", timeout=15.0) as client:
+                await client.chat.completions.create(model=model_id, messages=[{"role": "user", "content": "请回复 OK"}], max_tokens=8)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"连接测试失败：{type(exc).__name__}") from exc
+        return {"ok": True}
+
     @app.exception_handler(BookBusyError)
     async def book_busy(_request: Request, exc: BookBusyError) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
@@ -345,9 +573,10 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
 
     @app.get("/api/v1/bootstrap")
     async def bootstrap() -> dict[str, Any]:
-        """旧工作台首次加载所需的完整索引，数据源为 PostgreSQL。"""
+        """旧工作台首次加载所需的完整索引，数据源为 SQLite。"""
 
-        return {**workspace.bootstrap(), "skills": [
+        default_model = model_catalog.public()["default_model"] if model_catalog else settings.model
+        return {**workspace.bootstrap(), "model": default_model or "未配置模型", "skills": [
             {
                 "id": item.skill_id,
                 "name": item.name,
@@ -388,21 +617,57 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     async def create_session(body: CreateSessionBody) -> dict[str, Any]:
         if body.book_id:
             store.load_metadata(body.book_id)
-        return _session_data(sessions.create_session(title=body.title, book_id=body.book_id))
+        session = sessions.create_session(title=body.title, book_id=body.book_id)
+        data = _session_data(session)
+        selected = sessions.selected_model(session.session_id)
+        data["selected_model"] = {"provider_id": selected[0], "model_id": selected[1]} if selected else None
+        data["reasoning_level"] = sessions.selected_reasoning(session.session_id)
+        return data
 
     @app.get("/api/v1/sessions/{session_id}")
     async def get_session(session_id: str, before_sequence: int | None = None, limit: int = 50) -> dict[str, Any]:
         try:
-            return _workspace_session_data(workspace, session_id, before_sequence, limit)
+            data = _workspace_session_data(workspace, session_id, before_sequence, limit)
+            selected = sessions.selected_model(session_id)
+            if selected != effective_model_selection(session_id):
+                selected = None
+            data["selected_model"] = {"provider_id": selected[0], "model_id": selected[1]} if selected else None
+            data["reasoning_level"] = sessions.selected_reasoning(session_id)
+            return data
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.put("/api/v1/sessions/{session_id}/model")
+    async def select_session_model(session_id: str, body: ModelSelectionBody) -> dict[str, str]:
+        if model_catalog is None:
+            raise HTTPException(status_code=409, detail="当前服务未启用模型配置")
+        sessions.load_session(session_id)
+        model_catalog.selection(body.provider_id, body.model_id)
+        sessions.append_event(session_id, event_type="session_model_selected", payload=body.model_dump())
+        sessions.append_event(session_id, event_type="session_reasoning_selected", payload={"level": "default"})
+        return body.model_dump()
+
+    @app.put("/api/v1/sessions/{session_id}/reasoning")
+    async def select_session_reasoning(session_id: str, body: ReasoningSelectionBody) -> dict[str, str]:
+        if model_catalog is None:
+            raise HTTPException(status_code=409, detail="当前服务未启用模型配置")
+        sessions.load_session(session_id)
+        selected = effective_model_selection(session_id)
+        provider, model_id, _key = model_catalog.selection(*(selected or (None, None)))
+        if body.level not in model_catalog.reasoning_levels(provider, model_id):
+            raise HTTPException(status_code=422, detail="当前供应商不支持这个思考等级")
+        sessions.append_event(session_id, event_type="session_reasoning_selected", payload=body.model_dump())
+        return body.model_dump()
+
     @app.patch("/api/v1/sessions/{session_id}")
     async def bind_session_book(session_id: str, body: CreateSessionBody) -> dict[str, Any]:
         try:
-            return _session_data(workspace.bind_book(session_id, body.book_id))
+            # 用户主动关联作品时，建书讨论等已有消息应保留在同一会话。
+            return _session_data(
+                workspace.bind_book(session_id, body.book_id, allow_nonempty=True)
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -462,15 +727,16 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         if not isinstance(raw_skill_ids, list):
             raise HTTPException(status_code=422, detail="skill_ids 必须是数组")
         explicit_skill_ids = [str(item) for item in raw_skill_ids]
-        creative_task_context = (
-            await activate_chat_task(
+        with model_binding({"session_id": session_id}):
+            creative_task_context = (
+                await activate_chat_task(
                 session=session,
                 request=body.content or "处理当前创作请求",
                 explicit_skill_ids=explicit_skill_ids,
+                )
+                if body.action == "chat"
+                else None
             )
-            if body.action == "chat"
-            else None
-        )
         job = await supervisor.submit(
             job_type="session_action",
             book_id=bound_book_id,
@@ -508,9 +774,15 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         return {"proposals": [dispatcher.data(item) for item in action_proposals.list_pending(session_id=session_id)]}
 
     @app.post("/api/v1/action-proposals/{proposal_id}/confirm", status_code=202)
-    async def confirm_action_proposal(proposal_id: str) -> dict[str, Any]:
+    async def confirm_action_proposal(
+        proposal_id: str,
+        body: ConfirmFoundationProposalBody | None = None,
+    ) -> dict[str, Any]:
         try:
-            proposal = await dispatcher.confirm(proposal_id)
+            proposal = await dispatcher.confirm(
+                proposal_id,
+                expected_version=body.version if body is not None else None,
+            )
             workspace.sessions.append_event(
                 proposal.session_id,
                 event_type="action_proposal_confirmed",
@@ -519,6 +791,175 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
             if not proposal.job_id:
                 raise RuntimeError("确认操作未创建 Job")
             return _accepted(jobs.get(proposal.job_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.patch("/api/v1/action-proposals/{proposal_id}/foundation")
+    async def update_foundation_proposal(
+        proposal_id: str,
+        body: UpdateFoundationProposalBody,
+    ) -> dict[str, Any]:
+        """编辑待确认基础资料，并从编辑结果重建候选初始状态。"""
+
+        try:
+            proposal = action_proposals.get(proposal_id)
+            if proposal.action_type not in {"confirm_foundation", "apply_foundation_revision"}:
+                raise ValueError("该提案不是故事基础资料")
+            request_data = proposal.payload.get("request")
+            candidate_data = proposal.payload.get("candidate")
+            if not isinstance(candidate_data, dict):
+                raise ValueError("基础资料提案缺少候选内容")
+            from ..novel_creation.models import CreateNovelRequest, NovelProject
+
+            current = service.project_candidate_from_data(candidate_data)
+            foundation = _apply_foundation_patch(current.foundation, body.patch)
+            if proposal.action_type == "confirm_foundation":
+                if not isinstance(request_data, dict):
+                    raise ValueError("基础资料提案缺少创作要求")
+                candidate = service.rebuild_project_candidate(
+                    CreateNovelRequest(**request_data),
+                    foundation,
+                )
+            else:
+                # 正式作品修订不重置 state；但仍借用创建期校验检查字段完整性、
+                # 角色唯一性和大纲范围。
+                service.rebuild_project_candidate(
+                    CreateNovelRequest(
+                        title=current.metadata.title,
+                        genre=current.metadata.genre,
+                        premise=current.foundation.premise,
+                        protagonist="",
+                        central_conflict="",
+                        tone="",
+                        target_chapters=current.metadata.target_chapters,
+                        chapter_target_words=current.metadata.chapter_target_words,
+                        language=current.metadata.language,
+                    ),
+                    foundation,
+                )
+                committed = current.state.last_committed_chapter
+                original_nodes = {item.node_id: item for item in current.foundation.outline}
+                revised_nodes = {item.node_id: item for item in foundation.outline}
+                if any(
+                    revised_nodes[node_id] != node
+                    for node_id, node in original_nodes.items()
+                    if node.chapter_start <= committed
+                ):
+                    raise ValueError("已进入 Canon 的大纲节点不能直接修改")
+                candidate = NovelProject(
+                    metadata=current.metadata,
+                    foundation=foundation,
+                    state=current.state,
+                )
+            updated_payload = dict(proposal.payload)
+            updated_payload["candidate"] = to_data(candidate)
+            updated = action_proposals.replace_pending_payload(
+                proposal_id,
+                expected_version=body.version,
+                payload=updated_payload,
+                summary=f"《{candidate.metadata.title}》的故事基础资料已更新，等待确认。",
+            )
+            workspace.sessions.append_event(
+                updated.session_id,
+                event_type="action_proposal_pending",
+                payload=workspace._action_proposal_data(updated),
+            )
+            return {"proposal": dispatcher.data(updated)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/v1/books/{book_id}/foundation-revisions")
+    async def create_foundation_revision(
+        book_id: str,
+        body: CreateFoundationRevisionBody,
+    ) -> dict[str, Any]:
+        """从正式作品创建可编辑修订副本，不直接修改 Canon。"""
+
+        try:
+            sessions.load_session(body.session_id)
+            project = store.load_project(book_id)
+            # 一个范围只保留一份待确认草稿。再次点击编辑应恢复草稿，不能在聊天中
+            # 不断产生新的内部确认提案。
+            pending_revisions = [
+                item
+                for item in action_proposals.list_pending(session_id=body.session_id)
+                if (
+                    item.book_id == book_id
+                    and item.action_type == "apply_foundation_revision"
+                    and str(item.payload.get("scope") or "") == body.scope
+                )
+            ]
+            if pending_revisions:
+                current = pending_revisions[0]
+                for stale in pending_revisions[1:]:
+                    action_proposals.supersede(stale.proposal_id)
+                return {"proposal": dispatcher.data(current)}
+            proposal = action_proposals.create(
+                session_id=body.session_id,
+                book_id=book_id,
+                action_type="apply_foundation_revision",
+                payload={
+                    "version": 1,
+                    "scope": body.scope,
+                    "candidate": to_data(project),
+                },
+                summary=(
+                    "正在修订后续故事大纲，等待确认。"
+                    if body.scope == "outline"
+                    else "正在修订故事设定，等待确认。"
+                ),
+            )
+            workspace.sessions.append_event(
+                body.session_id,
+                event_type="action_proposal_pending",
+                payload=dispatcher.data(proposal),
+            )
+            return {"proposal": dispatcher.data(proposal)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/v1/action-proposals/{proposal_id}/regenerate", status_code=202)
+    async def regenerate_foundation_proposal(proposal_id: str) -> dict[str, Any]:
+        """用原始创作要求生成新候选；新候选成功后才替代旧候选。"""
+
+        try:
+            proposal = action_proposals.get(proposal_id)
+            if proposal.status != "pending" or proposal.action_type != "confirm_foundation":
+                raise ValueError("只能重新生成待确认的故事基础资料")
+            generation_attempt = int(proposal.payload.get("generation_attempt") or 1)
+            if generation_attempt >= MAX_FOUNDATION_GENERATION_ATTEMPTS:
+                raise ValueError(
+                    f"故事基础资料最多生成 {MAX_FOUNDATION_GENERATION_ATTEMPTS} 次；"
+                    "请编辑或确认当前方案"
+                )
+            request_data = proposal.payload.get("request")
+            if not isinstance(request_data, dict):
+                raise ValueError("基础资料提案缺少创作要求")
+            action_payload = {
+                **request_data,
+                "supersedes_proposal_id": proposal.proposal_id,
+                "generation_attempt": generation_attempt + 1,
+            }
+            if "creative_task_context" in proposal.payload:
+                action_payload["creative_task_context"] = proposal.payload["creative_task_context"]
+            job = await supervisor.submit(
+                job_type="session_action",
+                book_id=None,
+                payload={
+                    "session_id": proposal.session_id,
+                    "content": "重新生成故事基础资料",
+                    "action": "create_novel",
+                    "book_id": None,
+                    "action_payload": action_payload,
+                },
+            )
+            return _accepted(job)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -556,7 +997,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
     async def list_memories(scope_type: str | None = None, scope_id: str | None = None, status: str | None = None) -> dict[str, Any]:
         from ..memory.long_term import LongTermMemoryStatus, MemoryScopeType
         return {"memories": [
-            PostgresLongTermMemoryStore._encode(item)
+            SQLAlchemyLongTermMemoryStore._encode(item)
             for item in memories.list_records(
                 scope_type=MemoryScopeType(scope_type) if scope_type else None,
                 scope_id=scope_id,
@@ -566,11 +1007,11 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
 
     @app.delete("/api/v1/memories/{memory_id}")
     async def disable_memory(memory_id: str) -> dict[str, Any]:
-        return {"memory": PostgresLongTermMemoryStore._encode(memories.disable(memory_id))}
+        return {"memory": SQLAlchemyLongTermMemoryStore._encode(memories.disable(memory_id))}
 
     @app.post("/api/v1/memories/{memory_id}/restore")
     async def restore_memory(memory_id: str) -> dict[str, Any]:
-        return {"memory": PostgresLongTermMemoryStore._encode(memories.restore(memory_id))}
+        return {"memory": SQLAlchemyLongTermMemoryStore._encode(memories.restore(memory_id))}
 
     @app.delete("/api/v1/memories/{memory_id}/permanent", status_code=204)
     async def delete_memory_permanently(memory_id: str) -> None:
@@ -619,25 +1060,18 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str) -> Fast
         if not memories.save(corrected):
             raise HTTPException(status_code=409, detail="相同内容的生效会话记忆已存在")
         return {
-            "memory": PostgresLongTermMemoryStore._encode(corrected),
+            "memory": SQLAlchemyLongTermMemoryStore._encode(corrected),
             "replaced_memory_id": previous.memory_id,
         }
 
     @app.post("/api/v1/books", status_code=202)
     async def create_book(body: CreateBookBody) -> dict[str, Any]:
-        request_data = body.model_dump()
-        skill_ids = request_data.pop("skill_ids")
-        # 创建任务也按稳定 book_id 参与单活跃约束，避免重复简报并发建书。
-        from ..novel_creation.models import CreateNovelRequest
-        book_id = CreateNovelPipeline.build_book_id(CreateNovelRequest(**request_data))
-        job = await supervisor.submit(job_type="create_book", book_id=book_id, payload={
-            "request": request_data,
-            "creative_task_context": activate_task(
-                json.dumps(request_data, ensure_ascii=False),
-                skill_ids,
-            ),
-        })
-        return _accepted(job)
+        # 作品必须先作为会话中的 FoundationProposal 供作者确认；保留路由仅为
+        # 旧客户端提供明确错误，不能允许该入口绕过确认边界。
+        raise HTTPException(
+            status_code=409,
+            detail="请通过会话中的“创建小说”生成并确认故事基础资料",
+        )
 
     @app.delete("/api/v1/books/{book_id}")
     async def delete_book(book_id: str) -> dict[str, Any]:

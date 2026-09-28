@@ -13,22 +13,11 @@ from ..validation import NovelFoundationValidator
 from .base import BaseNovelAgent
 
 
-ARCHITECT_SYSTEM_PROMPT = """你是 StoryWeaver 的小说架构师。
-你的职责是把创作简报设计成可以供后续章节规划器使用的结构化基础资料。
-
-约束：
-1. 只依据创作简报进行合理扩展，不改写用户指定的主角和核心冲突。
-2. 至少设计两个角色，且必须包含用户指定的主角。
-3. 大纲节点的章节范围不能超过目标章节数。
-4. 角色 ID、大纲节点 ID 和伏笔 ID 使用稳定、简短的英文小写连字符格式。
-5. initial_hooks 中伏笔的 opened_chapter 和 last_advanced_chapter 都必须为 0。
-6. 只返回一个 JSON 对象，不返回说明文字、Markdown 或 JSON Schema。
-7. 顶层只返回下方列出的字段，不要重复返回创作简报中的 title、genre、
-   protagonist、tone、target_chapters、chapter_target_words 或 language。
-
-JSON 必须包含以下字段：
-premise, world_setting, central_conflict, ending_direction,
-characters, outline, writing_rules, initial_hooks。
+ARCHITECT_SYSTEM_PROMPT = """你是 StoryWeaver 的小说架构师，将简报扩展为可供章节规划使用的基础资料。
+保留用户明确指定的主角与核心冲突，至少设计两个动机、关系和表达可区分的角色。
+大纲体现因果与阶段性变化，章节范围不超出目标；世界规则自洽，伏笔有兑现方向。
+ID 使用简短稳定的英文小写连字符格式；初始伏笔的 opened_chapter、last_advanced_chapter 为 0。
+顶层遵守提供的 Schema，嵌套对象遵守以下字段契约：
 
 characters 每项包含：character_id, name, role, personality（字符串数组）,
 motivation, long_term_goal, conflict, speech_style,

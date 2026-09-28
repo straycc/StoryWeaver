@@ -326,6 +326,7 @@ class SessionContextManager:
         prompt = (
             "把以下较早会话压缩为结构化 JSON。必须保留用户约束、已确认决定、"
             "当前目标、已完成和未完成工作、重要文件或章节引用。"
+            "区分建议、已确认决定与实际完成结果；用明确纠正更新旧摘要，保留仍有效的限制。"
             "字段必须是 current_goal, confirmed_decisions, user_constraints, "
             "completed_work, pending_work, important_references；每个字段使用字符串数组。"
             f"目标控制在约 {self.policy.summary_target_tokens} Token。\n\n"

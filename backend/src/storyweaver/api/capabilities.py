@@ -9,8 +9,10 @@ from pydantic import BaseModel
 
 from .action_schemas import (
     ApproveChapterPlanParameters,
+    ApplyFoundationRevisionParameters,
     CancelChapterPlanParameters,
     ConfirmAndWriteParameters,
+    ConfirmFoundationParameters,
     CreateNovelParameters,
     CreativeDiscussionParameters,
     PrepareChapterPlanParameters,
@@ -57,6 +59,8 @@ _DEFINITIONS = (
     CapabilityDefinition("explain_review", "query", "解释章节审查结果", QueryRecentReviewParameters, True),
     CapabilityDefinition("creative_discussion", "creative", "借助本次选择的 Skill 讨论创作问题，但不修改作品状态", CreativeDiscussionParameters, False),
     CapabilityDefinition("create_novel", "workflow", "根据已讨论的创作简报创建新作品", CreateNovelParameters, False, requires_confirmation=True),
+    CapabilityDefinition("confirm_foundation", "workflow", "确认当前故事基础资料并创建作品", ConfirmFoundationParameters, False),
+    CapabilityDefinition("apply_foundation_revision", "workflow", "确认故事基础资料修订", ApplyFoundationRevisionParameters, True),
     CapabilityDefinition("prepare_chapter_plan", "creative", "只生成下一章候选计划，等待用户后续决定", PrepareChapterPlanParameters, True),
     CapabilityDefinition("revise_chapter_plan", "creative", "根据反馈修订当前候选计划", ReviseChapterPlanParameters, True, True),
     CapabilityDefinition("cancel_chapter_plan", "workflow", "取消当前候选计划", CancelChapterPlanParameters, True, True),

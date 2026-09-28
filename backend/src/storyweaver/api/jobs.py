@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from contextlib import nullcontext
 from typing import Any
 
 from ..novel_creation.application import NovelService
+from ..novel_creation.exceptions import ProjectAlreadyExistsError
 from ..application.workspace import ChatWorkspaceApplication
 from ..novel_creation.models import BatchPlanningContext, CreateNovelRequest
 from ..novel_creation.serialization import to_data
@@ -54,7 +56,7 @@ class _JobLlmEventSink(LlmEventSink):
 class JobSupervisor:
     """单 FastAPI 进程内的长任务调度器。
 
-    Task 引用仅用于当前进程执行；真正状态与事件都在 PostgreSQL，因此浏览器
+    Task 引用仅用于当前进程执行；真正状态与事件都在 SQLite，因此浏览器
     断开不会取消任务，服务重启则由启动钩子统一标记为 interrupted。
     """
 
@@ -69,6 +71,7 @@ class JobSupervisor:
         creative_controls: CreativeControlRepository | None = None,
         roleplay: Any | None = None,
         live_previews: LivePreviewHub | None = None,
+        bind_model_for_payload: Any | None = None,
     ) -> None:
         self._service = service
         self._jobs = jobs
@@ -78,6 +81,7 @@ class JobSupervisor:
         self._creative_controls = creative_controls
         self._roleplay = roleplay
         self._live_previews = live_previews or LivePreviewHub()
+        self._bind_model_for_payload = bind_model_for_payload
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._guard = asyncio.Lock()
 
@@ -97,15 +101,17 @@ class JobSupervisor:
         book_id: str | None,
         payload: Mapping[str, Any],
     ) -> Job:
-        lock_scope = self._lock_scope_for(job_type=job_type, payload=payload)
-        job = self._jobs.create(
-            job_type=job_type,
-            book_id=book_id,
-            payload=payload,
-            lock_scope=lock_scope,
-        )
-        async with self._guard:
-            self._tasks[job.job_id] = asyncio.create_task(self._run(job.job_id))
+        binding = self._bind_model_for_payload(payload) if self._bind_model_for_payload else nullcontext()
+        with binding:
+            lock_scope = self._lock_scope_for(job_type=job_type, payload=payload)
+            job = self._jobs.create(
+                job_type=job_type,
+                book_id=book_id,
+                payload=payload,
+                lock_scope=lock_scope,
+            )
+            async with self._guard:
+                self._tasks[job.job_id] = asyncio.create_task(self._run(job.job_id))
         return job
 
     async def retry(self, job_id: str) -> Job:
@@ -235,6 +241,88 @@ class JobSupervisor:
                 self._creative_task(payload),
             )
             return {"book_id": project.metadata.book_id, "status": "created"}
+        if job.job_type == "confirm_foundation":
+            workspace = self._require_workspace()
+            candidate_data = payload.get("candidate")
+            if not isinstance(candidate_data, Mapping):
+                raise ValueError("基础资料候选格式无效")
+            candidate = self._service.project_candidate_from_data(candidate_data)
+            try:
+                project = self._service.publish_project_candidate(candidate)
+                created = True
+            except ProjectAlreadyExistsError:
+                project = self._service.store.load_project(candidate.metadata.book_id)
+                # 同一份创作简报的 book_id 相同，但作者可能在候选阶段编辑过
+                # Foundation。只有资料完全一致时，才把重复执行视为安全重试。
+                if project.foundation != candidate.foundation:
+                    raise ValueError(
+                        "同一创作简报已创建过不同版本的作品；请修改标题或创作要求后重试"
+                    )
+                created = False
+            session_id = str(payload["session_id"])
+            # 该作品正是此会话内待确认 Proposal 发布的结果，不是用户把已有
+            # 对话切换到另一部作品；允许保留建书过程的对话和时间线。
+            workspace.bind_book(
+                session_id,
+                project.metadata.book_id,
+                allow_nonempty=True,
+            )
+            workspace.sessions.append_message(
+                session_id,
+                role="assistant",
+                action="confirm_foundation",
+                content=(
+                    f"已确认《{project.metadata.title}》的故事基础资料。"
+                    "现在可以开始规划第一章。"
+                ),
+                metadata={
+                    "book_id": project.metadata.book_id,
+                    "foundation_confirmed": True,
+                    "created": created,
+                },
+            )
+            return {
+                "book_id": project.metadata.book_id,
+                "status": "created" if created else "existing",
+            }
+        if job.job_type == "apply_foundation_revision":
+            candidate_data = payload.get("candidate")
+            if not isinstance(candidate_data, Mapping):
+                raise ValueError("基础资料修订候选格式无效")
+            candidate = self._service.project_candidate_from_data(candidate_data)
+            project = self._service.update_project_foundation(
+                book_id=self._require_book(job),
+                foundation=candidate.foundation,
+            )
+            expired_plans = ()
+            if payload.get("scope") == "outline":
+                expired_plans = self._service.expire_pending_chapter_plans(
+                    book_id=project.metadata.book_id,
+                )
+                for plan in expired_plans:
+                    self._append_plan_event(job, "chapter_plan_expired", plan)
+            workspace = self._require_workspace()
+            session_id = str(payload["session_id"])
+            invalidation_note = (
+                f"已使第 {expired_plans[0].chapter_number} 章候选计划失效，请重新规划下一章。"
+                if expired_plans
+                else ""
+            )
+            workspace.sessions.append_message(
+                session_id,
+                role="assistant",
+                action="apply_foundation_revision",
+                content=(
+                    f"已确认《{project.metadata.title}》的基础资料修订。"
+                    f"后续创作将使用新设定与新规划。{invalidation_note}"
+                ),
+                metadata={
+                    "book_id": project.metadata.book_id,
+                    "foundation_revised": True,
+                    "expired_plan_ids": [plan.proposal_id for plan in expired_plans],
+                },
+            )
+            return {"book_id": project.metadata.book_id, "status": "updated"}
         if job.job_type == "prepare_chapter":
             proposal = await self._service.prepare_next_chapter(
                 book_id=self._require_book(job),

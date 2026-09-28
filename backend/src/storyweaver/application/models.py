@@ -12,6 +12,8 @@ CHAT_ROLES = frozenset({"user", "assistant"})
 TRANSCRIPT_EVENT_TYPES = frozenset(
     {
         "session_created",
+        "session_model_selected",
+        "session_reasoning_selected",
         "book_bound",
         "story_timeline_rewritten",
         "message_added",

@@ -80,6 +80,7 @@ async def run_research(
             instructions=(
                 settings.instructions
                 + "\n此阶段只检索证据；不要输出最终结论。"
+                + f"本次研究最多 {max_research_turns} 个模型回合；工具次数由运行时限制。"
                 + "工具失败、空结果或预算耗尽时，使用已有证据结束研究，不要循环调用。"
             ),
             model=settings.model,
@@ -160,7 +161,7 @@ async def run_report(
             repair = (
                 "\n\n## 上一次交付错误\n"
                 f"{retry.repair_error}\n"
-                "请只修复结构和字段，不要改变证据或重新研究。"
+                "请针对错误修复结构或违反业务规则的内容，不改变已知证据，不重新研究。"
             )
         report = Agent(
             name=f"{settings.name}（最终交付）",

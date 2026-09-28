@@ -1,7 +1,7 @@
-"""PostgreSQL 版小说项目仓储。
+"""SQLite 版小说项目仓储。
 
 它实现 ``StoryProjectRepository`` 领域端口，因而 Pipeline、Reducer 和
-HookManager 无需了解数据库细节。章节与快照不可覆盖，提交时锁住作品行。
+HookManager 无需了解数据库细节。章节与快照不可覆盖，提交时通过短写事务检查版本并原子更新。
 """
 
 from __future__ import annotations
@@ -76,8 +76,8 @@ def _data_list(values: tuple[object, ...]) -> list[object]:
     return [to_data(value) for value in values]
 
 
-class PostgresStoryProjectRepository:
-    """以 PostgreSQL 为唯一事实源的小说仓储。"""
+class SQLAlchemyStoryProjectRepository:
+    """以 SQLite 为唯一事实源的小说仓储。"""
 
     def __init__(self, database: Database) -> None:
         self.database = database
@@ -93,7 +93,7 @@ class PostgresStoryProjectRepository:
         self._validate_initial_project(metadata, foundation, initial_state)
         with self.database.session() as session:
             try:
-                with session.begin():
+                with self.database.write_transaction(session):
                     session.add(BookRow(
                         book_id=metadata.book_id,
                         metadata_json=_data(metadata),
@@ -138,6 +138,29 @@ class PostgresStoryProjectRepository:
 
     def load_foundation(self, book_id: str) -> NovelFoundation:
         return decode_novel_foundation(self._book(book_id).foundation_json)
+
+    def update_foundation(
+        self,
+        book_id: str,
+        foundation: NovelFoundation,
+    ) -> NovelProject:
+        """在不改写章节 Canon 与当前状态的前提下更新长期创作资料。"""
+
+        with self.database.session() as session:
+            with self.database.write_transaction(session):
+                row = self._require_book(session, book_id)
+                metadata = decode_book_metadata(row.metadata_json)
+                state = decode_story_state(row.state_json)
+                if max(item.chapter_end for item in foundation.outline) > metadata.target_chapters:
+                    raise ProjectPersistenceError("大纲章节范围超出当前规划上限")
+                row.foundation_json = _data(foundation)
+                row.version += 1
+                session.flush()
+                return NovelProject(
+                    metadata=metadata,
+                    foundation=foundation,
+                    state=state,
+                )
 
     def load_state(self, book_id: str) -> StoryState:
         return decode_story_state(self._book(book_id).state_json)
@@ -208,7 +231,7 @@ class PostgresStoryProjectRepository:
         encoded = _data(proposal)
         with self.database.session() as session:
             try:
-                with session.begin():
+                with self.database.write_transaction(session):
                     self._require_book(session, proposal.book_id)
                     row = session.get(ChapterRunRow, proposal.proposal_id)
                     if row is not None:
@@ -268,6 +291,32 @@ class PostgresStoryProjectRepository:
             raise ProjectPersistenceError(f"候选章节计划不存在：{proposal_id}")
         return decode_chapter_plan_proposal(row.plan_json)
 
+    def expire_pending_plan_proposals(self, book_id: str) -> tuple[ChapterPlanProposal, ...]:
+        """使尚未写作的章节计划失效，保留完整计划历史以便审计。"""
+
+        expired: list[ChapterPlanProposal] = []
+        now = self._utc_now()
+        with self.database.session() as session:
+            with self.database.write_transaction(session):
+                self._require_book(session, book_id)
+                rows = session.scalars(
+                    select(ChapterRunRow).where(
+                        ChapterRunRow.book_id == book_id,
+                        ChapterRunRow.run_type == "create",
+                        ChapterRunRow.status.in_(("pending", "approved")),
+                    )
+                ).all()
+                for row in rows:
+                    if row.plan_json is None:
+                        continue
+                    proposal = decode_chapter_plan_proposal(row.plan_json)
+                    invalidated = replace(proposal, status="expired", updated_at=now)
+                    row.status = "expired"
+                    row.updated_at = now
+                    row.plan_json = _data(invalidated)
+                    expired.append(invalidated)
+        return tuple(expired)
+
     def save_chapter_checkpoint(
         self,
         proposal: ChapterPlanProposal,
@@ -276,8 +325,8 @@ class PostgresStoryProjectRepository:
         """原子更新章节运行的最近稳定 Worker 产物。"""
 
         with self.database.session() as session:
-            with session.begin():
-                row = session.get(ChapterRunRow, proposal.proposal_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                row = session.get(ChapterRunRow, proposal.proposal_id)
                 if row is None or row.book_id != proposal.book_id or row.run_type != "create":
                     raise ProjectPersistenceError("章节检查点对应的候选计划不存在")
                 if row.plan_json is None:
@@ -376,8 +425,8 @@ class PostgresStoryProjectRepository:
             revised=revised, created_at=self._utc_now(),
         )
         with self.database.session() as session:
-            with session.begin():
-                row = session.get(ChapterRunRow, proposal.proposal_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                row = session.get(ChapterRunRow, proposal.proposal_id)
                 if row is None:
                     raise ProjectPersistenceError("候选计划运行记录不存在")
                 row.status = metadata.status
@@ -423,8 +472,8 @@ class PostgresStoryProjectRepository:
         committed_draft = final_draft or draft
         with self.database.session() as session:
             try:
-                with session.begin():
-                    book = self._require_book(session, book_id, lock=True)
+                with self.database.write_transaction(session):
+                    book = self._require_book(session, book_id)
                     metadata = decode_book_metadata(book.metadata_json)
                     foundation = decode_novel_foundation(book.foundation_json)
                     current_state = decode_story_state(book.state_json)
@@ -486,8 +535,8 @@ class PostgresStoryProjectRepository:
 
     def begin_chapter_rewrite(self, book_id: str, chapter_number: int) -> ChapterRewriteRecord:
         with self.database.session() as session:
-            with session.begin():
-                book = self._require_book(session, book_id, lock=True)
+            with self.database.write_transaction(session):
+                book = self._require_book(session, book_id)
                 state = decode_story_state(book.state_json)
                 if chapter_number <= 0 or chapter_number > state.last_committed_chapter:
                     raise ValueError(f"重写章节必须在 1 到 {state.last_committed_chapter} 之间")
@@ -527,7 +576,7 @@ class PostgresStoryProjectRepository:
 
     def finalize_chapter_rewrite(self, record: ChapterRewriteRecord) -> None:
         with self.database.session() as session:
-            with session.begin():
+            with self.database.write_transaction(session):
                 row = session.get(ChapterRunRow, record.rewrite_id)
                 if row is None or row.book_id != record.book_id:
                     raise ProjectPersistenceError("章节重写记录不存在")
@@ -535,13 +584,13 @@ class PostgresStoryProjectRepository:
 
     def rollback_chapter_rewrite(self, record: ChapterRewriteRecord) -> None:
         with self.database.session() as session:
-            with session.begin():
+            with self.database.write_transaction(session):
                 row = session.get(ChapterRunRow, record.rewrite_id)
                 if row is None or row.book_id != record.book_id:
                     raise ProjectPersistenceError("章节重写记录不存在")
                 if row.status != "pending":
                     return
-                book = self._require_book(session, record.book_id, lock=True)
+                book = self._require_book(session, record.book_id)
                 archive = row.artifacts_json["archive"]
                 book.metadata_json = archive["metadata"]
                 book.state_json = archive["state"]
@@ -567,10 +616,8 @@ class PostgresStoryProjectRepository:
         return row
 
     @staticmethod
-    def _require_book(session: Any, book_id: str, *, lock: bool = False) -> BookRow:
+    def _require_book(session: Any, book_id: str) -> BookRow:
         statement = select(BookRow).where(BookRow.book_id == book_id)
-        if lock:
-            statement = statement.with_for_update()
         row = session.scalar(statement)
         if row is None:
             raise ProjectNotFoundError(f"项目不存在：{book_id}")

@@ -6,6 +6,8 @@ import unittest
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from agents import ModelSettings
 from agents.testing import ScriptedModel, assistant_message
@@ -34,6 +36,27 @@ class _EventSink:
 
 
 class SdkWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_output_schema_is_visible_to_model(self) -> None:
+        """校验不只发生在返回后：模型必须能看到实际输出契约。"""
+
+        with patch(
+            "storyweaver.llm.sdk.Runner.run",
+            new_callable=AsyncMock,
+            return_value=SimpleNamespace(final_output='{"value":"ok"}'),
+        ) as run:
+            result = await run_structured_worker(
+                settings=WorkerSettings(
+                    worker_id="test-worker", name="测试 Worker",
+                    instructions="完成测试任务。", model=ScriptedModel([]),
+                    model_settings=ModelSettings(), timeout_seconds=5,
+                ),
+                prompt="开始", output_type=_Output,
+            )
+        instructions = run.call_args.args[0].instructions
+        self.assertIn("完成测试任务。", instructions)
+        self.assertIn(json.dumps(_Output.model_json_schema(), ensure_ascii=False), instructions)
+        self.assertEqual(result.value, "ok")
+
     async def test_returns_pydantic_output_and_projects_events(self) -> None:
         model = ScriptedModel([[assistant_message('{"value":"ok"}')]])
         sink = _EventSink()

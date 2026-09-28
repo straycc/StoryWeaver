@@ -29,7 +29,13 @@ from ..novel_creation.models import (
     CreateNovelRequest,
 )
 from ..novel_creation.pipeline import CreateNovelPipeline
+from ..novel_creation.serialization import to_data
 from ..observability import logging_context
+from ..persistence.action_proposals import (
+    MAX_FOUNDATION_GENERATION_ATTEMPTS,
+    ActionProposal,
+    ActionProposalRepository,
+)
 from ..skills import applied_skill_markers
 from ..skills import creative_task_from_data
 from .models import ChatMessage, ChatSession
@@ -67,11 +73,9 @@ _DIRECT_CHAT_COMMANDS = {
     "列出我的作品": "list_projects",
 }
 
-CHAT_SYSTEM_PROMPT = """你是 StoryWeaver 小说创作工作台中的编辑助手。
-你可以与用户讨论创意、人物、情节、写作方法和当前作品，但不能声称已经修改项目文件。
-真正的建书、写章和状态读取只能由界面的预设动作执行。
-回答使用清晰自然的中文；需要用户决定时，给出少量明确选项。
-"""
+CHAT_SYSTEM_PROMPT = """你是 StoryWeaver 的编辑助手，用简洁中文讨论创意、人物和写作方法，给出具体建议。
+区分已确认设定与新建议，资料不足时说明，不编造作品事实或声称已经执行修改。
+建书、写章和状态读取由预设动作执行；需要用户决定时给出少量明确选项。"""
 
 # 示例作品仅供 Workspace 预设动作使用，不依赖已删除的命令行模块。
 _EXAMPLE_NOVEL_REQUEST = CreateNovelRequest(
@@ -107,6 +111,7 @@ class ChatWorkspaceApplication:
         memory_store: LongTermMemoryStore | None = None,
         memory_extractor: LongTermMemoryExtractor | None = None,
         memory_consolidator: LongTermMemoryConsolidator | None = None,
+        action_proposals: ActionProposalRepository | None = None,
     ) -> None:
         self.sessions = sessions
         self.novels = novels
@@ -116,6 +121,7 @@ class ChatWorkspaceApplication:
         self.memory_store = memory_store
         self.memory_extractor = memory_extractor
         self.memory_consolidator = memory_consolidator
+        self.action_proposals = action_proposals
 
     def bootstrap(self) -> dict[str, Any]:
         return {
@@ -130,10 +136,20 @@ class ChatWorkspaceApplication:
             self.novels.store.load_metadata(book_id)
         return self.sessions.create_session(book_id=book_id)
 
-    def bind_book(self, session_id: str, book_id: str | None) -> ChatSession:
+    def bind_book(
+        self,
+        session_id: str,
+        book_id: str | None,
+        *,
+        allow_nonempty: bool = False,
+    ) -> ChatSession:
         if book_id is not None:
             self.novels.store.load_metadata(book_id)
-        return self.sessions.bind_book(session_id, book_id)
+        return self.sessions.bind_book(
+            session_id,
+            book_id,
+            allow_nonempty=allow_nonempty,
+        )
 
     async def send_message(
         self,
@@ -199,8 +215,9 @@ class ChatWorkspaceApplication:
     ) -> ChatActionResult:
         """执行首次请求或同一逻辑动作的新尝试。"""
 
+        session = self.sessions.load_session(session_id)
         if book_id is not None:
-            self.bind_book(session_id, book_id)
+            session = self.bind_book(session_id, book_id)
         # 未绑定作品的会话可以先讨论新书设定，再通过确认提案创建作品；已有
         # 作品的会话仍禁止悄悄切换到另一部新书。
         may_bind_created_book = (
@@ -220,7 +237,6 @@ class ChatWorkspaceApplication:
             )
             user_message = session.messages[-1]
         else:
-            session = self.sessions.load_session(session_id)
             user_message = None
         action_run_id = (
             requested_run_id or str(uuid4())
@@ -499,6 +515,67 @@ class ChatWorkspaceApplication:
             return "\n".join(lines), {}, None
         if action in {"create_novel", "create_example"}:
             request = self._create_request(payload, example=action == "create_example")
+            if self.action_proposals is not None:
+                try:
+                    generation_attempt = int(payload.get("generation_attempt") or 1)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("基础资料生成次数格式无效") from exc
+                if not 1 <= generation_attempt <= MAX_FOUNDATION_GENERATION_ATTEMPTS:
+                    raise ValueError(
+                        f"故事基础资料最多生成 {MAX_FOUNDATION_GENERATION_ATTEMPTS} 次"
+                    )
+                task_value = payload.get("creative_task_context")
+                candidate = await self.novels.generate_project_candidate(
+                    request,
+                    (
+                        creative_task_from_data(task_value)
+                        if task_value is not None
+                        else None
+                    ),
+                )
+                proposal = self.action_proposals.create(
+                    session_id=session.session_id,
+                    book_id=None,
+                    action_type="confirm_foundation",
+                    payload={
+                        "version": 1,
+                        "generation_attempt": generation_attempt,
+                        "request": to_data(request),
+                        "candidate": to_data(candidate),
+                        **(
+                            {"creative_task_context": task_value}
+                            if task_value is not None
+                            else {}
+                        ),
+                    },
+                    summary=f"《{candidate.metadata.title}》的故事基础资料已生成，等待确认。",
+                )
+                superseded_id = str(payload.get("supersedes_proposal_id") or "").strip()
+                if superseded_id:
+                    previous = self.action_proposals.supersede(superseded_id)
+                    self.sessions.append_event(
+                        session.session_id,
+                        event_type="action_proposal_cancelled",
+                        payload=self._action_proposal_data(previous),
+                    )
+                self.sessions.append_event(
+                    session.session_id,
+                    event_type="action_proposal_pending",
+                    payload=self._action_proposal_data(proposal),
+                )
+                foundation = candidate.foundation
+                reply = (
+                    "故事基础资料已生成，等待确认。\n\n"
+                    f"书名：{candidate.metadata.title}\n"
+                    f"题材：{candidate.metadata.genre}\n"
+                    f"已生成：{len(foundation.characters)} 名人物、"
+                    f"{len(foundation.initial_hooks)} 条待埋伏笔、"
+                    f"{len(foundation.outline)} 个总纲节点"
+                )
+                return reply, {
+                    "foundation_proposal_id": proposal.proposal_id,
+                    "proposal_version": 1,
+                }, None
             book_id = CreateNovelPipeline.build_book_id(request)
             try:
                 task_value = payload.get("creative_task_context")
@@ -1531,9 +1608,6 @@ class ChatWorkspaceApplication:
             "title",
             "genre",
             "premise",
-            "protagonist",
-            "central_conflict",
-            "tone",
             "target_chapters",
             "chapter_target_words",
         )
@@ -1544,13 +1618,34 @@ class ChatWorkspaceApplication:
             title=str(payload["title"]),
             genre=str(payload["genre"]),
             premise=str(payload["premise"]),
-            protagonist=str(payload["protagonist"]),
-            central_conflict=str(payload["central_conflict"]),
-            tone=str(payload["tone"]),
+            protagonist=str(payload.get("protagonist") or ""),
+            central_conflict=str(payload.get("central_conflict") or ""),
+            tone=str(payload.get("tone") or ""),
             target_chapters=int(payload["target_chapters"]),
             chapter_target_words=int(payload["chapter_target_words"]),
             language=str(payload.get("language", "zh")),
         )
+
+    @staticmethod
+    def _action_proposal_data(proposal: ActionProposal) -> dict[str, Any]:
+        """将待确认基础资料投影到会话时间线，隐藏内部 Skill 快照。"""
+
+        payload = dict(proposal.payload)
+        payload.pop("creative_task_context", None)
+        return {
+            "action_proposal_id": proposal.proposal_id,
+            "session_id": proposal.session_id,
+            "book_id": proposal.book_id,
+            "action_type": proposal.action_type,
+            "payload": payload,
+            "summary": proposal.summary,
+            "status": proposal.status,
+            "job_id": proposal.job_id,
+            "created_at": proposal.created_at,
+            "confirmed_at": proposal.confirmed_at,
+            "expires_at": proposal.expires_at,
+            "updated_at": proposal.updated_at,
+        }
 
     @staticmethod
     def session_data(session: ChatSession) -> dict[str, Any]:
@@ -1631,20 +1726,23 @@ def build_chat_workspace(
     sessions: ChatSessionRepository,
     memory_store: LongTermMemoryStore,
     novels: NovelService,
+    action_proposals: ActionProposalRepository | None = None,
+    model_override: object | None = None,
 ) -> ChatWorkspaceApplication:
-    """构造正式 PostgreSQL 对话编排层。"""
-    provider = OpenAICompatibleProviderSettings(
+    """构造正式 SQLite 对话编排层。"""
+    provider = None if model_override is not None else OpenAICompatibleProviderSettings(
         base_url=settings.base_url,
         model_name=settings.model,
         api_key=settings.api_key,
     ).create_provider()
+    model = model_override if model_override is not None else provider.get_model(settings.model)
 
     async def generate_memory_text(prompt: str) -> str:
         return await run_text_worker(
             settings=WorkerSettings(
                 worker_id="long-term-memory", name="长期记忆",
                 instructions="只完成用户给定的记忆任务。",
-                model=provider.get_model(settings.model),
+                model=model,
                 model_settings=ModelSettings(temperature=0.1),
                 timeout_seconds=settings.timeout_seconds,
             ),
@@ -1656,7 +1754,7 @@ def build_chat_workspace(
             settings=WorkerSettings(
                 worker_id="session-context", name="会话摘要",
                 instructions="只完成用户给定的会话摘要任务。",
-                model=provider.get_model(settings.model),
+                model=model,
                 model_settings=ModelSettings(temperature=0.1),
                 timeout_seconds=settings.timeout_seconds,
             ),
@@ -1667,7 +1765,7 @@ def build_chat_workspace(
         return await run_text_worker(
             settings=WorkerSettings(
                 worker_id="web-chat", name="编辑助手", instructions=CHAT_SYSTEM_PROMPT,
-                model=provider.get_model(settings.model), model_settings=ModelSettings(temperature=settings.temperature),
+                model=model, model_settings=ModelSettings(temperature=settings.temperature),
                 timeout_seconds=settings.timeout_seconds,
             ), prompt=prompt,
         )
@@ -1688,6 +1786,7 @@ def build_chat_workspace(
         model_name=settings.model,
         context_manager=context_manager,
         memory_store=memory_store,
+        action_proposals=action_proposals,
         memory_extractor=LongTermMemoryExtractor(
             generate_text=generate_memory_text,
             store=memory_store,

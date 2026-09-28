@@ -40,7 +40,7 @@ class NovelFoundationValidator:
         character_names = {
             self._normalize(character.name) for character in foundation.characters
         }
-        if normalized_protagonist not in character_names:
+        if normalized_protagonist and normalized_protagonist not in character_names:
             raise NovelFoundationValidationError(
                 f"小说基础资料缺少指定主角：{request.protagonist}"
             )

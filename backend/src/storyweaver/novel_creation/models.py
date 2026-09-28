@@ -68,9 +68,6 @@ class CreateNovelRequest:
             "title",
             "genre",
             "premise",
-            "protagonist",
-            "central_conflict",
-            "tone",
             "language",
         ):
             _require_text(getattr(self, field_name), field_name)

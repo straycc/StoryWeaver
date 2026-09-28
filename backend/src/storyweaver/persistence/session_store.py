@@ -1,4 +1,4 @@
-"""PostgreSQL 会话事件仓储。"""
+"""SQLite 会话事件仓储。"""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ from sqlalchemy import delete, func, select
 
 from ..application.models import ChatMessage, ChatSession, ChatSessionSummary, TimelinePage, TranscriptEvent
 from .database import Database
-from .tables import ChatSessionEventRow, ChatSessionRow
+from .tables import ActionProposalRow, ChatSessionEventRow, ChatSessionRow, JobRow
 from .timeline import TimelineProjector
 
 
-class PostgresChatSessionRepository:
-    """PostgreSQL 会话事件仓储。"""
+class SQLAlchemyChatSessionRepository:
+    """SQLite 会话事件仓储。"""
 
     def __init__(self, database: Database) -> None:
         self.database = database
@@ -24,23 +24,32 @@ class PostgresChatSessionRepository:
     def create_session(self, *, title: str = "新对话", book_id: str | None = None) -> ChatSession:
         now = self._timestamp()
         session_id = str(uuid4())
+        reused_session_id: str | None = None
         with self.database.session() as session:
-            with session.begin():
-                session.add(ChatSessionRow(
-                    session_id=session_id,
-                    created_at=now,
-                    title=title.strip() or "新对话",
-                    book_id=book_id.strip() if book_id and book_id.strip() else None,
-                    updated_at=now,
-                    last_sequence=0,
-                    message_count=0,
-                ))
-                session.flush()
-                self._append(session, session_id, "session_created", {
-                    "title": title.strip() or "新对话", "book_id": book_id.strip() if book_id and book_id.strip() else None,
-                    "created_at": now, "updated_at": now,
-                }, created_at=now)
-        return self.load_session(session_id)
+            with self.database.write_transaction(session):
+                normalized_title = title.strip() or "新对话"
+                normalized_book_id = book_id.strip() if book_id and book_id.strip() else None
+                if normalized_title == "新对话" and normalized_book_id is None:
+                    for row in self._empty_candidates(session):
+                        if self._is_reusable_empty(session, row):
+                            reused_session_id = row.session_id
+                            break
+                if reused_session_id is None:
+                    session.add(ChatSessionRow(
+                        session_id=session_id,
+                        created_at=now,
+                        title=normalized_title,
+                        book_id=normalized_book_id,
+                        updated_at=now,
+                        last_sequence=0,
+                        message_count=0,
+                    ))
+                    session.flush()
+                    self._append(session, session_id, "session_created", {
+                        "title": normalized_title, "book_id": normalized_book_id,
+                        "created_at": now, "updated_at": now,
+                    }, created_at=now)
+        return self.load_session(reused_session_id or session_id)
 
     def load_session(self, session_id: str) -> ChatSession:
         events = self.list_events(session_id)
@@ -53,21 +62,71 @@ class PostgresChatSessionRepository:
             rows = session.scalars(
                 select(ChatSessionRow).order_by(ChatSessionRow.updated_at.desc())
             ).all()
-        return tuple(
-            ChatSessionSummary(
-                session_id=row.session_id,
-                title=row.title,
-                updated_at=row.updated_at,
-                book_id=row.book_id,
-                message_count=row.message_count,
-            )
-            for row in rows
-        )
+            summaries: list[ChatSessionSummary] = []
+            found_empty = False
+            for row in rows:
+                if self._is_reusable_empty(session, row):
+                    if found_empty:
+                        continue
+                    found_empty = True
+                summaries.append(ChatSessionSummary(
+                    session_id=row.session_id,
+                    title=row.title,
+                    updated_at=row.updated_at,
+                    book_id=row.book_id,
+                    message_count=row.message_count,
+                ))
+        return tuple(summaries)
+
+    def prune_duplicate_empty_sessions(self) -> int:
+        """启动时清理多余的原始空对话，保留最新的一条。"""
+        removed = 0
+        with self.database.session() as session:
+            with self.database.write_transaction(session):
+                found_empty = False
+                for row in self._empty_candidates(session):
+                    if not self._is_reusable_empty(session, row):
+                        continue
+                    if not found_empty:
+                        found_empty = True
+                        continue
+                    session.execute(delete(ChatSessionEventRow).where(
+                        ChatSessionEventRow.session_id == row.session_id
+                    ))
+                    session.delete(row)
+                    removed += 1
+        return removed
+
+    @staticmethod
+    def _empty_candidates(session: Any) -> list[ChatSessionRow]:
+        return session.scalars(select(ChatSessionRow).where(
+            ChatSessionRow.book_id.is_(None),
+            ChatSessionRow.title == "新对话",
+            ChatSessionRow.message_count == 0,
+        ).order_by(ChatSessionRow.updated_at.desc())).all()
+
+    @staticmethod
+    def _is_reusable_empty(session: Any, row: ChatSessionRow) -> bool:
+        if row.book_id is not None or row.title != "新对话" or row.message_count != 0:
+            return False
+        events = session.scalars(select(ChatSessionEventRow).where(
+            ChatSessionEventRow.session_id == row.session_id
+        )).all()
+        if any(event.event_json.get("event_type") not in {"session_created", "session_model_selected", "session_reasoning_selected"} for event in events):
+            return False
+        # 已关联任务或提案的会话即使没有消息，也不视作可复用草稿。
+        if session.scalar(select(JobRow.job_id).where(
+            JobRow.payload_json["session_id"].as_string() == row.session_id
+        ).limit(1)) is not None:
+            return False
+        return session.scalar(select(ActionProposalRow.proposal_id).where(
+            ActionProposalRow.session_id == row.session_id
+        ).limit(1)) is None
 
     def append_message(self, session_id: str, *, role: str, content: str, action: str = "chat", metadata: Mapping[str, Any] | None = None) -> ChatSession:
         now = self._timestamp()
         with self.database.session() as session:
-            with session.begin():
+            with self.database.write_transaction(session):
                 self._append(session, session_id, "message_added", {
                     "message_id": str(uuid4()), "role": role, "content": content,
                     "action": action, "metadata": dict(metadata or {}),
@@ -93,8 +152,20 @@ class PostgresChatSessionRepository:
 
     def append_event(self, session_id: str, *, event_type: str, payload: Mapping[str, Any] | None = None) -> TranscriptEvent:
         with self.database.session() as session:
-            with session.begin():
+            with self.database.write_transaction(session):
                 return self._append(session, session_id, event_type, dict(payload or {}))
+
+    def selected_model(self, session_id: str) -> tuple[str, str] | None:
+        for event in reversed(self.list_events(session_id)):
+            if event.event_type == "session_model_selected":
+                return str(event.payload["provider_id"]), str(event.payload["model_id"])
+        return None
+
+    def selected_reasoning(self, session_id: str) -> str:
+        for event in reversed(self.list_events(session_id)):
+            if event.event_type == "session_reasoning_selected":
+                return str(event.payload["level"])
+        return "default"
 
     def list_events(self, session_id: str) -> tuple[TranscriptEvent, ...]:
         with self.database.session() as session:
@@ -121,7 +192,7 @@ class PostgresChatSessionRepository:
 
     def delete_session(self, session_id: str) -> None:
         with self.database.session() as session:
-            with session.begin():
+            with self.database.write_transaction(session):
                 row = session.get(ChatSessionRow, session_id)
                 if row is None:
                     raise KeyError(f"会话不存在：{session_id}")
@@ -130,7 +201,7 @@ class PostgresChatSessionRepository:
     def _append(self, session: Any, session_id: str, event_type: str, payload: Mapping[str, Any], *, created_at: str | None = None) -> TranscriptEvent:
         # 同一会话可能同时收到浏览器请求与后台摘要/记忆事件；先锁住会话行，
         # 再读取最大 sequence，避免两个事务分配到同一个事件序号。
-        row = session.get(ChatSessionRow, session_id, with_for_update=True)
+        row = session.get(ChatSessionRow, session_id)
         if row is None:
             raise KeyError(f"会话不存在：{session_id}")
         sequence = int(session.scalar(select(func.coalesce(func.max(ChatSessionEventRow.sequence), 0)).where(ChatSessionEventRow.session_id == session_id)) or 0) + 1

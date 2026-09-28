@@ -1,4 +1,4 @@
-"""PostgreSQL 仓储的无外部服务烟测。"""
+"""SQLite 仓储的无外部服务烟测。"""
 
 from __future__ import annotations
 
@@ -20,10 +20,10 @@ from storyweaver.persistence import (
     DatabaseSettings,
     DeletionConflictError,
     JobRepository,
-    PostgresDeletionRepository,
-    PostgresLongTermMemoryStore,
-    PostgresChatSessionRepository,
-    PostgresStoryProjectRepository,
+    SQLAlchemyDeletionRepository,
+    SQLAlchemyLongTermMemoryStore,
+    SQLAlchemyChatSessionRepository,
+    SQLAlchemyStoryProjectRepository,
 )
 from storyweaver.memory.long_term import (
     LongTermMemoryRecord,
@@ -53,7 +53,7 @@ class PersistenceJobsTests(unittest.TestCase):
         self.addCleanup(self.database.dispose)
 
     def test_project_commit_and_rewrite_rollback(self) -> None:
-        store = PostgresStoryProjectRepository(self.database)
+        store = SQLAlchemyStoryProjectRepository(self.database)
         initial = create_initial_state()
         store.create_project(metadata=create_metadata(), foundation=create_foundation(), initial_state=initial)
         delta = create_chapter_delta()
@@ -84,7 +84,7 @@ class PersistenceJobsTests(unittest.TestCase):
         self.assertEqual(writing.lock_scope, "book_write")
 
     def test_conversation_memory_can_be_replaced_or_permanently_deleted(self) -> None:
-        store = PostgresLongTermMemoryStore(self.database)
+        store = SQLAlchemyLongTermMemoryStore(self.database)
         original = self._memory_record("memory-original", "保持江湖悬疑感")
         corrected = self._memory_record(
             "memory-corrected", "近期不要揭穿师父", supersedes_id=original.memory_id
@@ -110,7 +110,7 @@ class PersistenceJobsTests(unittest.TestCase):
             content=content,
             importance=3,
             source_refs=("session:test",),
-            fingerprint=PostgresLongTermMemoryStore.fingerprint(content),
+            fingerprint=SQLAlchemyLongTermMemoryStore.fingerprint(content),
             status=LongTermMemoryStatus.ACTIVE,
             created_at="2026-08-25T00:00:00+00:00",
             updated_at="2026-08-25T00:00:00+00:00",
@@ -118,7 +118,7 @@ class PersistenceJobsTests(unittest.TestCase):
         )
 
     def test_candidate_and_plan_query_projections_are_maintained(self) -> None:
-        store = PostgresStoryProjectRepository(self.database)
+        store = SQLAlchemyStoryProjectRepository(self.database)
         store.create_project(
             metadata=create_metadata(),
             foundation=create_foundation(),
@@ -200,7 +200,7 @@ class PersistenceJobsTests(unittest.TestCase):
     def test_chapter_checkpoint_round_trip_and_plan_revision_clears_it(self) -> None:
         """稳定 Worker 产物应可恢复；计划变更后必须失效。"""
 
-        store = PostgresStoryProjectRepository(self.database)
+        store = SQLAlchemyStoryProjectRepository(self.database)
         store.create_project(
             metadata=create_metadata(),
             foundation=create_foundation(),
@@ -260,7 +260,7 @@ class PersistenceJobsTests(unittest.TestCase):
         self.assertIsNone(store.load_chapter_checkpoint(BOOK_ID, proposal.proposal_id))
 
     def test_session_list_projection_tracks_messages_and_binding(self) -> None:
-        sessions = PostgresChatSessionRepository(self.database)
+        sessions = SQLAlchemyChatSessionRepository(self.database)
         created = sessions.create_session(title="新对话")
         sessions.append_message(created.session_id, role="user", content="帮我继续写这一章")
         sessions.bind_book(created.session_id, BOOK_ID, allow_nonempty=True)
@@ -272,9 +272,9 @@ class PersistenceJobsTests(unittest.TestCase):
         self.assertEqual(summary.message_count, 1)
 
     def test_session_deletion_rejects_active_job_then_removes_transcript(self) -> None:
-        sessions = PostgresChatSessionRepository(self.database)
+        sessions = SQLAlchemyChatSessionRepository(self.database)
         jobs = JobRepository(self.database)
-        deletions = PostgresDeletionRepository(self.database)
+        deletions = SQLAlchemyDeletionRepository(self.database)
         created = sessions.create_session()
         active = jobs.create(
             job_type="session_action",
@@ -293,10 +293,10 @@ class PersistenceJobsTests(unittest.TestCase):
         self.assertEqual(jobs.get(active.job_id).status, "succeeded")
 
     def test_book_deletion_unbinds_sessions_and_removes_book_memory(self) -> None:
-        projects = PostgresStoryProjectRepository(self.database)
-        sessions = PostgresChatSessionRepository(self.database)
-        memories = PostgresLongTermMemoryStore(self.database)
-        deletions = PostgresDeletionRepository(self.database)
+        projects = SQLAlchemyStoryProjectRepository(self.database)
+        sessions = SQLAlchemyChatSessionRepository(self.database)
+        memories = SQLAlchemyLongTermMemoryStore(self.database)
+        deletions = SQLAlchemyDeletionRepository(self.database)
         projects.create_project(
             metadata=create_metadata(),
             foundation=create_foundation(),
@@ -318,9 +318,9 @@ class PersistenceJobsTests(unittest.TestCase):
             memories.get(book_memory.memory_id)
 
     def test_book_deletion_rejects_active_job(self) -> None:
-        projects = PostgresStoryProjectRepository(self.database)
+        projects = SQLAlchemyStoryProjectRepository(self.database)
         jobs = JobRepository(self.database)
-        deletions = PostgresDeletionRepository(self.database)
+        deletions = SQLAlchemyDeletionRepository(self.database)
         projects.create_project(
             metadata=create_metadata(),
             foundation=create_foundation(),

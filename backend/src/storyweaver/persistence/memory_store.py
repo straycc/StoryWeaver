@@ -1,4 +1,4 @@
-"""PostgreSQL 长期记忆仓储。"""
+"""SQLite 长期记忆仓储。"""
 
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ from .database import Database
 from .tables import LongTermMemoryRow
 
 
-class PostgresLongTermMemoryStore:
-    """沿用 LongTermMemoryStore 协议，数据仅落 PostgreSQL。"""
+class SQLAlchemyLongTermMemoryStore:
+    """沿用 LongTermMemoryStore 协议，数据仅落 SQLite。"""
 
     def __init__(self, database: Database) -> None:
         self.database = database
@@ -40,7 +40,7 @@ class PostgresLongTermMemoryStore:
     def save(self, record: LongTermMemoryRecord) -> bool:
         with self.database.session() as session:
             try:
-                with session.begin():
+                with self.database.write_transaction(session):
                     existing = session.scalar(select(LongTermMemoryRow).where(
                         LongTermMemoryRow.scope_type == record.scope_type.value,
                         LongTermMemoryRow.scope_id == record.scope_id,
@@ -87,7 +87,7 @@ class PostgresLongTermMemoryStore:
         if unknown:
             raise ValueError("不允许修改字段：" + ", ".join(sorted(unknown)))
         with self.database.session() as session:
-            with session.begin():
+            with self.database.write_transaction(session):
                 row = self._require(session, memory_id)
                 current = self._decode(row.record_json)
                 normalized = dict(changes)
@@ -114,7 +114,7 @@ class PostgresLongTermMemoryStore:
         """
 
         with self.database.session() as session:
-            with session.begin():
+            with self.database.write_transaction(session):
                 row = self._require(session, memory_id)
                 session.delete(row)
 

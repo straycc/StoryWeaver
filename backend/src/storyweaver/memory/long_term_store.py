@@ -11,7 +11,7 @@ from .long_term import LongTermMemoryRecord, LongTermMemoryStatus, LongTermMemor
 
 
 class LongTermMemoryStore(Protocol):
-    """正式运行时由 PostgreSQL 实现的长期记忆接口。"""
+    """正式运行时由 SQLite 实现的长期记忆接口。"""
 
     def save(self, record: LongTermMemoryRecord) -> bool: ...
     def get(self, memory_id: str) -> LongTermMemoryRecord: ...

@@ -14,8 +14,11 @@ from .tables import ActionProposalRow
 
 
 ACTION_PROPOSAL_STATUSES = frozenset({
-    "pending", "confirmed", "cancelled", "completed", "failed", "expired",
+    "pending", "confirmed", "cancelled", "completed", "failed", "expired", "superseded",
 })
+
+# 首次 Architect 候选也计入次数；编辑候选不消耗这个配额。
+MAX_FOUNDATION_GENERATION_ATTEMPTS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +53,7 @@ class ActionProposalRepository:
             expires_at=expires_at, updated_at=now,
         )
         with self.database.session() as session:
-            with session.begin():
+            with self.database.write_transaction(session):
                 session.add(row)
         return self.get(row.proposal_id)
 
@@ -84,8 +87,98 @@ class ActionProposalRepository:
     def confirm(self, proposal_id: str, *, job_id: str) -> ActionProposal:
         return self._transition(proposal_id, "confirmed", job_id=job_id)
 
+    def claim_foundation_confirmation(
+        self,
+        proposal_id: str,
+        *,
+        expected_version: int,
+    ) -> ActionProposal:
+        """原子锁定用户看到的待确认基础资料版本。"""
+
+        with self.database.session() as session:
+            with self.database.write_transaction(session):
+                row = session.get(ActionProposalRow, proposal_id)
+                if row is None:
+                    raise KeyError(f"ActionProposal 不存在：{proposal_id}")
+                if row.status != "pending":
+                    raise ValueError(f"ActionProposal 当前为 {row.status}，不能确认")
+                if int(dict(row.payload_json).get("version") or 1) != expected_version:
+                    raise ValueError("基础资料已更新，请刷新后确认当前版本")
+                row.status = "confirmed"
+                row.confirmed_at = self._now()
+                row.updated_at = row.confirmed_at
+                session.flush()
+                return self._decode(row)
+
+    def attach_confirmation_job(self, proposal_id: str, *, job_id: str) -> ActionProposal:
+        """为已锁定候选关联发布 Job；允许 Job 已极快进入终态。"""
+
+        with self.database.session() as session:
+            with self.database.write_transaction(session):
+                row = session.get(ActionProposalRow, proposal_id)
+                if row is None:
+                    raise KeyError(f"ActionProposal 不存在：{proposal_id}")
+                if row.status not in {"confirmed", "completed", "failed"}:
+                    raise ValueError(f"ActionProposal 当前为 {row.status}，不能关联确认任务")
+                if row.job_id is not None:
+                    raise ValueError("基础资料确认任务已创建")
+                row.job_id = job_id
+                row.updated_at = self._now()
+                session.flush()
+                return self._decode(row)
+
+    def release_foundation_claim(self, proposal_id: str) -> ActionProposal:
+        """仅在 Job 创建失败时释放确认锁，恢复原候选可编辑状态。"""
+
+        with self.database.session() as session:
+            with self.database.write_transaction(session):
+                row = session.get(ActionProposalRow, proposal_id)
+                if row is None:
+                    raise KeyError(f"ActionProposal 不存在：{proposal_id}")
+                if row.status != "confirmed" or row.job_id is not None:
+                    raise ValueError("基础资料确认锁无法释放")
+                row.status = "pending"
+                row.confirmed_at = None
+                row.updated_at = self._now()
+                session.flush()
+                return self._decode(row)
+
     def cancel(self, proposal_id: str) -> ActionProposal:
         return self._transition(proposal_id, "cancelled")
+
+    def supersede(self, proposal_id: str) -> ActionProposal:
+        """保留旧候选内容，同时使其不再出现在待确认列表中。"""
+
+        return self._transition(proposal_id, "superseded")
+
+    def replace_pending_payload(
+        self,
+        proposal_id: str,
+        *,
+        expected_version: int,
+        payload: Mapping[str, Any],
+        summary: str,
+    ) -> ActionProposal:
+        """以乐观锁更新作者编辑后的候选内容。"""
+
+        with self.database.session() as session:
+            with self.database.write_transaction(session):
+                row = session.get(ActionProposalRow, proposal_id)
+                if row is None:
+                    raise KeyError(f"ActionProposal 不存在：{proposal_id}")
+                if row.status != "pending":
+                    raise ValueError(f"ActionProposal 当前为 {row.status}，不能编辑")
+                current_payload = dict(row.payload_json)
+                current_version = int(current_payload.get("version") or 1)
+                if current_version != expected_version:
+                    raise ValueError("基础资料已更新，请刷新后再保存")
+                updated_payload = dict(payload)
+                updated_payload["version"] = current_version + 1
+                row.payload_json = updated_payload
+                row.summary = summary
+                row.updated_at = self._now()
+                session.flush()
+                return self._decode(row)
 
     def expire(self, proposal_id: str) -> ActionProposal:
         return self._transition(proposal_id, "expired")
@@ -98,8 +191,8 @@ class ActionProposalRepository:
         if status not in ACTION_PROPOSAL_STATUSES:
             raise ValueError(f"不支持的 ActionProposal 状态：{status}")
         with self.database.session() as session:
-            with session.begin():
-                row = session.get(ActionProposalRow, proposal_id, with_for_update=True)
+            with self.database.write_transaction(session):
+                row = session.get(ActionProposalRow, proposal_id)
                 if row is None:
                     raise KeyError(f"ActionProposal 不存在：{proposal_id}")
                 accepted = allow_from or {"pending"}

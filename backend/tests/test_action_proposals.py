@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from storyweaver.persistence import ActionProposalRepository, Database, DatabaseSettings, PostgresChatSessionRepository
+from storyweaver.persistence import ActionProposalRepository, Database, DatabaseSettings, JobRepository, SQLAlchemyChatSessionRepository
 
 
 class ActionProposalRepositoryTests(unittest.TestCase):
@@ -14,7 +14,7 @@ class ActionProposalRepositoryTests(unittest.TestCase):
         self._directory = tempfile.TemporaryDirectory()
         self.database = Database(DatabaseSettings(f"sqlite+pysqlite:///{Path(self._directory.name) / 'test.db'}"))
         self.database.create_schema()
-        self.sessions = PostgresChatSessionRepository(self.database)
+        self.sessions = SQLAlchemyChatSessionRepository(self.database)
         self.session = self.sessions.create_session(book_id="book-1")
         self.repository = ActionProposalRepository(self.database)
 
@@ -28,8 +28,9 @@ class ActionProposalRepositoryTests(unittest.TestCase):
             payload={"chapter_number": 2}, summary="重写第 2 章",
         )
         self.assertEqual(proposal.status, "pending")
-        confirmed = self.repository.confirm(proposal.proposal_id, job_id="job-1")
-        self.assertEqual((confirmed.status, confirmed.job_id), ("confirmed", "job-1"))
+        job = JobRepository(self.database).create(job_type="rewrite_chapter", book_id="book-1", payload={})
+        confirmed = self.repository.confirm(proposal.proposal_id, job_id=job.job_id)
+        self.assertEqual((confirmed.status, confirmed.job_id), ("confirmed", job.job_id))
         completed = self.repository.project_job_terminal(proposal.proposal_id, succeeded=True)
         self.assertEqual(completed.status, "completed")
 

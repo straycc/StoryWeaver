@@ -1,15 +1,14 @@
-"""StoryWeaver 的收敛 PostgreSQL 表定义。"""
+"""StoryWeaver 的收敛 SQLite 表定义。"""
 
 from __future__ import annotations
 
 from sqlalchemy import BigInteger, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
 from .database import Base
 
-JSON_VALUE = JSON().with_variant(JSONB, "postgresql")
+JSON_VALUE = JSON()
 
 
 class BookRow(Base):
@@ -67,7 +66,6 @@ class ChapterRunRow(Base):
 class JobRow(Base):
     __tablename__ = "jobs"
     __table_args__ = (Index("uq_active_job_per_book", "book_id", unique=True,
-        postgresql_where=text("book_id IS NOT NULL AND lock_scope = 'book_write' AND status IN ('queued', 'running')"),
         sqlite_where=text("book_id IS NOT NULL AND lock_scope = 'book_write' AND status IN ('queued', 'running')")),)
     job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     job_type: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -159,7 +157,7 @@ class SimulationSessionRow(Base):
 
 class SimulationTurnRow(Base):
     __tablename__ = "simulation_turns"
-    __table_args__ = (UniqueConstraint("simulation_id", "turn_number", name="uq_simulation_turn_number"), UniqueConstraint("simulation_id", "client_request_id", name="uq_simulation_client_request"), Index("uq_simulation_active_turn", "simulation_id", unique=True, postgresql_where=text("status IN ('queued', 'running')"), sqlite_where=text("status IN ('queued', 'running')")))
+    __table_args__ = (UniqueConstraint("simulation_id", "turn_number", name="uq_simulation_turn_number"), UniqueConstraint("simulation_id", "client_request_id", name="uq_simulation_client_request"), Index("uq_simulation_active_turn", "simulation_id", unique=True, sqlite_where=text("status IN ('queued', 'running')")))
     turn_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     simulation_id: Mapped[str] = mapped_column(ForeignKey("simulation_sessions.simulation_id", ondelete="CASCADE"), nullable=False, index=True)
     turn_number: Mapped[int] = mapped_column(Integer, nullable=False)

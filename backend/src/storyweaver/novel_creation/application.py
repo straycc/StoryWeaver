@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import os
-import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,12 +40,18 @@ from .models import (
     ChapterRewriteRecord,
     ChapterResult,
     CreateNovelRequest,
+    NovelFoundation,
     NovelProject,
 )
 from .observability import NovelRunObserver
 from .pipeline import CreateNovelPipeline, WriteNextChapterPipeline
 from .repository import StoryProjectRepository
 from .quality_gate import ReviewQualityGate, ReviewQualityGatePolicy
+from .serialization import (
+    decode_book_metadata,
+    decode_novel_foundation,
+    decode_story_state,
+)
 from .sdk_tracing import configure_local_sdk_tracing
 
 
@@ -56,68 +60,6 @@ DEFAULT_MODEL_DIAGNOSTICS_DIRECTORY = (
     PROJECT_ROOT / "runtime" / "diagnostics" / "model_failures"
 )
 DEFAULT_AGENT_TRACE_DIRECTORY = PROJECT_ROOT / "runtime" / "traces"
-_ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-def load_env_file(path: str | Path = PROJECT_ROOT / ".env") -> bool:
-    """用标准库加载简单 ``.env``，且不覆盖进程已有变量。"""
-
-    env_path = Path(path)
-    if not env_path.is_file():
-        return False
-    try:
-        lines = env_path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise ConfigurationError(f"无法读取配置文件 {env_path}：{exc}") from exc
-
-    for line_number, raw_line in enumerate(lines, start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].lstrip()
-        if "=" not in line:
-            raise ConfigurationError(
-                f"{env_path} 第 {line_number} 行缺少等号"
-            )
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if not _ENV_NAME_PATTERN.fullmatch(key):
-            raise ConfigurationError(
-                f"{env_path} 第 {line_number} 行变量名不合法"
-            )
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        os.environ.setdefault(key, value)
-    return True
-
-
-def _read_env(primary_name: str, legacy_name: str | None = None) -> str | None:
-    value = os.getenv(primary_name)
-    if value is not None:
-        return value
-    return os.getenv(legacy_name) if legacy_name else None
-
-
-def _read_float(name: str, default: float) -> float:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        return float(raw_value)
-    except ValueError as exc:
-        raise ConfigurationError(f"{name} 必须是数字") from exc
-
-
-def _read_int(name: str, default: int) -> int:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        return int(raw_value)
-    except ValueError as exc:
-        raise ConfigurationError(f"{name} 必须是整数") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,9 +124,7 @@ class NovelApplicationSettings:
         if not self.base_url.strip():
             raise ConfigurationError("模型 base_url 不能为空")
         if not self.model.strip():
-            raise ConfigurationError(
-                "缺少 STORYWEAVER_LLM_MODEL，请在 .env 中配置模型名称"
-            )
+            raise ConfigurationError("模型名称不能为空")
         if not isinstance(self.model_diagnostics_directory, Path):
             raise TypeError("model_diagnostics_directory 必须是 Path")
         if not isinstance(self.agent_trace_directory, Path):
@@ -274,101 +214,6 @@ class NovelApplicationSettings:
         except (TypeError, ValueError) as exc:
             raise ConfigurationError(f"Review QualityGate 配置无效：{exc}") from exc
 
-    @classmethod
-    def from_env(
-        cls,
-    ) -> "NovelApplicationSettings":
-        base_url = _read_env(
-            "STORYWEAVER_LLM_BASE_URL",
-            "LLM_BASE_URL",
-        ) or "http://localhost:11434/v1"
-        model = _read_env("STORYWEAVER_LLM_MODEL", "LLM_MODEL_ID") or ""
-        api_key = _read_env("STORYWEAVER_LLM_API_KEY", "LLM_API_KEY")
-        reasoning_effort = os.getenv("STORYWEAVER_LLM_REASONING_EFFORT")
-        thinking = os.getenv("STORYWEAVER_LLM_THINKING")
-        json_mode = os.getenv("STORYWEAVER_LLM_JSON_MODE", "auto")
-        configured_diagnostics = os.getenv("STORYWEAVER_DIAGNOSTICS_DIR")
-        configured_traces = os.getenv("STORYWEAVER_TRACE_DIR")
-        return cls(
-            base_url=base_url,
-            model=model,
-            api_key=api_key,
-            temperature=_read_float("STORYWEAVER_LLM_TEMPERATURE", 0.8),
-            timeout_seconds=_read_float("STORYWEAVER_LLM_TIMEOUT", 300.0),
-            reviewer_turn_timeout_seconds=_read_float(
-                "STORYWEAVER_REVIEWER_TURN_TIMEOUT",
-                300.0,
-            ),
-            reasoning_effort=reasoning_effort.strip() if reasoning_effort else None,
-            thinking=thinking.strip().lower() if thinking else None,
-            json_mode=json_mode.strip().lower(),
-            architect_temperature=_read_float("STORYWEAVER_ARCHITECT_TEMPERATURE", 0.4),
-            planner_temperature=_read_float("STORYWEAVER_PLANNER_TEMPERATURE", 0.3),
-            writer_temperature=_read_float("STORYWEAVER_WRITER_TEMPERATURE", 0.8),
-            reviewer_temperature=_read_float("STORYWEAVER_REVIEWER_TEMPERATURE", 0.2),
-            reviser_temperature=_read_float("STORYWEAVER_REVISER_TEMPERATURE", 0.6),
-            analyzer_temperature=_read_float("STORYWEAVER_ANALYZER_TEMPERATURE", 0.1),
-            context_token_budget=_read_int(
-                "STORYWEAVER_CONTEXT_TOKEN_BUDGET",
-                6000,
-            ),
-            model_context_window=_read_int("STORYWEAVER_MODEL_CONTEXT_WINDOW", 1_000_000),
-            context_operational_window=_read_int("STORYWEAVER_CONTEXT_OPERATIONAL_WINDOW", 64_000),
-            context_safety_reserve=_read_int("STORYWEAVER_CONTEXT_SAFETY_RESERVE", 4_000),
-            context_fixed_token_budget=_read_int("STORYWEAVER_CONTEXT_FIXED_BUDGET", 2_000),
-            planner_context_token_budget=_read_int("STORYWEAVER_PLANNER_CONTEXT_BUDGET", 4_000),
-            reviewer_context_token_budget=_read_int("STORYWEAVER_REVIEWER_CONTEXT_BUDGET", 10_000),
-            reviser_context_token_budget=_read_int("STORYWEAVER_REVISER_CONTEXT_BUDGET", 12_000),
-            analyzer_context_token_budget=_read_int("STORYWEAVER_ANALYZER_CONTEXT_BUDGET", 15_000),
-            planner_evidence_token_budget=_read_int("STORYWEAVER_PLANNER_EVIDENCE_BUDGET", 4_000),
-            reviewer_evidence_token_budget=_read_int("STORYWEAVER_REVIEWER_EVIDENCE_BUDGET", 6_000),
-            verification_evidence_token_budget=_read_int("STORYWEAVER_VERIFICATION_EVIDENCE_BUDGET", 3_000),
-            analyzer_evidence_token_budget=_read_int("STORYWEAVER_ANALYZER_EVIDENCE_BUDGET", 4_000),
-            context_tool_timeout_seconds=_read_float("STORYWEAVER_CONTEXT_TOOL_TIMEOUT", 8.0),
-            planner_tool_result_token_limit=_read_int("STORYWEAVER_PLANNER_TOOL_RESULT_LIMIT", 900),
-            reviewer_tool_result_token_limit=_read_int("STORYWEAVER_REVIEWER_TOOL_RESULT_LIMIT", 1_000),
-            planner_max_tool_calls=_read_int("STORYWEAVER_PLANNER_MAX_TOOL_CALLS", 4),
-            planner_max_research_turns=_read_int("STORYWEAVER_PLANNER_RESEARCH_TURNS", 2),
-            reviewer_max_tool_calls=_read_int("STORYWEAVER_REVIEWER_MAX_TOOL_CALLS", 6),
-            reviewer_max_research_turns=_read_int("STORYWEAVER_REVIEWER_RESEARCH_TURNS", 2),
-            verification_max_tool_calls=_read_int("STORYWEAVER_VERIFICATION_MAX_TOOL_CALLS", 3),
-            analyzer_max_tool_calls=_read_int("STORYWEAVER_ANALYZER_MAX_TOOL_CALLS", 4),
-            analyzer_max_research_turns=_read_int("STORYWEAVER_ANALYZER_RESEARCH_TURNS", 2),
-            analyzer_tool_result_token_limit=_read_int("STORYWEAVER_ANALYZER_TOOL_RESULT_LIMIT", 900),
-            architect_output_token_limit=_read_int("STORYWEAVER_ARCHITECT_OUTPUT_LIMIT", 32_000),
-            planner_output_token_limit=_read_int("STORYWEAVER_PLANNER_OUTPUT_LIMIT", 32_000),
-            reviewer_output_token_limit=_read_int("STORYWEAVER_REVIEWER_OUTPUT_LIMIT", 32_000),
-            writer_output_token_limit=_read_int("STORYWEAVER_WRITER_OUTPUT_LIMIT", 32_000),
-            reviser_output_token_limit=_read_int("STORYWEAVER_REVISER_OUTPUT_LIMIT", 32_000),
-            analyzer_output_token_limit=_read_int("STORYWEAVER_ANALYZER_OUTPUT_LIMIT", 32_000),
-            review_policy=os.getenv("STORYWEAVER_REVIEW_POLICY", "strict").strip(),
-            review_minimum_score=_read_int(
-                "STORYWEAVER_REVIEW_MINIMUM_SCORE",
-                80,
-            ),
-            review_minimum_target_ratio=_read_float(
-                "STORYWEAVER_REVIEW_MINIMUM_TARGET_RATIO",
-                0.5,
-            ),
-            review_maximum_target_ratio=_read_float(
-                "STORYWEAVER_REVIEW_MAXIMUM_TARGET_RATIO",
-                1.8,
-            ),
-            review_warning_count_threshold=_read_int(
-                "STORYWEAVER_REVIEW_WARNING_COUNT_THRESHOLD",
-                3,
-            ),
-            review_max_revision_rounds=_read_int(
-                "STORYWEAVER_REVIEW_MAX_REVISION_ROUNDS",
-                1,
-            ),
-            model_diagnostics_directory=Path(
-                configured_diagnostics or DEFAULT_MODEL_DIAGNOSTICS_DIRECTORY
-            ).expanduser(),
-            agent_trace_directory=Path(
-                configured_traces or DEFAULT_AGENT_TRACE_DIRECTORY
-            ).expanduser(),
-        )
 
 class NovelService:
     """FastAPI 与 JobSupervisor 共用的小说创作应用入口。"""
@@ -392,6 +237,57 @@ class NovelService:
         creative_task: CreativeTaskContext | None = None,
     ) -> NovelProject:
         return await self._create_pipeline.run(request, creative_task)
+
+    async def generate_project_candidate(
+        self,
+        request: CreateNovelRequest,
+        creative_task: CreativeTaskContext | None = None,
+    ) -> NovelProject:
+        """生成待作者确认的基础资料候选，不创建正式作品。"""
+
+        return await self._create_pipeline.prepare(request, creative_task)
+
+    def rebuild_project_candidate(
+        self,
+        request: CreateNovelRequest,
+        foundation: NovelFoundation,
+    ) -> NovelProject:
+        """作者编辑候选基础资料后，重新校验并派生初始状态。"""
+
+        return self._create_pipeline.assemble(request, foundation)
+
+    def publish_project_candidate(self, candidate: NovelProject) -> NovelProject:
+        """将已确认候选一次性发布为正式作品。"""
+
+        return self._create_pipeline.publish(candidate)
+
+    def update_project_foundation(
+        self,
+        *,
+        book_id: str,
+        foundation: NovelFoundation,
+    ) -> NovelProject:
+        """提交已确认的长期设定/未来大纲修订，不触碰已发生状态。"""
+
+        return self.store.update_foundation(book_id, foundation)
+
+    def expire_pending_chapter_plans(
+        self,
+        *,
+        book_id: str,
+    ) -> tuple[ChapterPlanProposal, ...]:
+        """总纲变更后，旧 Foundation 生成的待执行计划不能继续使用。"""
+
+        return self.store.expire_pending_plan_proposals(book_id)
+
+    def project_candidate_from_data(self, data: Mapping[str, object]) -> NovelProject:
+        """从待确认提案的持久化 JSON 恢复严格候选对象。"""
+
+        return NovelProject(
+            metadata=decode_book_metadata(data.get("metadata")),
+            foundation=decode_novel_foundation(data.get("foundation")),
+            state=decode_story_state(data.get("state")),
+        )
 
     async def write_next_chapter(
         self,
@@ -771,6 +667,7 @@ def build_novel_service(
     creative_control_provider: object | None = None,
     store: StoryProjectRepository,
     context_snapshot_sink: object | None = None,
+    model_override: object | None = None,
 ) -> NovelService:
     """使用一个共享 Runtime 组装真实模型小说创作服务。"""
 
@@ -779,13 +676,14 @@ def build_novel_service(
     diagnostic_writer = ModelFailureDiagnosticWriter(settings.model_diagnostics_directory)
     hooks = (observer,) if observer is not None else ()
     # 生产小说 Worker 全部直接使用 SDK，并共用同一 Provider 配置。
-    sdk_model = None
-    sdk_provider = OpenAICompatibleProviderSettings(
-        base_url=settings.base_url,
-        model_name=settings.model,
-        api_key=settings.api_key,
-    ).create_provider()
-    sdk_model = sdk_provider.get_model(settings.model)
+    sdk_model = model_override
+    if sdk_model is None:
+        sdk_provider = OpenAICompatibleProviderSettings(
+            base_url=settings.base_url,
+            model_name=settings.model,
+            api_key=settings.api_key,
+        ).create_provider()
+        sdk_model = sdk_provider.get_model(settings.model)
     skill_materializer = SkillMaterializer(
         SkillResolver(
             selector=build_model_skill_selector(
