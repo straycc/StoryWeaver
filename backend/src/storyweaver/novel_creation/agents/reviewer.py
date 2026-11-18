@@ -7,6 +7,7 @@ from dataclasses import replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping
 
+from ...retrieval import HybridRetriever
 from ...context import (
     AgentContextPolicy,
     ContextCandidate,
@@ -124,6 +125,7 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
         context_policy: AgentContextPolicy | None = None,
         verification_context_policy: AgentContextPolicy | None = None,
         skill_materializer: SkillMaterializer | None = None,
+        retriever: HybridRetriever | None = None,
     ) -> None:
         super().__init__(
             agent_id="novel-reviewer",
@@ -137,6 +139,7 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
         )
         self._renderer = renderer or ChapterContextRenderer()
         self._store = store
+        self._retriever = retriever
         self._context_snapshot_sink = context_snapshot_sink
         defaults = default_agent_context_policies()
         self._context_policy = context_policy or defaults["reviewer"]
@@ -234,6 +237,7 @@ class ReviewerAgent(BaseNovelAgent[dict[str, Any]]):
                 await sink.on_event(event)
         tools = build_sdk_read_tools(
             snapshot=snapshot,
+            retriever=self._retriever,
             max_tool_calls=retrieval.max_tool_calls,
             on_completed=completed,
             evidence=evidence,

@@ -314,6 +314,27 @@ button { color: inherit; }
   background: var(--surface-soft);
 }
 .message.assistant .message-content { width: 100%; max-width: 100%; padding: 2px 4px; }
+.message.assistant .message-content { white-space: normal; }
+.assistant-markdown { overflow-wrap: anywhere; }
+.assistant-markdown > :first-child { margin-top: 0; }
+.assistant-markdown > :last-child { margin-bottom: 0; }
+.assistant-markdown p { margin: 0 0 1em; }
+.assistant-markdown h1, .assistant-markdown h2, .assistant-markdown h3 { margin: 1.35em 0 .55em; line-height: 1.4; font-weight: 650; }
+.assistant-markdown h1 { font-size: 1.4em; }
+.assistant-markdown h2 { font-size: 1.2em; }
+.assistant-markdown h3 { font-size: 1.07em; }
+.assistant-markdown ul, .assistant-markdown ol { margin: .4em 0 1em; padding-left: 1.6em; }
+.assistant-markdown li + li { margin-top: .25em; }
+.assistant-markdown li > p { margin: .3em 0; }
+.assistant-markdown blockquote { margin: 1em 0; padding: .1em 0 .1em 1em; border-left: 3px solid var(--line); color: var(--muted); }
+.assistant-markdown hr { margin: 1.4em 0; border: 0; border-top: 1px solid var(--line); }
+.assistant-markdown pre { max-width: 100%; overflow-x: auto; margin: 1em 0; padding: 12px 14px; border-radius: 10px; background: var(--surface-soft); line-height: 1.55; }
+.assistant-markdown code { padding: .15em .35em; border-radius: 4px; background: var(--surface-soft); font-size: .9em; }
+.assistant-markdown pre code { padding: 0; background: transparent; }
+.assistant-markdown table { display: block; max-width: 100%; overflow-x: auto; margin: 1em 0; border-collapse: collapse; }
+.assistant-markdown th, .assistant-markdown td { padding: 6px 10px; border: 1px solid var(--line); text-align: left; }
+.assistant-markdown a { color: #345f89; text-decoration: underline; text-underline-offset: 2px; }
+.assistant-markdown img { max-width: 100%; }
 .chat-thinking {
   margin: -8px 0 28px 4px;
   color: var(--muted);

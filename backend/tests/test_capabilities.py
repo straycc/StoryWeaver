@@ -11,7 +11,11 @@ from storyweaver.api.capabilities import (
     validate_capability_parameters,
 )
 from storyweaver.api.action_surface import should_route_explicit_skill_reply
-from storyweaver.api.main_agent import ConversationDecision
+from storyweaver.api.main_agent import (
+    ConversationDecision,
+    MainAgentDecisionValidationError,
+    validate_main_agent_decision,
+)
 
 
 class CapabilityManifestTests(unittest.TestCase):
@@ -50,6 +54,28 @@ class CapabilityManifestTests(unittest.TestCase):
                 "creative_discussion",
                 {"objective": "讨论下一章", "unknown": True},
             )
+
+    def test_manifest_exposes_exact_parameter_names_from_dto(self) -> None:
+        rendered = render_main_agent_manifest()
+        chapter_line = next(
+            line for line in rendered.splitlines()
+            if line.startswith("- query_chapter：")
+        )
+        self.assertIn("chapter_number: integer", chapter_line)
+        self.assertIn("include: summary|content|plan|review", chapter_line)
+        self.assertNotIn("chapter:", chapter_line)
+
+    def test_main_agent_validates_action_specific_parameters(self) -> None:
+        with self.assertRaises(MainAgentDecisionValidationError):
+            validate_main_agent_decision(ConversationDecision(
+                kind="query", action="query_chapter",
+                parameters={"chapter": 3, "include": ["summary"]},
+            ))
+        decision = validate_main_agent_decision(ConversationDecision(
+            kind="query", action="query_chapter",
+            parameters={"chapter_number": 3},
+        ))
+        self.assertEqual(decision.parameters["include"], "summary")
 
     def test_explicit_skill_cannot_be_ignored_by_plain_reply(self) -> None:
         task = SimpleNamespace(applied_skills=(object(),))

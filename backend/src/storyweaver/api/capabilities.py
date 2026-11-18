@@ -69,7 +69,7 @@ _DEFINITIONS = (
     CapabilityDefinition("confirm_and_write_chapter", "workflow", "兼容旧入口：确认候选计划并生成正文", ConfirmAndWriteParameters, True, True, True),
     CapabilityDefinition("rewrite_chapter", "workflow", "回退并重写指定章节", RewriteChapterParameters, True, requires_confirmation=True),
     CapabilityDefinition("write_batch", "workflow", "连续创作指定数量章节", WriteBatchParameters, True, requires_confirmation=True),
-    CapabilityDefinition("run_next_chapter_workflow", "workflow", "启动可暂停的下一章完整工作流，先产出候选计划并等待确认", RunNextChapterWorkflowParameters, True),
+    CapabilityDefinition("run_next_chapter_workflow", "workflow", "启动可暂停的下一章完整工作流，先产出候选计划并等待确认", RunNextChapterWorkflowParameters, True, requires_confirmation=True),
 )
 
 
@@ -96,7 +96,29 @@ def validate_capability_parameters(
 
 
 def render_main_agent_manifest() -> str:
-    """生成供 Main Agent 选择能力的精简目录。"""
+    """从动作 DTO 生成能力与参数目录，避免提示词和执行契约分叉。"""
+
+    def field_type(schema: dict[str, Any]) -> str:
+        if "enum" in schema:
+            return "|".join(str(value) for value in schema["enum"])
+        if "anyOf" in schema:
+            variants = [field_type(item) for item in schema["anyOf"] if item.get("type") != "null"]
+            return "|".join(variants) or "null"
+        kind = schema.get("type", "object")
+        if kind == "array":
+            return f"list[{field_type(schema.get('items', {}))}]"
+        return str(kind)
+
+    def parameter_contract(item: CapabilityDefinition) -> str:
+        schema = item.parameter_model.model_json_schema()
+        required = set(schema.get("required", ()))
+        fields = schema.get("properties", {})
+        if not fields:
+            return "无参数"
+        return "、".join(
+            f"{name}: {field_type(field)}（{'必填' if name in required else '可选'}）"
+            for name, field in fields.items()
+        )
 
     sections: list[str] = []
     for category, title in (
@@ -106,7 +128,7 @@ def render_main_agent_manifest() -> str:
     ):
         sections.append(f"{title} 能力：")
         sections.extend(
-            f"- {item.capability_id}：{item.description}"
+            f"- {item.capability_id}：{item.description}；参数仅允许 {parameter_contract(item)}。"
             for item in _DEFINITIONS
             if item.category == category
         )

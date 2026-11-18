@@ -9,6 +9,8 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from agents import ModelSettings
+
+from ..retrieval import HybridRetriever
 from ..llm import LlmMessage, LlmMessageRole
 from ..context import ChatContextPolicy, SessionContextManager
 from ..llm import OpenAICompatibleProviderSettings, WorkerSettings, run_text_worker
@@ -1728,6 +1730,7 @@ def build_chat_workspace(
     novels: NovelService,
     action_proposals: ActionProposalRepository | None = None,
     model_override: object | None = None,
+    retriever: HybridRetriever | None = None,
 ) -> ChatWorkspaceApplication:
     """构造正式 SQLite 对话编排层。"""
     provider = None if model_override is not None else OpenAICompatibleProviderSettings(
@@ -1772,6 +1775,7 @@ def build_chat_workspace(
     memory_retriever = LongTermMemoryRetriever(
         generate_text=generate_memory_text,
         store=memory_store,
+        retriever=retriever,
     )
     context_manager = SessionContextManager(
         sessions=sessions,

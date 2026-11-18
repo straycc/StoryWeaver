@@ -17,7 +17,7 @@ import yaml
 from agents import ModelSettings
 from agents.models.interface import Model
 from openai.types.shared.reasoning import Reasoning
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..llm import OpenAICompatibleProviderSettings
 
@@ -35,7 +35,9 @@ class ProviderConfig(BaseModel):
     id: str
     name: str
     base_url: str
-    models: list[str] = Field(min_length=1)
+    models: list[str] = Field(default_factory=list)
+    # 仅保留上一版目录字段以读取旧文件，新 Embedding 配置不再使用它。
+    embedding_models: list[str] = Field(default_factory=list)
 
     @field_validator("id")
     @classmethod
@@ -52,13 +54,19 @@ class ProviderConfig(BaseModel):
             raise ValueError("名称和 API 地址不能为空")
         return value
 
-    @field_validator("models")
+    @field_validator("models", "embedding_models")
     @classmethod
     def validate_models(cls, value: list[str]) -> list[str]:
         result = [item.strip() for item in value]
         if not all(result) or len(result) != len(set(result)):
             raise ValueError("模型 ID 不能为空或重复")
         return result
+
+    @model_validator(mode="after")
+    def validate_capabilities(self) -> ProviderConfig:
+        if not self.models and not self.embedding_models:
+            raise ValueError("请至少配置一个对话模型或 Embedding 模型")
+        return self
 
     @field_validator("base_url")
     @classmethod
@@ -70,12 +78,35 @@ class ProviderConfig(BaseModel):
         return value.rstrip("/")
 
 
+class EmbeddingModelConfig(BaseModel):
+    """设置接口只暴露模型信息，检索策略由后端管理。"""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    name: str = Field(default="Embedding", min_length=1)
+    base_url: str = Field(min_length=1)
+    model_id: str = Field(min_length=1)
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        return ProviderConfig.validate_base_url(value)
+
+
+class EmbeddingConfig(EmbeddingModelConfig):
+    """持久化内部检索策略，不进入模型设置接口。"""
+
+    dimensions: int | None = Field(default=None, gt=0)
+    timeout_seconds: float = Field(default=5.0, gt=0, le=60, allow_inf_nan=False)
+    minimum_similarity: float = Field(default=0.35, ge=-1, le=1, allow_inf_nan=False)
+
+
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     version: int = 1
     providers: list[ProviderConfig] = Field(default_factory=list)
     default_provider: str | None = None
     default_model: str | None = None
+    embedding: EmbeddingConfig | None = None
 
 
 class ModelCatalog:
@@ -116,18 +147,58 @@ class ModelCatalog:
 
     def _config(self) -> ModelConfig:
         try:
-            config = ModelConfig.model_validate(self._read_yaml(self.config_path))
+            raw = self._read_yaml(self.config_path)
+            embedding = raw.get("embedding")
+            legacy_provider = None
+            if isinstance(embedding, dict) and "provider_id" in embedding:
+                # 将上一版供应商引用展开为独立地址，并复制密钥以解除后续绑定。
+                legacy_provider = next((item for item in raw.get("providers", []) if item.get("id") == embedding["provider_id"]), None)
+                if legacy_provider is None:
+                    raise ValueError("旧 Embedding 配置引用的供应商不存在")
+                raw["embedding"] = {
+                    **{key: value for key, value in embedding.items() if key != "provider_id"},
+                    "base_url": legacy_provider["base_url"],
+                    "name": f"{legacy_provider['name']} Embedding",
+                }
+            if isinstance(raw.get("embedding"), dict):
+                # 兼容旧的页面开关；是否使用模型只取决于有没有有效配置。
+                raw["embedding"].pop("enabled", None)
+            config = ModelConfig.model_validate(raw)
         except Exception as exc:
             raise ModelConfigurationError(f"模型配置文件无效：{exc}") from exc
         if config.version != 1 or len({item.id for item in config.providers}) != len(config.providers):
             raise ModelConfigurationError("模型配置版本不支持或供应商 ID 重复")
+        if legacy_provider is not None:
+            data = self._credential_data()
+            if "embedding_api_key" not in data:
+                key = data.get("api_keys", {}).get(legacy_provider["id"])
+                if key:
+                    self._set_embedding_key(str(key))
+            self._write_yaml(self.config_path, config.model_dump())
         return config
 
-    def _credentials(self) -> dict[str, str]:
+    def _credential_data(self) -> dict[str, Any]:
         data = self._read_yaml(self.credentials_path)
         if data.get("version", 1) != 1 or not isinstance(data.get("api_keys", {}), dict):
             raise ModelConfigurationError("密钥文件格式无效")
-        return {str(key): str(value) for key, value in data.get("api_keys", {}).items() if value}
+        if not isinstance(data.get("embedding_api_key", ""), str):
+            raise ModelConfigurationError("Embedding 密钥必须为字符串")
+        return data
+
+    def _credentials(self) -> dict[str, str]:
+        return {str(key): str(value) for key, value in self._credential_data().get("api_keys", {}).items() if value}
+
+    def _set_chat_keys(self, keys: Mapping[str, str]) -> None:
+        data = self._credential_data()
+        self._write_yaml(self.credentials_path, {**data, "version": 1, "api_keys": dict(keys)})
+
+    def _set_embedding_key(self, key: str | None) -> None:
+        data = self._credential_data()
+        if key:
+            data["embedding_api_key"] = key
+        else:
+            data.pop("embedding_api_key", None)
+        self._write_yaml(self.credentials_path, {**data, "version": 1})
 
     def public(self) -> dict[str, Any]:
         with self._lock:
@@ -141,6 +212,7 @@ class ModelCatalog:
                 ],
                 "default_provider": config.default_provider,
                 "default_model": config.default_model,
+                "embedding": {**config.embedding.model_dump(include=set(EmbeddingModelConfig.model_fields)), "has_api_key": bool(self._credential_data().get("embedding_api_key"))} if config.embedding else None,
             }
 
     def upsert(self, provider: ProviderConfig, *, api_key: str | None = None, clear_key: bool = False) -> dict[str, Any]:
@@ -149,20 +221,68 @@ class ModelCatalog:
             providers = [item for item in config.providers if item.id != provider.id]
             providers.append(provider)
             config.providers = providers
-            if config.default_provider is None:
-                config.default_provider = provider.id
-                config.default_model = provider.models[0]
-            elif config.default_provider == provider.id and config.default_model not in provider.models:
-                config.default_model = provider.models[0]
+            self._repair_selections(config)
             if api_key is not None or clear_key:
                 keys = self._credentials()
                 if clear_key:
                     keys.pop(provider.id, None)
                 elif api_key and api_key.strip():
                     keys[provider.id] = api_key.strip()
-                self._write_yaml(self.credentials_path, {"version": 1, "api_keys": keys})
+                self._set_chat_keys(keys)
             self._write_yaml(self.config_path, config.model_dump())
             return self.public()
+
+    @staticmethod
+    def _repair_selections(config: ModelConfig) -> None:
+        """仅修复对话默认模型，Embedding 配置独立保存。"""
+        chat_providers = [item for item in config.providers if item.models]
+        current = next((item for item in chat_providers if item.id == config.default_provider), None)
+        if current is None or config.default_model not in current.models:
+            selected = current or next(iter(chat_providers), None)
+            config.default_provider = selected.id if selected else None
+            config.default_model = selected.models[0] if selected else None
+
+    @staticmethod
+    def _embedding_configuration(model: EmbeddingModelConfig, previous: EmbeddingConfig | None) -> EmbeddingConfig:
+        """编辑同一模型时保留内部策略；更换模型后使用默认策略与维度。"""
+        if previous and previous.base_url == model.base_url and previous.model_id == model.model_id:
+            return EmbeddingConfig.model_validate({**previous.model_dump(), **model.model_dump()})
+        return EmbeddingConfig.model_validate(model.model_dump())
+
+    def set_embedding(self, selection: EmbeddingModelConfig | None, *, api_key: str | None = None,
+                      clear_key: bool = False) -> dict[str, Any]:
+        with self._lock:
+            config = self._config()
+            if selection is not None and not isinstance(selection, EmbeddingConfig):
+                selection = self._embedding_configuration(selection, config.embedding)
+            if selection is None or clear_key:
+                self._set_embedding_key(None)
+            elif api_key and api_key.strip():
+                self._set_embedding_key(api_key.strip())
+            config.embedding = selection
+            self._write_yaml(self.config_path, config.model_dump())
+            return self.public()
+
+    def embedding_settings(self, selection: EmbeddingModelConfig | None = None, *, api_key: str | None = None,
+                           clear_key: bool = False):
+        """每次检索读取当前配置；调用方持有返回值直到本次检索完成。"""
+        from ..retrieval.embeddings import EmbeddingSettings
+
+        with self._lock:
+            config = self._config()
+            selection = selection or config.embedding
+            if selection is None:
+                return None
+            if not isinstance(selection, EmbeddingConfig):
+                selection = self._embedding_configuration(selection, config.embedding)
+            key = "" if clear_key else (api_key.strip() if api_key and api_key.strip() else self._credential_data().get("embedding_api_key", ""))
+            if not key and urlsplit(selection.base_url).hostname not in {"localhost", "127.0.0.1", "::1"}:
+                raise ModelConfigurationError("Embedding 尚未配置独立 API Key")
+            return EmbeddingSettings(
+                base_url=selection.base_url, model=selection.model_id, api_key=key,
+                dimensions=selection.dimensions, timeout_seconds=selection.timeout_seconds,
+                minimum_similarity=selection.minimum_similarity,
+            )
 
     def set_default(self, provider_id: str, model_id: str) -> dict[str, Any]:
         with self._lock:
@@ -178,14 +298,11 @@ class ModelCatalog:
             if not any(item.id == provider_id for item in config.providers):
                 raise KeyError(provider_id)
             config.providers = [item for item in config.providers if item.id != provider_id]
-            if config.default_provider == provider_id:
-                first = config.providers[0] if config.providers else None
-                config.default_provider = first.id if first else None
-                config.default_model = first.models[0] if first else None
+            self._repair_selections(config)
             self._write_yaml(self.config_path, config.model_dump())
             keys = self._credentials()
             keys.pop(provider_id, None)
-            self._write_yaml(self.credentials_path, {"version": 1, "api_keys": keys})
+            self._set_chat_keys(keys)
             return self.public()
 
     @staticmethod

@@ -26,8 +26,10 @@ from ..story_simulation.agent import (CHARACTER_SYSTEM_PROMPT, DIRECTOR_SYSTEM_P
 from ..story_simulation.runtime import RoleplayRuntime
 from ..story_simulation.service import public_state
 from ..llm import OpenAICompatibleProviderSettings, WorkerSettings
+from ..retrieval import build_retriever
 from ..model_config import ModelCatalog, ModelConfigurationError, RoutedModel
-from ..model_config.store import ProviderConfig, bind_model
+from ..model_config.store import EmbeddingModelConfig, ProviderConfig, bind_model
+from ..retrieval.embeddings import ApiEmbedder
 from agents import ModelSettings
 from ..observability import ModelFailureDiagnosticWriter
 from ..application.workspace import ChatWorkspaceApplication, build_chat_workspace
@@ -105,6 +107,11 @@ class SessionMessageBody(BaseModel):
 
 class ProviderBody(ProviderConfig):
     api_key: str | None = None
+    clear_key: bool = False
+
+
+class EmbeddingBody(EmbeddingModelConfig):
+    api_key: str | None = Field(default=None, repr=False)
     clear_key: bool = False
 
 
@@ -313,6 +320,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str, model_c
     sessions = SQLAlchemyChatSessionRepository(database)
     deletions = SQLAlchemyDeletionRepository(database)
     memories = SQLAlchemyLongTermMemoryStore(database)
+    retriever = build_retriever(database.path, model_catalog)
     live_previews = LivePreviewHub()
 
     def emit_run_event(run_id: str, event_type: str, payload: Mapping[str, Any]) -> None:
@@ -347,6 +355,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str, model_c
     ).create_provider().get_model(settings.model)
     service = build_novel_service(
         settings,
+        retriever=retriever,
         store=store,
         observer=observer,
         creative_control_provider=creative_controls.get,
@@ -419,6 +428,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str, model_c
     )
     workspace = build_chat_workspace(
         settings,
+        retriever=retriever,
         sessions=sessions,
         memory_store=memories,
         novels=service,
@@ -436,8 +446,9 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str, model_c
             return selected
         if config["default_provider"] and config["default_model"]:
             return str(config["default_provider"]), str(config["default_model"])
-        if providers:
-            return str(providers[0]["id"]), str(providers[0]["models"][0])
+        for provider in providers:
+            if provider["models"]:
+                return str(provider["id"]), str(provider["models"][0])
         return None
 
     def model_binding(payload: Mapping[str, Any]):
@@ -521,7 +532,28 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str, model_c
 
     @app.get("/api/v1/models/config")
     async def get_model_config() -> dict[str, Any]:
-        return model_catalog.public() if model_catalog else {"providers": [], "default_provider": None, "default_model": None}
+        return model_catalog.public() if model_catalog else {"providers": [], "default_provider": None, "default_model": None, "embedding": None}
+
+    @app.put("/api/v1/models/embedding")
+    async def set_embedding_model(body: EmbeddingBody | None = None) -> dict[str, Any]:
+        if model_catalog is None:
+            raise HTTPException(status_code=409, detail="当前服务未启用模型配置")
+        selection = EmbeddingModelConfig.model_validate(body.model_dump(exclude={"api_key", "clear_key"})) if body else None
+        return model_catalog.set_embedding(selection, api_key=body.api_key if body else None, clear_key=body.clear_key if body else False)
+
+    @app.post("/api/v1/models/embedding/test")
+    async def test_embedding_model(body: EmbeddingBody) -> dict[str, bool]:
+        if model_catalog is None:
+            raise HTTPException(status_code=409, detail="当前服务未启用模型配置")
+        selection = EmbeddingModelConfig.model_validate(body.model_dump(exclude={"api_key", "clear_key"}))
+        settings = model_catalog.embedding_settings(selection, api_key=body.api_key, clear_key=body.clear_key)
+        assert settings is not None
+        try:
+            async with asyncio.timeout(settings.timeout_seconds):
+                await ApiEmbedder(settings).embed(["小说资料检索连接测试"])
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Embedding 连接测试失败：{type(exc).__name__}") from exc
+        return {"ok": True}
 
     @app.put("/api/v1/models/providers/{provider_id}")
     async def save_model_provider(provider_id: str, body: ProviderBody) -> dict[str, Any]:

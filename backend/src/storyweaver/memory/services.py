@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from ..llm import LlmMessage, LlmMessageRole
+from ..retrieval import HybridRetriever, RetrievalDocument
 from .long_term import (
     LongTermMemoryRecord,
     LongTermMemoryStatus,
@@ -249,7 +250,7 @@ class LongTermMemoryExtractor:
 
 
 class LongTermMemoryRetriever:
-    """作用域过滤后，让 LLM 从目录中最多选择五条记忆。"""
+    """正式运行时使用混合检索，未注入检索器时兼容原有目录选择。"""
 
     def __init__(
         self,
@@ -258,11 +259,13 @@ class LongTermMemoryRetriever:
         store: LongTermMemoryStore,
         max_catalog_items: int = 200,
         limit: int = 5,
+        retriever: HybridRetriever | None = None,
     ) -> None:
         self.generate_text = generate_text
         self.store = store
         self.max_catalog_items = max_catalog_items
         self.limit = limit
+        self.retriever = retriever
 
     async def retrieve(
         self,
@@ -288,6 +291,14 @@ class LongTermMemoryRetriever:
                 )
             )
         records.sort(key=lambda item: item.updated_at, reverse=True)
+        if self.retriever is not None:
+            result = await self.retriever.search(
+                query,
+                tuple(RetrievalDocument(item.memory_id, f"{item.name}\n{item.description}\n{item.content}") for item in records),
+                limit=self.limit,
+            )
+            index = {item.memory_id: item for item in records}
+            return tuple(index[memory_id] for memory_id in result.document_ids)
         records = records[: self.max_catalog_items]
         if not records or not query.strip():
             return ()

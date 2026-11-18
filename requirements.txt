@@ -11,3 +11,6 @@ uvicorn>=0.30,<1
 SQLAlchemy>=2.0,<3
 # 标准解析 Skill 的 YAML frontmatter，避免用正则实现不完整 YAML 子集。
 PyYAML>=6.0,<7
+# 混合检索：固定已验证的扩展版本，HTTP 客户端用于 Embedding API。
+sqlite-vec==0.1.6
+httpx>=0.27,<1

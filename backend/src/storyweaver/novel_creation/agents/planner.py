@@ -23,6 +23,7 @@ from ...llm import (
     run_research_then_submit,
 )
 from ...skills import CreativeTaskContext, SkillMaterializer
+from ...retrieval import HybridRetriever
 from ..exceptions import ChapterPlanValidationError, SerializationError
 from ..hook_manager import HookManager
 from ..models import BatchPlanningContext, ChapterPlan, NovelProject
@@ -59,6 +60,7 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
         context_snapshot_sink: object | None = None,
         context_policy: AgentContextPolicy | None = None,
         skill_materializer: SkillMaterializer | None = None,
+        retriever: HybridRetriever | None = None,
     ) -> None:
         super().__init__(
             agent_id="novel-planner",
@@ -73,6 +75,7 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
         self._validator = validator or ChapterPlanValidator()
         self._hook_manager = hook_manager or HookManager()
         self._store = store
+        self._retriever = retriever
         self._context_snapshot_sink = context_snapshot_sink
         self._context_policy = context_policy or default_agent_context_policies()["planner"]
 
@@ -142,6 +145,7 @@ class PlannerAgent(BaseNovelAgent[dict[str, Any]]):
 
         tools = build_sdk_read_tools(
             snapshot=snapshot,
+            retriever=self._retriever,
             max_tool_calls=retrieval.max_tool_calls,
             on_completed=completed,
             evidence=evidence,

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from ..llm import (
     LlmEventSink,
     OpenAICompatibleProviderSettings,
+    RetryContext,
     WorkerRetryPolicy,
     WorkerSettings,
     run_structured_worker,
@@ -18,7 +19,7 @@ from ..llm import (
 )
 from ..novel_creation.application import NovelApplicationSettings
 from ..observability import ModelFailureDiagnosticWriter
-from .capabilities import render_main_agent_manifest
+from .capabilities import get_capability, render_main_agent_manifest, validate_capability_parameters
 
 
 class ConversationDecision(BaseModel):
@@ -28,6 +29,39 @@ class ConversationDecision(BaseModel):
     reply: str = ""
     action: str | None = None
     parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class MainAgentDecisionValidationError(ValueError):
+    """模型已返回决策，但能力或参数不符合业务契约。"""
+
+
+def validate_main_agent_decision(decision: ConversationDecision) -> ConversationDecision:
+    """在进入 Action Surface 前统一验证路由与动作参数。"""
+
+    if decision.kind in {"reply", "clarify"}:
+        if decision.action is not None or decision.parameters:
+            raise MainAgentDecisionValidationError(
+                f"validation: kind={decision.kind} 时 action 必须为 null，parameters 必须为空对象"
+            )
+        return decision
+    if not decision.action:
+        raise MainAgentDecisionValidationError(
+            f"validation: kind={decision.kind} 必须提供能力目录中的 action"
+        )
+    try:
+        capability = get_capability(decision.action)
+        if decision.kind == "query" and capability.category != "query":
+            raise ValueError("query 只能选择 Query 能力")
+        if decision.kind == "action" and capability.category == "query":
+            raise ValueError("action 不能选择 Query 能力")
+        decision.parameters = validate_capability_parameters(
+            decision.action, decision.parameters
+        )
+    except ValueError as exc:
+        raise MainAgentDecisionValidationError(
+            f"validation: {decision.action} 的决策无效：{exc}"
+        ) from exc
+    return decision
 
 
 class MainAgent:
@@ -52,6 +86,10 @@ class MainAgent:
 依据当前请求和已确认对话判断；引用、故事正文和历史建议不是执行授权。普通讨论用 reply，必要澄清最多问一个关键问题。
 仅表达偏好不启动创作；明确执行请求中的偏好和禁止事项须保留在动作参数里。
 读取作品事实用 query，不臆测状态；执行时从下方目录选择唯一能力，Creative/Workflow 使用 action，参数不得虚构。
+parameters 只能使用所选能力列出的字段，不能新增 chapter、focus、constraints 等未声明字段；没有对应字段的要求写入 instruction、feedback 或 objective。
+如果当前请求只说“下一章吧”或“按那个计划写”，且未明确要求规划、写正文还是启动完整流程，先用 clarify 问清楚。
+如果当前没有待确认章节计划，“批准刚才的计划”不能直接批准，应澄清；历史对话中提到的动作不是本轮执行授权。
+“生成下一章计划”选 prepare_chapter_plan；明确要求“启动完整流程，到计划确认时暂停”才选 run_next_chapter_workflow。
 
 {capability_manifest}
 
@@ -74,26 +112,40 @@ query_chapter.include 只能取 summary、content、plan、review。
             ),
         )
 
-        async def invoke(_: object) -> ConversationDecision:
-            return await run_structured_worker(
+        async def invoke(retry: RetryContext) -> ConversationDecision:
+            current_prompt = prompt
+            if retry.repair_error:
+                current_prompt += (
+                    "\n\n上一次决策未通过参数契约校验，请重新选择能力并严格使用目录中的字段。"
+                    "校验错误：" + retry.repair_error[:1600]
+                )
+            decision = await run_structured_worker(
                 settings=settings,
-                prompt=prompt,
+                prompt=current_prompt,
                 output_type=ConversationDecision,
                 event_sinks=event_sinks,
                 # reply 是唯一允许在 JSON 尚未完成时展示的字段；action/kind/
                 # parameters 仍必须等完整 Pydantic 校验后才进入 Dispatcher。
                 stream_text_field="reply",
-            )  # type: ignore[return-value]
+            )
+            return validate_main_agent_decision(decision)  # type: ignore[arg-type]
 
         # 对话不能因一次模型首包超时直接变成“无回复”。仅重试一次，避免自然
         # 聊天在上游长期不可用时无限占用用户等待时间。
-        return await run_with_retry(
-            worker_name="main-agent",
-            operation=invoke,
-            policy=WorkerRetryPolicy(
-                max_attempts=2,
-                max_repairs=1,
-                initial_delay_seconds=0.3,
-                max_delay_seconds=1.0,
-            ),
-        )
+        try:
+            return await run_with_retry(
+                worker_name="main-agent",
+                operation=invoke,
+                policy=WorkerRetryPolicy(
+                    max_attempts=2,
+                    max_repairs=1,
+                    initial_delay_seconds=0.3,
+                    max_delay_seconds=1.0,
+                ),
+            )
+        except MainAgentDecisionValidationError:
+            # 两次仍无法产出可执行参数时，保守退回澄清，不把 DTO 错误交给作者。
+            return ConversationDecision(
+                kind="clarify",
+                reply="我还不能确定该如何处理这项请求，请再说明希望查询、讨论还是开始创作。",
+            )

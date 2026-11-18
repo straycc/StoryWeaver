@@ -11,7 +11,10 @@ export interface Session {
 export interface ModelSelection { provider_id: string; model_id: string; }
 export type ReasoningLevel = "default" | "off" | "low" | "medium" | "high" | "max";
 export interface ModelProvider { id: string; name: string; base_url: string; models: string[]; has_api_key: boolean; reasoning_levels_by_model: Record<string, ReasoningLevel[]>; }
-export interface ModelConfig { providers: ModelProvider[]; default_provider: string | null; default_model: string | null; }
+export interface EmbeddingSelection { name: string; base_url: string; model_id: string; }
+export interface EmbeddingRequest extends EmbeddingSelection { api_key?: string; clear_key?: boolean; }
+export interface EmbeddingModel extends EmbeddingSelection { has_api_key: boolean; }
+export interface ModelConfig { providers: ModelProvider[]; default_provider: string | null; default_model: string | null; embedding: EmbeddingModel | null; }
 export interface SessionSummary { session_id: string; title: string; book_id: string | null; message_count: number; updated_at: string; }
 export interface ProjectSummary { book_id: string; title: string; genre: string; target_chapters: number; }
 export interface SkillOption { id: string; name: string; display_name: string; description: string; short_description: string; }
@@ -34,6 +37,8 @@ export const api = {
   saveModelProvider: (value: Omit<ModelProvider, "has_api_key" | "reasoning_levels_by_model"> & { api_key?: string; clear_key?: boolean }) => request<ModelConfig>(`/models/providers/${encodeURIComponent(value.id)}`, { method: "PUT", body: JSON.stringify(value) }),
   deleteModelProvider: (id: string) => request<ModelConfig>(`/models/providers/${encodeURIComponent(id)}`, { method: "DELETE" }),
   setDefaultModel: (value: ModelSelection) => request<ModelConfig>("/models/default", { method: "PUT", body: JSON.stringify(value) }),
+  setEmbeddingModel: (value: EmbeddingRequest | null) => request<ModelConfig>("/models/embedding", { method: "PUT", body: JSON.stringify(value) }),
+  testEmbeddingModel: (value: EmbeddingRequest) => request<{ ok: boolean }>("/models/embedding/test", { method: "POST", body: JSON.stringify(value) }),
   testModel: (value: ModelSelection) => request<{ ok: boolean }>("/models/test", { method: "POST", body: JSON.stringify(value) }),
   selectSessionModel: (id: string, value: ModelSelection) => request<ModelSelection>(`/sessions/${encodeURIComponent(id)}/model`, { method: "PUT", body: JSON.stringify(value) }),
   selectSessionReasoning: (id: string, level: ReasoningLevel) => request<{ level: ReasoningLevel }>(`/sessions/${encodeURIComponent(id)}/reasoning`, { method: "PUT", body: JSON.stringify({ level }) }),

@@ -13,6 +13,7 @@ import {
 } from "./api";
 import { SimulationWorkspace } from "./features/simulation/SimulationWorkspace";
 import { ModelSettings } from "./ModelSettings";
+import { MarkdownText } from "./MarkdownText";
 import { RoundedSelect } from "./RoundedSelect";
 
 const DEFAULT_BOOK: Json = {
@@ -1060,7 +1061,7 @@ export default function App() {
                         {modelMenuPanel === "model" && <>
                           <button type="button" className="composer-model-menu-back" onClick={() => setModelMenuPanel("root")}>‹ <span>模型</span></button>
                           <div className="composer-model-options">
-                            {modelConfig?.providers.map((provider) => <div key={provider.id}>
+                            {modelConfig?.providers.filter((provider) => provider.models.length > 0).map((provider) => <div key={provider.id}>
                               <div className="composer-model-group">{provider.name}</div>
                               {provider.models.map((model) => <button type="button" className="composer-model-option" key={model} aria-current={currentModel.provider_id === provider.id && currentModel.model_id === model ? "true" : undefined} onClick={() => {
                                 void api.selectSessionModel(session.session_id, { provider_id: provider.id, model_id: model }).then((selected_model) => {
@@ -1338,7 +1339,9 @@ function TimelineCard({
           {payload.role !== "user" && Object.keys(chapterResult).length > 0 ? (
             <ChapterCompletionCard result={chapterResult} />
           ) : (
-            <Text value={text(payload.content)} />
+            payload.role === "user"
+              ? <Text value={text(payload.content)} />
+              : <MarkdownText value={text(payload.content)} />
           )}
           {payload.role !== "user" && materializedSkills.length > 0 && (
             <div className="plan-skill-row">
@@ -1431,7 +1434,7 @@ function TimelineCard({
       }
       return preview ? (
         <article className="message assistant stream-reply-preview" aria-live="polite">
-          <div className="message-content"><Text value={preview} /></div>
+          <div className="message-content"><MarkdownText value={preview} /></div>
         </article>
       ) : event.event_type === "action_started" ? (
         // 首个文本分片到达前给出轻量反馈，避免普通聊天看起来像完全没有响应。

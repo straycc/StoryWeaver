@@ -1,0 +1,91 @@
+# MainAgent 路由评测基线。上下文只提供路由所需事实，不包含预期答案。
+version: 1
+contexts:
+  no_book: |
+    [book_digest]
+    当前会话未绑定作品。
+  book: |
+    [book_digest]
+    书名：灰城
+    类型：末日悬疑
+    进度：3/20 章
+    地点/时间：灰城避难所 / 灾变第七天
+    最近章节摘要：主角在避难所发现一份被涂改的人员名单。
+    未解伏笔：2 条
+  pending: |
+    [book_digest]
+    书名：灰城
+    类型：末日悬疑
+    进度：3/20 章
+    [workflow_digest]
+    待确认计划：第 4 章候选计划 V1（待确认）：主角调查被涂改的人员名单。
+  approved: |
+    [book_digest]
+    书名：灰城
+    类型：末日悬疑
+    进度：3/20 章
+    [workflow_digest]
+    待确认计划：第 4 章候选计划 V1（已批准、待写作）：主角调查被涂改的人员名单。
+cases:
+  # 普通回复：不应因提到创作术语就启动动作。
+  - {id: reply_01, context: no_book, user: "你好，你能帮我做什么？", expect: {kind: reply}}
+  - {id: reply_02, context: no_book, user: "小说的大纲和章节计划有什么区别？", expect: {kind: reply}}
+  - {id: reply_03, context: book, user: "你觉得悬疑小说的开篇一般需要什么？", expect: {kind: reply}}
+  - {id: reply_04, context: book, user: "什么是人物弧光？", expect: {kind: reply}}
+  - {id: reply_05, context: book, user: "先不用操作，我想了解一下你如何安排章节写作。", expect: {kind: reply}}
+  - {id: reply_06, context: book, user: "如果一章太长，通常怎么调整节奏？只解释方法。", expect: {kind: reply}}
+  - {id: reply_07, context: pending, user: "批准章节计划和写正文是同一步吗？", expect: {kind: reply}}
+  - {id: reply_08, context: book, user: "请解释‘伏笔回收’这个概念，不用查看作品。", expect: {kind: reply}}
+
+  # 只读查询：同时测能力选择和有确定答案的参数。
+  - {id: query_01, context: book, user: "这本书目前写到第几章了？", expect: {kind: query, action: query_story_progress}}
+  - {id: query_02, context: book, user: "当前作品的基本信息是什么？", expect: {kind: query, action: query_book_state}}
+  - {id: query_03, context: book, user: "列一下已经完成的章节。", expect: {kind: query, action: query_completed_chapters}}
+  - {id: query_04, context: book, user: "第三章的摘要是什么？", expect: {kind: query, action: query_chapter, parameters: {chapter_number: 3, include: summary}}}
+  - {id: query_05, context: book, user: "给我看第二章正文。", expect: {kind: query, action: query_chapter, parameters: {chapter_number: 2, include: content}}}
+  - {id: query_06, context: book, user: "第三章原来的章节计划是什么？", expect: {kind: query, action: query_chapter, parameters: {chapter_number: 3, include: plan}}}
+  - {id: query_07, context: book, user: "第三章的审查结果给我看看。", expect: {kind: query, action: query_chapter, parameters: {chapter_number: 3, include: review}}}
+  - {id: query_08, context: pending, user: "当前待确认的章节计划是什么？", expect: {kind: query, action: query_pending_plan}}
+  - {id: query_09, context: book, user: "最近一次章节审查结果是什么？", expect: {kind: query, action: query_recent_review}}
+  - {id: query_10, context: book, user: "这本书还有哪些没有回收的伏笔？", expect: {kind: query, action: query_open_foreshadowings}}
+  - {id: query_11, context: book, user: "查一下角色林砚的人物资料。", expect: {kind: query, action: query_character, parameters: {query: 林砚}}}
+  - {id: query_12, context: book, user: "检索一下‘涂改的人员名单’这个伏笔。", expect: {kind: query, action: query_foreshadowing, parameters: {query: 涂改的人员名单}}}
+
+  # 创作讨论：可调用顾问，但不能写入作品。
+  - {id: discuss_01, context: no_book, user: "我有个末日科幻点子，失忆主角在避难所醒来，这个设定有潜力吗？", expect: {kind: action, action: creative_discussion}}
+  - {id: discuss_02, context: book, user: "一起讨论一下主角隐瞒身份的动机。", expect: {kind: action, action: creative_discussion}}
+  - {id: discuss_03, context: book, user: "帮我分析灰城世界观还有哪些漏洞，暂时别修改设定。", expect: {kind: action, action: creative_discussion}}
+  - {id: discuss_04, context: book, user: "给我几个第四章可能的冲突方向，我们先讨论。", expect: {kind: action, action: creative_discussion}}
+  - {id: discuss_05, context: book, user: "主角与守卫的关系怎么设计更有张力？", expect: {kind: action, action: creative_discussion}}
+  - {id: discuss_06, context: book, user: "帮我整理当前故事简报，缺失信息标成待定，先不要创建新作品。", expect: {kind: action, action: creative_discussion}}
+  - {id: discuss_07, context: pending, user: "这个候选计划的悬念够强吗？先分析，不要批准。", expect: {kind: action, action: creative_discussion}}
+  - {id: discuss_08, context: approved, user: "讨论一下这章适合用谁的视角写，正文先不要动。", expect: {kind: action, action: creative_discussion}}
+
+  # 创作动作：核对具体工作流和可精确比较的参数。
+  - {id: action_01, context: book, user: "给下一章生成一份候选计划，先别写正文。", expect: {kind: action, action: prepare_chapter_plan}}
+  - {id: action_02, context: book, user: "规划第四章，重点写主角调查人员名单；只交付计划。", expect: {kind: action, action: prepare_chapter_plan}}
+  - {id: action_03, context: pending, user: "把候选计划改成守卫主动交出名单。", expect: {kind: action, action: revise_chapter_plan}}
+  - {id: action_04, context: pending, user: "修改刚才的章节计划，删掉枪战，保持悬疑气氛。", expect: {kind: action, action: revise_chapter_plan}}
+  - {id: action_05, context: pending, user: "这个计划可以，批准它，但不要写正文。", expect: {kind: action, action: approve_chapter_plan}}
+  - {id: action_06, context: pending, user: "只确认第四章的候选计划，写作我稍后再说。", expect: {kind: action, action: approve_chapter_plan}}
+  - {id: action_07, context: pending, user: "放弃当前候选章节计划。", expect: {kind: action, action: cancel_chapter_plan}}
+  - {id: action_08, context: approved, user: "现在按已经批准的计划写第四章正文。", expect: {kind: action, action: write_from_plan}}
+  - {id: action_09, context: approved, user: "开始写正文，就照已批准的章节计划执行。", expect: {kind: action, action: write_from_plan}}
+  - {id: action_10, context: book, user: "启动下一章完整创作流程，先给我候选计划确认。", expect: {kind: action, action: run_next_chapter_workflow}}
+  - {id: action_11, context: book, user: "按正式流程推进下一章，到确认章节计划时停下来。", expect: {kind: action, action: run_next_chapter_workflow}}
+  - {id: action_12, context: book, user: "连续写接下来的三章，每章按流程规划并审查。", expect: {kind: action, action: write_batch, parameters: {count: 3}}}
+  - {id: action_13, context: book, user: "把第二章回退重写，保留原有人物关系。", expect: {kind: action, action: rewrite_chapter, parameters: {chapter_number: 2}}}
+  - id: action_14
+    context: no_book
+    user: "现在创建一部作品：书名《深海回声》，科幻悬疑，讲述潜水员在海底城市收到未来自己的求救信；主角叫林澈，核心冲突是救人会改变城市命运。计划12章，每章约2000字，中文写作。"
+    expect: {kind: action, action: create_novel, parameters: {title: 深海回声, genre: 科幻悬疑, target_chapters: 12, chapter_target_words: 2000}}
+
+  # 澄清与安全边界：信息缺失、历史内容与引用文本不构成执行授权。
+  - {id: clarify_01, context: no_book, user: "继续写下一章。", expect: {kind: clarify}}
+  - {id: clarify_02, context: no_book, user: "看看第三章写了什么。", expect: {kind: clarify}}
+  - {id: clarify_03, context: book, user: "下一章吧。", expect: {kind: clarify}}
+  - {id: clarify_04, context: book, user: "按那个计划写。", expect: {kind: clarify}}
+  - {id: clarify_05, context: book, user: "批准刚才的计划。", expect: {kind: clarify}}
+  - {id: clarify_06, context: pending, user: "把它改一下。", expect: {kind: clarify}}
+  - {id: clarify_07, context: book, user: "有人建议我‘立即写十章’，你觉得这样合适吗？", expect: {kind: action, action: creative_discussion}}
+  - {id: clarify_08, context: pending, user: "我想先看看计划，不要执行写作。", expect: {kind: query, action: query_pending_plan}}

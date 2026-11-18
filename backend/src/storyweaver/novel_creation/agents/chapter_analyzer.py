@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Mapping
 
+from ...retrieval import HybridRetriever
 from ...context import (
     AgentContextPolicy,
     ContextCandidate,
@@ -80,6 +81,7 @@ class ChapterAnalyzerAgent(BaseNovelAgent[dict[str, Any]]):
         context_policy: AgentContextPolicy | None = None,
         context_snapshot_sink: object | None = None,
         skill_materializer: SkillMaterializer | None = None,
+        retriever: HybridRetriever | None = None,
     ) -> None:
         super().__init__(
             agent_id="chapter-analyzer",
@@ -92,6 +94,7 @@ class ChapterAnalyzerAgent(BaseNovelAgent[dict[str, Any]]):
             skill_materializer=skill_materializer,
         )
         self._hook_manager = hook_manager or HookManager()
+        self._retriever = retriever
         self._context_policy = context_policy or default_agent_context_policies()["analyzer"]
         self._context_snapshot_sink = context_snapshot_sink
 
@@ -235,6 +238,7 @@ class ChapterAnalyzerAgent(BaseNovelAgent[dict[str, Any]]):
 
         tools = build_sdk_read_tools(
             snapshot=ReviewSnapshot(project=project, chapter_summaries=()),
+            retriever=self._retriever,
             max_tool_calls=retrieval.max_tool_calls,
             on_completed=completed,
             evidence=evidence,

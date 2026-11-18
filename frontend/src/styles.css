@@ -379,6 +379,10 @@
 .model-settings-save-row { justify-content: flex-end; }
 .model-settings-primary { min-width: 68px; border: 0; border-radius: 8px; background: #181b21; color: #fff; padding: 9px 18px; }
 .model-settings-message { margin: 14px 0 0; color: #656b74; font-size: 12px; }
+.model-settings-embedding { margin-top: 16px; }
+.model-settings-embedding .model-settings-card-head > span, .model-settings-help { color: #777d86; font-size: 12px; line-height: 1.6; }
+.model-settings-embedding > .model-settings-text-button { margin-top: 10px; }
+.model-settings-embedding .model-settings-masked button { border: 1px solid #dcdee3; border-radius: 8px; background: #fff; padding: 6px 10px; }
 .composer-model-control { position:relative; min-width:0; }
 .composer-model-trigger { display:flex; align-items:center; gap:5px; max-width:min(225px, 48vw); min-height:30px; padding:0 7px; border:0; border-radius:8px; background:transparent; color:#5c626b; font:inherit; font-size:12px; cursor:pointer; }
 .composer-model-trigger:hover, .composer-model-trigger[aria-expanded="true"] { background:#f4f5f6; }

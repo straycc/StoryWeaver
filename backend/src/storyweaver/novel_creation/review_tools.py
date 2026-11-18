@@ -11,6 +11,7 @@ from agents.tool import FunctionTool
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..llm.tool_runtime import ReadToolSpec, ToolRuntimePolicy, build_read_tools
+from ..retrieval import HybridRetriever, RetrievalDocument
 
 from .models import ChapterSummary, NovelProject
 
@@ -70,7 +71,7 @@ TOOL_INPUT_MODELS: dict[str, type[_ToolInput]] = {
 
 _TOOL_DESCRIPTIONS = {
     "get_entity_evidence": "查询角色当前状态、持有物和相关权威事实，仅用于核验具体疑点。",
-    "search_canon_evidence": "按关键词查询权威事实和伏笔，未找到不代表正文错误。",
+    "search_canon_evidence": "按关键词与语义混合检索权威事实、伏笔和已提交章节摘要；语义不可用时使用关键词，未找到不代表正文错误。",
     "read_chapter_summary": "读取已提交章节的压缩摘要，不返回全文。",
     "query_foundation": "查询人物稳定设定、世界规则或写作硬约束，不返回动态状态。",
     "list_open_foreshadowings": "列出尚未解决的伏笔，用于核验推进或回收状态。",
@@ -196,19 +197,22 @@ class EntityEvidenceTool:
 
 
 class CanonEvidenceSearchTool:
-    """按确定性关键词查找事实和伏笔，不调用模型或修改正史。"""
+    """在权威快照内混合检索，返回原始证据而不修改正史。"""
 
     _DEFINITION = ReadToolDescription(
         name="search_canon_evidence",
         description=(
-            "按关键词查找权威事实和伏笔，返回来源章节、有效状态和原始 canon。"
+            "按关键词和语义查找权威事实、伏笔和章节摘要，返回来源章节及有效状态。"
             "未找到结果不代表正文错误。"
         ),
         input_schema=_input_schema(CanonEvidenceSearchInput),
     )
 
-    def __init__(self, snapshot: ReviewSnapshot) -> None:
+    def __init__(self, snapshot: ReviewSnapshot, retriever: HybridRetriever | None = None,
+                 semantic_timeout_seconds: float | None = None) -> None:
         self._snapshot = snapshot
+        self._retriever = retriever
+        self._semantic_timeout_seconds = semantic_timeout_seconds
 
     @property
     def definition(self) -> ReadToolDescription:
@@ -244,8 +248,48 @@ class CanonEvidenceSearchTool:
                 f"{hook.hook_id} {hook.description}",
             )
         )[:limit]
+        summaries: tuple[ChapterSummary, ...] = ()
+        retrieval_metadata = None
+        if self._retriever is not None:
+            # 只把本次快照允许读取的记录送入召回，缓存无法扩大可读范围。
+            allowed_facts = () if foreshadowing_only else self._snapshot.project.state.facts
+            allowed_summaries = () if foreshadowing_only else self._snapshot.chapter_summaries
+            names = {item.character_id: item.name for item in self._snapshot.project.foundation.characters}
+            documents = tuple(
+                RetrievalDocument(
+                    f"fact:{fact.fact_id}",
+                    f"{fact.fact_id} {names.get(fact.subject_id, fact.subject_id)} {fact.subject_id} "
+                    f"{fact.predicate} {fact.value} 来源章节:{fact.source_chapter} "
+                    f"状态:{'current' if fact.is_current else 'superseded'}",
+                )
+                for fact in allowed_facts
+            ) + tuple(
+                RetrievalDocument(f"hook:{hook.hook_id}", f"{hook.hook_id} {hook.description} 状态:{hook.status}")
+                for hook in self._snapshot.project.state.hooks
+            ) + tuple(
+                RetrievalDocument(f"chapter:{item.chapter_number}", item.summary)
+                for item in allowed_summaries
+            )
+            result = await self._retriever.search(
+                query, documents, limit=limit * 3, timeout_seconds=self._semantic_timeout_seconds,
+            )
+            ranks = {key: index for index, key in enumerate(result.document_ids)}
+            facts = tuple(sorted(
+                (item for item in allowed_facts if f"fact:{item.fact_id}" in ranks),
+                key=lambda item: ranks[f"fact:{item.fact_id}"],
+            ))[:limit]
+            hooks = tuple(sorted(
+                (item for item in self._snapshot.project.state.hooks if f"hook:{item.hook_id}" in ranks),
+                key=lambda item: ranks[f"hook:{item.hook_id}"],
+            ))[:limit]
+            summaries = tuple(sorted(
+                (item for item in allowed_summaries if f"chapter:{item.chapter_number}" in ranks),
+                key=lambda item: ranks[f"chapter:{item.chapter_number}"],
+            ))[:limit]
+            retrieval_metadata = result.metadata()
         return {
             "query": query.strip(),
+            "retrieval": retrieval_metadata,
             "facts": [
                 {
                     "fact_id": fact.fact_id,
@@ -272,6 +316,11 @@ class CanonEvidenceSearchTool:
                 for hook in hooks
             ],
             "truncated": False,
+            "chapter_summaries": [
+                {"source_id": f"chapter:{item.chapter_number}", "chapter_number": item.chapter_number,
+                 "summary": _clip(item.summary, maximum=1200)}
+                for item in summaries
+            ],
         }
 
     @staticmethod
@@ -502,12 +551,13 @@ def build_sdk_read_tools(
     result_token_limit: int = 800,
     transient_attempts: int = 2,
     tool_names: tuple[str, ...] | None = None,
+    retriever: HybridRetriever | None = None,
 ) -> list[FunctionTool]:
     """从正史快照构造领域工具，并交给统一只读 Tool Runtime 治理。"""
 
     implementations = {
         "get_entity_evidence": EntityEvidenceTool(snapshot),
-        "search_canon_evidence": CanonEvidenceSearchTool(snapshot),
+        "search_canon_evidence": CanonEvidenceSearchTool(snapshot, retriever, timeout_seconds * 0.75),
         "read_chapter_summary": ChapterSummaryTool(snapshot),
         "query_foundation": FoundationQueryTool(snapshot),
         "list_open_foreshadowings": OpenForeshadowingsTool(snapshot),

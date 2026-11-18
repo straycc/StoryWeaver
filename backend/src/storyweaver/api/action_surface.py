@@ -533,6 +533,23 @@ class MainAgentActionSurface:
                 self._reply(session_id, "请先在当前会话绑定一部作品，再执行这项创作能力。",
                             user_message=user_message, context_trace=context_trace)
                 return {"kind": "clarify"}
+            if decision.action in {"revise_chapter_plan", "approve_chapter_plan", "cancel_chapter_plan"}:
+                # 先核对真实计划状态，避免历史中的计划被误当作仍待处理。
+                allowed_statuses = (
+                    frozenset({"pending", "approved"})
+                    if decision.action == "cancel_chapter_plan"
+                    else frozenset({"pending"})
+                )
+                try:
+                    decision.parameters["proposal_id"] = self._dispatcher.resolve_plan_id(
+                        session.book_id, decision.parameters.get("proposal_id"), session_id,
+                        allowed_statuses=allowed_statuses,
+                    )
+                except (KeyError, ValueError):
+                    reply = "当前没有可处理的候选章节计划。请先生成计划，或告诉我你想讨论哪一步。"
+                    self._reply(session_id, reply,
+                                user_message=user_message, context_trace=context_trace)
+                    return {"kind": "clarify", "reply": reply}
             if decision.action == "creative_discussion":
                 if self._creative_discussion is None:
                     raise RuntimeError("专业创作讨论能力尚未配置")
@@ -600,15 +617,23 @@ class MainAgentActionSurface:
                             context_trace=context_trace)
                 return {"kind": "job", "job_id": job.job_id, "reply": reply}
             if decision.action == "run_next_chapter_workflow":
-                job = await self._dispatcher.dispatch(
-                    action="run_next_chapter_workflow", session_id=session_id,
-                    book_id=session.book_id, parameters=decision.parameters,
-                    creative_task=creative_task,
+                # 自然语言路由可能误解含糊的“下一章”；确认前不启动生成任务。
+                payload = dict(decision.parameters)
+                if creative_task is not None:
+                    payload["creative_task_context"] = creative_task_to_data(creative_task)
+                proposal = self._proposals.create(
+                    session_id=session_id, book_id=session.book_id,
+                    action_type="run_next_chapter_workflow", payload=payload,
+                    summary="启动下一章完整创作流程（先生成候选计划）",
                 )
-                reply = "完整章节工作流已启动；我会先生成候选计划，并在计划确认点暂停。"
+                self._workspace.sessions.append_event(
+                    session_id, event_type="action_proposal_pending",
+                    payload=self._dispatcher.data(proposal),
+                )
+                reply = "我已准备好启动下一章完整流程。请确认后开始；流程会在候选计划处暂停。"
                 self._reply(session_id, reply, user_message=user_message,
                             context_trace=context_trace)
-                return {"kind": "job", "job_id": job.job_id, "reply": reply}
+                return {"kind": "proposal", "proposal": self._dispatcher.data(proposal), "reply": reply}
             if decision.action in {"confirm_and_write_chapter", "write_from_plan", "rewrite_chapter", "write_batch"}:
                 frozen_parameters = dict(decision.parameters)
                 if decision.action in {"confirm_and_write_chapter", "write_from_plan"}:

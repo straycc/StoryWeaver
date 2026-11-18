@@ -9,6 +9,7 @@ from pathlib import Path
 
 from agents import ModelSettings
 
+from ..retrieval import HybridRetriever
 from ..context import AgentContextPolicy, default_agent_context_policies
 from ..llm.errors import ConfigurationError
 from ..skills import (
@@ -668,6 +669,7 @@ def build_novel_service(
     store: StoryProjectRepository,
     context_snapshot_sink: object | None = None,
     model_override: object | None = None,
+    retriever: HybridRetriever | None = None,
 ) -> NovelService:
     """使用一个共享 Runtime 组装真实模型小说创作服务。"""
 
@@ -734,6 +736,7 @@ def build_novel_service(
     )
     planner = PlannerAgent(
         store=store,
+        retriever=retriever,
         context_snapshot_sink=context_snapshot_sink,
         sdk_settings=sdk_worker_settings(
             worker_id="novel-planner", name="章节规划师",
@@ -767,6 +770,7 @@ def build_novel_service(
     )
     reviewer = ReviewerAgent(
         store=store,
+        retriever=retriever,
         context_snapshot_sink=context_snapshot_sink,
         sdk_settings=sdk_worker_settings(
             worker_id="novel-reviewer", name="章节审查员",
@@ -780,6 +784,7 @@ def build_novel_service(
         skill_materializer=skill_materializer,
     )
     analyzer = ChapterAnalyzerAgent(
+        retriever=retriever,
         sdk_settings=sdk_worker_settings(
             worker_id="chapter-analyzer",
             name="章节状态分析器",
