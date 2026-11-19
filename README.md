@@ -173,6 +173,16 @@ npm run dev
 当前还有哪些未解伏笔？
 ```
 
+### 联网调研配置
+
+本地开发时，可以将 Tavily API Key 保存到项目根目录的 `.env` 文件。
+
+```dotenv
+STORYWEAVER_TAVILY_API_KEY=填入你的_Tavily_API_Key
+```
+
+进程环境变量优先于 `.env` 中的 Tavily 密钥。`.env` 已被 Git 忽略。
+
 ### Docker Compose 启动
 
 在项目根目录执行：

@@ -12,6 +12,8 @@ class LlmEventType(StrEnum):
     """业务层关心的模型运行事件。"""
 
     RUN_STARTED = "run_started"
+    # 长流程内部的阶段切换（例如调研的“检索 → 整理”），只用于进度反馈。
+    PHASE_STARTED = "phase_started"
     MODEL_COMPLETED = "model_completed"
     TOOL_COMPLETED = "tool_completed"
     SKILL_RESOLVED = "skill_resolved"

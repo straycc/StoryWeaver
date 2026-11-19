@@ -35,6 +35,26 @@ class MainAgentDecisionValidationError(ValueError):
     """模型已返回决策，但能力或参数不符合业务契约。"""
 
 
+def _research_note(authorized: bool) -> str:
+    """联网授权只影响本轮的可用能力说明，不改变任何持久状态。"""
+
+    if authorized:
+        return (
+            "\n本次用户已在输入框选择「联网搜索」，本条消息允许检索外部公开资料。"
+            "当问题涉及真实世界的制度、史料、地理、人物、专业细节或时效信息时，"
+            "选择 creative_discussion，并把 objective 写成具体、可直接检索的问题"
+            "（包含时代、地域、对象等限定）；不要自己编造资料出处。"
+            "与外部资料无关的纯创作讨论仍按普通 creative_discussion 处理。"
+        )
+    return (
+        "\n本次没有开启联网搜索，你不能查询任何外部资料。"
+        "此时涉及真实制度、史料、地理、时效信息，或用户明确要求查资料、要出处的请求，"
+        "必须用 kind=reply 说明：需要点击输入框旁的「联网搜索」再发送一次，这条消息才会联网；"
+        "也可以先给出你已知的通用说明，但不要展开成“资料整理”。"
+        "不要选择 creative_discussion 后再承诺去查，不要声称自己已经搜索过，也不要编造链接。"
+    )
+
+
 def validate_main_agent_decision(decision: ConversationDecision) -> ConversationDecision:
     """在进入 Action Surface 前统一验证路由与动作参数。"""
 
@@ -75,6 +95,7 @@ class MainAgent:
 
     async def decide(
         self, *, context: str, event_sinks: Sequence[LlmEventSink] = (),
+        research_authorized: bool = False,
     ) -> ConversationDecision:
         """基于已由 Context Builder 审计过的上下文做意图判断。"""
 
@@ -99,9 +120,9 @@ create_novel 仅用于明确建书请求，整理 title、genre、premise、prot
 write_from_plan 要求计划已 approved 且用户明确要求写正文；旧入口 confirm_and_write_chapter 非首选且要求 pending 计划。
 run_next_chapter_workflow 在候选计划处暂停；需要作品却未绑定时用 clarify。
 query_chapter.include 只能取 summary、content、plan、review。
-按输出 Schema 返回决策；回复聚焦创作问题，不播报无关状态或内部实现。""".format(
+按输出 Schema 返回决策；回复聚焦创作问题，不播报无关状态或内部实现。            """.format(
                 capability_manifest=capability_manifest
-            ),
+            ) + _research_note(research_authorized),
             model=self._model,
             # 意图字段仍由 Pydantic 约束；适度提高温度，让普通创作讨论不再
             # 退化成机械的状态播报。

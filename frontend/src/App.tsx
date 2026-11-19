@@ -10,6 +10,7 @@ import {
   type Session,
   type SkillOption,
   type TimelineEvent,
+  type ToolOption,
 } from "./api";
 import { SimulationWorkspace } from "./features/simulation/SimulationWorkspace";
 import { ModelSettings } from "./ModelSettings";
@@ -73,6 +74,7 @@ export default function App() {
     projects: ProjectSummary[];
     actions: Record<string, string>;
     skills?: SkillOption[];
+    tools?: ToolOption[];
   } | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [modelConfig, setModelConfig] = useState<ModelConfig | null>(null);
@@ -112,7 +114,10 @@ export default function App() {
   const [skillMenuOpen, setSkillMenuOpen] = useState(false);
   const [skillMenuIndex, setSkillMenuIndex] = useState(0);
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
+  const [selectedToolIds, setSelectedToolIds] = useState<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // 流式生成时不要每来一个分片就把读者拽回底部；只有本来就在底部才跟随。
+  const followBottom = useRef(true);
   const eventSources = useRef<Map<string, EventSource>>(new Map());
   const modelMenuRef = useRef<HTMLDivElement>(null);
 
@@ -232,7 +237,9 @@ export default function App() {
     return () => eventSources.current.forEach((item) => item.close());
   }, [createSession, loadSession, notify, refreshBootstrap]);
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+    const node = scrollRef.current;
+    if (!node || !followBottom.current) return;
+    node.scrollTo({ top: node.scrollHeight });
   }, [timeline, jobEvents]);
 
   const currentBookId = viewingBookId || session?.book_id || null;
@@ -350,6 +357,7 @@ export default function App() {
       if (!session || busy) return;
       const normalized = content.trim() || bootstrap?.actions[action] || action;
       if (!normalized && action === "chat") return;
+      followBottom.current = true;
       setBusy(true);
       setInput("");
       const creativePayload =
@@ -363,6 +371,17 @@ export default function App() {
                   ...selectedSkillIds,
                 ]),
               ),
+              // 联网授权只跟随这一条聊天消息，Job 跑完即失效。
+              ...(action === "chat" && selectedToolIds.length > 0
+                ? {
+                    tools: Array.from(
+                      new Set([
+                        ...list(payload.tools).map((item) => text(item)),
+                        ...selectedToolIds,
+                      ]),
+                    ),
+                  }
+                : {}),
             }
           : payload;
       try {
@@ -411,6 +430,7 @@ export default function App() {
         );
         watchJob(result.job_id, session.session_id);
         setSelectedSkillIds([]);
+        setSelectedToolIds([]);
         if (action !== "revise_chapter_plan") setActiveAction("chat");
       } catch (error) {
         setBusy(false);
@@ -425,6 +445,7 @@ export default function App() {
       notify,
       session,
       selectedSkillIds,
+      selectedToolIds,
       timeline,
       watchJob,
     ],
@@ -769,7 +790,15 @@ export default function App() {
               : "view-panel chat-view"
           }
         >
-          <div className="message-scroll" ref={scrollRef}>
+          <div
+            className="message-scroll"
+            ref={scrollRef}
+            onScroll={(event) => {
+              const node = event.currentTarget;
+              followBottom.current =
+                node.scrollHeight - node.scrollTop - node.clientHeight < 80;
+            }}
+          >
             {!timeline.length && (
               <div className="empty-state">
                 <h1>准备好了，随时开始</h1>
@@ -927,6 +956,20 @@ export default function App() {
                   ))}
                 </div>
               )}
+              {selectedToolIds.includes("web_search") && (
+                <div className="selected-skill-row" aria-label="已启用的联网能力">
+                  <span className="selected-tool-chip">
+                    联网搜索 · 仅本条消息
+                    <button
+                      type="button"
+                      aria-label="关闭联网搜索"
+                      onClick={() => setSelectedToolIds([])}
+                    >
+                      ×
+                    </button>
+                  </span>
+                </div>
+              )}
               {skillMenuOpen && (
                 <div
                   className="skill-command-menu"
@@ -1049,6 +1092,34 @@ export default function App() {
                       onClick={() => setCreateOpen(true)}
                     >
                       ＋
+                    </button>
+                    <button
+                      type="button"
+                      className={
+                        selectedToolIds.includes("web_search")
+                          ? "tool-button tool-button-text tool-button-active"
+                          : "tool-button tool-button-text"
+                      }
+                      aria-pressed={selectedToolIds.includes("web_search")}
+                      disabled={
+                        (bootstrap?.tools || []).some(
+                          (item) => item.id === "web_search" && item.available === false,
+                        )
+                      }
+                      title={
+                        (bootstrap?.tools || []).some(
+                          (item) => item.id === "web_search" && item.available === false,
+                        )
+                          ? "未配置联网检索密钥（STORYWEAVER_TAVILY_API_KEY），暂不可用"
+                          : "这一条消息允许联网检索公开资料；发送后自动关闭"
+                      }
+                      onClick={() =>
+                        setSelectedToolIds((old) =>
+                          old.includes("web_search") ? [] : ["web_search"],
+                        )
+                      }
+                    >
+                      联网
                     </button>
                   </div>
                   <div className="composer-actions">
@@ -1336,12 +1407,19 @@ function TimelineCard({
         }
       >
         <div className="message-content">
+          {/* 需求 R16：执行记录在正文上方，正文不受其展开状态影响。 */}
+          {payload.role !== "user" && Boolean(text(obj(metadata.research).status)) && (
+            <ResearchPanel research={obj(metadata.research)} />
+          )}
           {payload.role !== "user" && Object.keys(chapterResult).length > 0 ? (
             <ChapterCompletionCard result={chapterResult} />
           ) : (
             payload.role === "user"
               ? <Text value={text(payload.content)} />
               : <MarkdownText value={text(payload.content)} />
+          )}
+          {payload.role !== "user" && list(obj(metadata.research).sources).length > 0 && (
+            <ResearchSources sources={list(obj(metadata.research).sources).map(obj)} />
           )}
           {payload.role !== "user" && materializedSkills.length > 0 && (
             <div className="plan-skill-row">
@@ -1432,14 +1510,32 @@ function TimelineCard({
         if (item.event_type === "preview_snapshot" && text(itemPayload.field) === "reply") preview = text(itemPayload.text);
         if (["content_delta", "preview_delta"].includes(item.event_type) && text(itemPayload.field) === "reply") preview += text(itemPayload.delta);
       }
-      return preview ? (
-        <article className="message assistant stream-reply-preview" aria-live="polite">
-          <div className="message-content"><MarkdownText value={preview} /></div>
-        </article>
-      ) : event.event_type === "action_started" ? (
-        // 首个文本分片到达前给出轻量反馈，避免普通聊天看起来像完全没有响应。
-        <div className="chat-thinking" role="status">正在思考…</div>
-      ) : null;
+      const researchEvents = progress.filter(
+        (item) =>
+          item.event_type === "research_search_completed" ||
+          item.event_type === "research_phase",
+      );
+      if (!preview && researchEvents.length === 0) {
+        return event.event_type === "action_started" ? (
+          // 首个文本分片到达前给出轻量反馈，避免普通聊天看起来像完全没有响应。
+          <div className="chat-thinking" role="status">正在思考…</div>
+        ) : null;
+      }
+      return (
+        <>
+          {researchEvents.length > 0 && (
+            <ResearchLivePanel
+              events={researchEvents}
+              running={event.event_type === "action_started"}
+            />
+          )}
+          {preview && (
+            <article className="message assistant stream-reply-preview" aria-live="polite">
+              <div className="message-content"><MarkdownText value={preview} /></div>
+            </article>
+          )}
+        </>
+      );
     }
     const detail =
       text(payload.error) ||
@@ -1510,6 +1606,267 @@ function displayActionLabel(action: string, label: string, actions: Record<strin
     confirm_foundation: "确认基础资料",
   };
   return actions[action] || fallback[action] || (label && !label.includes("_") ? label : "创作任务");
+}
+
+/** 通用地球图标：检索行前缀，也作为站点图标缺失时的兜底。 */
+function GlobeIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="8" cy="8" r="6.3" fill="none" stroke="currentColor" strokeWidth="1.2" />
+      <path
+        d="M1.7 8h12.6M8 1.7c2.2 2.1 2.2 10.5 0 12.6M8 1.7c-2.2 2.1-2.2 10.5 0 12.6"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.2"
+      />
+    </svg>
+  );
+}
+
+/** 站点小图标：直接取站点根域的 favicon，取不到退回地球图标。 */
+function SiteIcon({ site, className }: { site: string; className?: string }) {
+  const [failed, setFailed] = useState(false);
+  if (!site || failed) return <GlobeIcon className={className} />;
+  return (
+    <img
+      className={className}
+      src={`https://${site}/favicon.ico`}
+      alt=""
+      loading="lazy"
+      referrerPolicy="no-referrer"
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
+/** 来源汇总：默认收成「N 个来源」，展开后逐条列出标题与站点。 */
+function ResearchSources({ sources }: { sources: Json[] }) {
+  const [open, setOpen] = useState(false);
+  if (sources.length === 0) return null;
+  return (
+    <div className="research-sources">
+      <button
+        type="button"
+        className="research-sources-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span className="research-source-stack" aria-hidden="true">
+          {sources.slice(0, 3).map((source, index) => (
+            <SiteIcon
+              key={`${index}-${text(source.url)}`}
+              site={text(source.site)}
+              className="research-source-stack-icon"
+            />
+          ))}
+        </span>
+        <span>{sources.length} 个来源</span>
+        <span className="research-chevron">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <ul className="research-hit-card">
+          {sources.map((source) => {
+            const title = text(source.title) || text(source.url);
+            return (
+              <li key={text(source.url)}>
+                <SiteIcon site={text(source.site)} className="research-hit-icon" />
+                <a
+                  href={text(source.url)}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  title={title}
+                >
+                  {title}
+                </a>
+                {text(source.site) && (
+                  <span className="research-source-domain">{text(source.site)}</span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/** 进行中的联网检索：逐次追加，结束后由消息 metadata 的折叠面板接管。 */
+function ResearchLivePanel({ events, running }: { events: any[]; running: boolean }) {
+  const searches: Json[] = [];
+  let phase = "";
+  for (const event of events) {
+    const payload = obj(event.payload);
+    if (event.event_type === "research_phase") phase = text(payload.phase);
+    if (event.event_type === "research_search_completed") searches.push(payload);
+  }
+  const reporting = phase === "report";
+  // 预算耗尽被拒绝的调用不算“检索了一次”，否则会出现「已检索 8 次」但上限是 5。
+  const effective = searches.filter((item) => !item.exhausted);
+  const skipped = searches.length - effective.length;
+  const elapsed = effective.reduce(
+    (sum, item) => sum + Number(item.elapsed_seconds || 0),
+    0,
+  );
+  return (
+    <div className="research-live" role="status" aria-live="polite">
+      <div className="research-live-head">
+        <span className="research-live-dot" aria-hidden="true" />
+        <span className="research-live-title">
+          {reporting ? "正在整理资料并核对来源…" : "正在联网检索资料…"}
+        </span>
+        <span className="research-search-count">
+          {effective.length > 0 ? `已检索 ${effective.length} 次` : ""}
+          {skipped > 0 ? ` · ${skipped} 次超出预算` : ""}
+          {elapsed > 0 ? ` · ${elapsed.toFixed(1)} 秒` : ""}
+        </span>
+      </div>
+      {searches.length > 0 && (
+        <ol className="research-searches">
+          {searches.map((item, index) => {
+            const status = text(item.status);
+            const hitCount = text(item.hit_count);
+            const exhausted = Boolean(item.exhausted);
+            return (
+              <li
+                key={`${index}-${text(item.query)}`}
+                className="research-search-row research-live-row"
+                data-status={status}
+              >
+                <span className="research-search-label">
+                  <GlobeIcon className="research-search-globe" />
+                  网页搜索
+                </span>
+                <code>{text(item.query) || "（检索词缺失）"}</code>
+                <span
+                  className="research-search-count"
+                  title={status === "failed" ? text(item.error) : undefined}
+                >
+                  {exhausted
+                    ? "超出预算"
+                    : status === "failed"
+                      ? text(item.error) || "未获取到结果"
+                      : `${hitCount || "0"} 条`}
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+      {running && !reporting && (
+        <p className="research-live-hint">
+          {searches.length > 0
+            ? "继续检索其他角度；全部结束后会整理成带来源的结论。"
+            : "正在连接检索服务…"}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** 联网检索的执行记录；正文只放结论，过程收进折叠面板。 */
+function ResearchPanel({ research }: { research: Json }) {
+  const [open, setOpen] = useState(false);
+  const [expanded, setExpanded] = useState<number[]>([]);
+  const status = text(research.status);
+  const searches = list(research.searches).map(obj);
+  const sources = list(research.sources).map(obj);
+  if (!status) return null;
+  // 超出预算被拒绝的调用不算检索次数，否则摘要会出现「8 次检索」而实际上限是 5。
+  const effective = searches.filter((record) => !record.exhausted);
+  const skipped = searches.length - effective.length;
+  const elapsed = Number(research.elapsed_seconds || 0);
+  const label =
+    status === "complete"
+      ? "联网检索完成"
+      : status === "partial"
+        ? "联网检索部分完成"
+        : "联网检索未完成";
+  const toggleSearch = (index: number) =>
+    setExpanded((current) =>
+      current.includes(index)
+        ? current.filter((item) => item !== index)
+        : [...current, index],
+    );
+  return (
+    <div className={`research-panel research-${status}`}>
+      <button
+        type="button"
+        className="research-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span className="research-title">{label}</span>
+        <span className="research-summary">
+          {effective.length > 0 ? `${effective.length} 次检索` : ""}
+          {skipped > 0 ? ` · ${skipped} 次超出预算` : ""}
+          {elapsed > 0 ? ` · ${elapsed.toFixed(1)} 秒` : ""}
+          {sources.length > 0 ? ` · ${sources.length} 个来源` : ""}
+        </span>
+        <span className="research-chevron">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <div className="research-body">
+          {searches.length > 0 && (
+            <ol className="research-searches">
+              {searches.map((record, index) => {
+                const hits = list(record.hits).map(obj);
+                const isOpen = expanded.includes(index);
+                const failed = text(record.status) === "failed";
+                return (
+                  <li key={`${index}-${text(record.query)}`} className="research-search">
+                    <button
+                      type="button"
+                      className="research-search-row"
+                      aria-expanded={isOpen}
+                      onClick={() => toggleSearch(index)}
+                    >
+                      <span className="research-search-label">
+                  <GlobeIcon className="research-search-globe" />
+                  网页搜索
+                </span>
+                      <code>{text(record.query)}</code>
+                      <span className="research-search-count">
+                        {record.exhausted
+                          ? "超出预算"
+                          : failed
+                            ? "未获取到结果"
+                            : `${hits.length} 条`}
+                      </span>
+                      <span className="research-chevron">{isOpen ? "▾" : "▸"}</span>
+                    </button>
+                    {isOpen && hits.length > 0 && (
+                      <ul className="research-hit-card">
+                        {hits.map((hit) => {
+                          const title = text(hit.title) || text(hit.url);
+                          const site = text(hit.site);
+                          return (
+                            <li key={text(hit.url)}>
+                              <SiteIcon site={site} className="research-hit-icon" />
+                              <a
+                                href={text(hit.url)}
+                                target="_blank"
+                                rel="noreferrer noopener"
+                                title={site ? `${title} · ${site}` : title}
+                              >
+                                {title}
+                              </a>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+                  </li>
+                );
+              })}
+            </ol>
+          )}
+          {text(research.error) && (
+            <p className="research-error">{text(research.error)}</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 /** 章节正文以轻量 Markdown 阅读容器展示；不引入额外解析依赖。 */

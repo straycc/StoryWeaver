@@ -333,6 +333,7 @@ button { color: inherit; }
 .assistant-markdown pre code { padding: 0; background: transparent; }
 .assistant-markdown table { display: block; max-width: 100%; overflow-x: auto; margin: 1em 0; border-collapse: collapse; }
 .assistant-markdown th, .assistant-markdown td { padding: 6px 10px; border: 1px solid var(--line); text-align: left; }
+.assistant-markdown thead th { background: var(--surface-soft); font-weight: 600; }
 .assistant-markdown a { color: #345f89; text-decoration: underline; text-underline-offset: 2px; }
 .assistant-markdown img { max-width: 100%; }
 .chat-thinking {
@@ -1025,3 +1026,76 @@ button { color: inherit; }
 
 /* 侧栏图标按钮提供一致的键盘定位提示。 */
 .sidebar button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* 联网搜索：输入框内的单次授权开关与已选提示。 */
+.tool-button-text { width: auto; min-width: 44px; padding: 0 10px; border-radius: 999px; font-size: 12px; color: var(--muted); }
+.tool-button-active, .tool-button-active:hover { background: var(--accent); color: #fff; }
+.selected-tool-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 999px; background: var(--accent); color: #fff; font-size: 11px; }
+.selected-tool-chip button { border: 0; padding: 0; background: transparent; color: inherit; cursor: pointer; font-size: 13px; line-height: 1; }
+
+/* 消息内的检索执行记录：正文只展示结论，过程默认折叠。 */
+.research-panel { margin: 0 0 12px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.research-toggle { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 10px; border: 0; background: var(--surface-soft); cursor: pointer; text-align: left; font-size: 11px; color: var(--muted); }
+.research-toggle:hover { background: var(--surface-hover); }
+.research-title { color: var(--ink); font-weight: 500; }
+.research-summary { color: var(--muted-light); }
+.research-chevron { margin-left: auto; font-size: 10px; }
+.research-body { padding: 6px 10px 10px; background: transparent; }
+.research-searches { margin: 0; padding: 0; list-style: none; font-size: 11px; color: var(--muted); }
+.research-search { border-top: 1px solid var(--line); }
+.research-search:first-child { border-top: 0; }
+.research-search-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 0; border: 0; background: transparent; cursor: pointer; text-align: left; font-size: 11px; color: var(--muted); }
+.research-search-row:hover { color: var(--ink); }
+.research-search-label { flex: none; color: var(--muted-light); }
+.research-search-row code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--ink); }
+.research-search-count { flex: none; color: var(--muted-light); }
+.research-hits { margin: 0 0 6px; padding: 0 0 0 14px; list-style: none; }
+.research-hits li { margin: 3px 0; line-height: 1.5; }
+.research-hits a { color: var(--accent); text-decoration: none; }
+.research-hits a:hover { text-decoration: underline; }
+.research-hit-site { margin-left: 6px; color: var(--muted-light); }
+
+/* 命中网页：参考工作台搜索过程样式——浅底卡片 + 站点图标 + 标题。 */
+.research-hit-card { margin: 2px 0 8px; padding: 6px; list-style: none; border-radius: 8px; background: var(--surface-soft); }
+.research-hit-card li { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px; line-height: 1.45; }
+.research-hit-card li:hover { background: var(--surface-hover); }
+.research-hit-card a { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); text-decoration: none; font-size: 12px; }
+.research-hit-card a:hover { text-decoration: underline; }
+.research-hit-icon { flex: none; width: 15px; height: 15px; border-radius: 3px; object-fit: contain; color: var(--muted-light); }
+.research-source-domain { flex: none; max-width: 38%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--muted-light); }
+.research-search-globe { flex: none; width: 13px; height: 13px; margin-right: 5px; color: var(--muted-light); vertical-align: -2px; }
+
+/* 来源汇总：正文不再堆链接，默认折成「N 个来源」。 */
+.research-sources { margin: 8px 0 0 2px; }
+.research-sources-toggle { display: inline-flex; align-items: center; gap: 8px; padding: 4px 10px 4px 5px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; }
+.research-sources-toggle:hover { background: var(--surface-soft); color: var(--ink); }
+.research-sources-toggle .research-chevron { margin-left: 0; }
+.research-source-stack { display: inline-flex; align-items: center; }
+.research-source-stack-icon { width: 16px; height: 16px; margin-left: -6px; border-radius: 50%; object-fit: contain; background: var(--surface); box-shadow: 0 0 0 2px var(--surface); color: var(--muted-light); }
+.research-source-stack-icon:first-child { margin-left: 0; }
+
+/* 正文引用标记：可点击直达原网页，不打断行内阅读。 */
+.assistant-markdown a.citation-link { display: inline-block; margin: 0 1px; padding: 0 4px; border-radius: 4px; background: var(--surface-soft); color: var(--muted); font-size: .78em; line-height: 1.5; text-decoration: none; vertical-align: 1px; }
+.assistant-markdown a.citation-link:hover { background: var(--surface-hover); color: var(--ink); }
+/* 正文引用角标：数字上标，弱化到不打断阅读，点击打开原网页。 */
+.assistant-markdown sup.citation-mark { line-height: 0; vertical-align: super; }
+.assistant-markdown sup.citation-mark a { display: inline-block; margin: 0 1px; padding: 0 3px; border-radius: 4px; background: var(--surface-soft); color: var(--muted); font-size: 10px; line-height: 1.5; text-decoration: none; }
+.assistant-markdown sup.citation-mark a:hover { background: var(--surface-hover); color: var(--ink); }
+.research-error { margin: 6px 0 0; font-size: 11px; color: #b42318; }
+
+/* 进行中的联网检索：替代“正在思考…”，让每次搜索当场可见。 */
+.research-live { margin: 0 4px 14px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); animation: rise .18s ease-out; }
+.research-live-head { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); }
+.research-live-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: research-pulse 1.1s ease-in-out infinite; }
+.research-live-title { color: var(--ink); }
+.research-live-head .research-search-count { margin-left: auto; }
+.research-live .research-searches { margin-top: 4px; }
+.research-live-row { padding: 4px 0; cursor: default; }
+.research-live-row[data-status="failed"] code { color: #b42318; }
+.research-live-row .research-search-count { max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.research-live-hint { margin: 4px 0 0; font-size: 11px; color: var(--muted-light); }
+@keyframes research-pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+
+/* 未配置联网密钥时按钮置灰，避免用户点了才收到降级提示。 */
+.tool-button:disabled { opacity: .45; cursor: not-allowed; }
+.tool-button:disabled:hover { background: transparent; color: var(--muted); }
