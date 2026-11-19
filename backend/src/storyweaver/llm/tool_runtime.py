@@ -111,8 +111,14 @@ def build_read_tools(
                     )
                 return result_text
             if own_future is None:
+                # 预算耗尽的回复本身就是给模型的指令：只说“预算已耗尽”，
+                # 模型往往再换一组参数重试，白耗回合。
                 result_text = json.dumps(
-                    {"error": "工具调用预算已耗尽", "status": "budget_exhausted"},
+                    {
+                        "error": "工具调用次数已用尽，不能再调用任何工具；"
+                        "请立即基于已有结果给出最终答复。",
+                        "status": "budget_exhausted",
+                    },
                     ensure_ascii=False,
                 )
                 if on_completed is not None:

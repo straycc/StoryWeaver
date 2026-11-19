@@ -18,6 +18,7 @@ export interface ModelConfig { providers: ModelProvider[]; default_provider: str
 export interface SessionSummary { session_id: string; title: string; book_id: string | null; message_count: number; updated_at: string; }
 export interface ProjectSummary { book_id: string; title: string; genre: string; target_chapters: number; }
 export interface SkillOption { id: string; name: string; display_name: string; description: string; short_description: string; }
+export interface ToolOption { id: string; name: string; description: string; available?: boolean; }
 export interface JobEvent { sequence: number; job_id: string; event_type: string; created_at: string; payload: Json; }
 export interface Job { job_id: string; status: string; error: string | null; result: Json | null; }
 export interface ActionProposal { action_proposal_id: string; action_type: string; summary: string; status: string; job_id: string | null; payload: Json; }
@@ -42,7 +43,7 @@ export const api = {
   testModel: (value: ModelSelection) => request<{ ok: boolean }>("/models/test", { method: "POST", body: JSON.stringify(value) }),
   selectSessionModel: (id: string, value: ModelSelection) => request<ModelSelection>(`/sessions/${encodeURIComponent(id)}/model`, { method: "PUT", body: JSON.stringify(value) }),
   selectSessionReasoning: (id: string, level: ReasoningLevel) => request<{ level: ReasoningLevel }>(`/sessions/${encodeURIComponent(id)}/reasoning`, { method: "PUT", body: JSON.stringify({ level }) }),
-  bootstrap: () => request<{ model: string; sessions: SessionSummary[]; projects: ProjectSummary[]; actions: Record<string, string>; skills?: SkillOption[] }>("/bootstrap"),
+  bootstrap: () => request<{ model: string; sessions: SessionSummary[]; projects: ProjectSummary[]; actions: Record<string, string>; skills?: SkillOption[]; tools?: ToolOption[] }>("/bootstrap"),
   createSession: (book_id: string | null = null) => request<Session>("/sessions", { method: "POST", body: JSON.stringify({ book_id }) }),
   deleteSession: (id: string) => request<{ ok: boolean }>(`/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }),
   getSession: (id: string, before?: number | null) => request<Session>(`/sessions/${encodeURIComponent(id)}?limit=50${before ? `&before_sequence=${before}` : ""}`),
@@ -78,7 +79,7 @@ export const api = {
   cancelJob: (id: string) => request<{ job_id: string }>(`/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
   streamJob(id: string, callback: (event: JobEvent) => void) {
     const source = new EventSource(`${ROOT}/jobs/${encodeURIComponent(id)}/events`);
-    const names = ["job_queued", "job_started", "job_succeeded", "job_failed", "job_paused", "job_interrupted", "job_cancelled", "stage_started", "stage_completed", "stage_failed", "model_completed", "tool_completed", "stream_started", "stream_completed", "preview_started", "preview_snapshot", "preview_delta", "preview_reset", "preview_completed", "simulation_context_ready", "simulation_model_started", "simulation_model_completed", "simulation_router_selected", "simulation_director_planned", "simulation_character_started", "simulation_character_preview", "simulation_message", "simulation_state_changed", "simulation_turn_committed", "simulation_turn_failed"];
+    const names = ["job_queued", "job_started", "job_succeeded", "job_failed", "job_paused", "job_interrupted", "job_cancelled", "stage_started", "stage_completed", "stage_failed", "model_completed", "tool_completed", "research_phase", "research_search_completed", "stream_started", "stream_completed", "preview_started", "preview_snapshot", "preview_delta", "preview_reset", "preview_completed", "simulation_context_ready", "simulation_model_started", "simulation_model_completed", "simulation_router_selected", "simulation_director_planned", "simulation_character_started", "simulation_character_preview", "simulation_message", "simulation_state_changed", "simulation_turn_committed", "simulation_turn_failed"];
     const receive = (message: MessageEvent) => callback(JSON.parse(message.data) as JobEvent);
     source.onmessage = receive;
     names.forEach((name) => source.addEventListener(name, receive as EventListener));

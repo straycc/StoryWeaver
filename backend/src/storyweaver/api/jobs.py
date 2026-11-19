@@ -51,6 +51,20 @@ class _JobLlmEventSink(LlmEventSink):
             await self._previews.complete(self._job_id, agent_id=agent_id, field=field)
         elif event_type == LlmEventType.RUN_FAILED.value:
             await self._previews.reset(self._job_id, agent_id=agent_id, field=field)
+        elif event_type == LlmEventType.PHASE_STARTED.value:
+            # 阶段切换（检索 / 整理）只用于进行中反馈，不写入消息正文。
+            self._jobs.append_event(
+                self._job_id,
+                "research_phase",
+                {"agent_id": agent_id, **data},
+            )
+        elif event_type == LlmEventType.TOOL_COMPLETED.value:
+            # 检索进度属于执行期流水，不进消息正文；刷新后由 metadata.research 回看。
+            self._jobs.append_event(
+                self._job_id,
+                "research_search_completed",
+                {"agent_id": agent_id, **data},
+            )
 
 
 class JobSupervisor:
@@ -204,6 +218,7 @@ class JobSupervisor:
                     session_id=str(payload["session_id"]), content=str(payload.get("content") or ""),
                     current_job_id=job.job_id,
                     creative_task=self._creative_task(payload),
+                    research_tools=self._research_tools(payload),
                     event_sinks=(
                         _JobLlmEventSink(self._live_previews, self._jobs, job.job_id),
                     ),
@@ -608,6 +623,15 @@ class JobSupervisor:
     def _creative_task(payload: Mapping[str, Any]) -> CreativeTaskContext | None:
         value = payload.get("creative_task_context")
         return None if value is None else creative_task_from_data(value)
+
+    @staticmethod
+    def _research_tools(payload: Mapping[str, Any]) -> tuple[str, ...]:
+        """只认白名单内的联网能力，且仅对本条消息有效。"""
+
+        value = payload.get("research_tools")
+        if not isinstance(value, list):
+            return ()
+        return tuple(item for item in value if item == "web_search")
 
     @staticmethod
     def _chapter_result(result: Any) -> dict[str, Any]:

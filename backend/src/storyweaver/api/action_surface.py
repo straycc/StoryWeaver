@@ -27,9 +27,11 @@ from ..skills import (
     creative_task_to_data,
 )
 from ..llm import LlmEventSink
+from ..research.service import ResearchOutcome, ResearchService
 
 
 SubmitJob = Callable[..., Awaitable[Any]]
+ResearchFactory = Callable[[Sequence[LlmEventSink]], ResearchService]
 
 
 def should_route_explicit_skill_reply(
@@ -437,7 +439,8 @@ class MainAgentActionSurface:
                  dispatcher: ActionDispatcher, workspace: ChatWorkspaceApplication,
                  context_builder: MainAgentContextBuilder,
                  creative_discussion: CreativeDiscussionService | None = None,
-                 context_snapshots: ContextSnapshotRepository | None = None) -> None:
+                 context_snapshots: ContextSnapshotRepository | None = None,
+                 research_factory: ResearchFactory | None = None) -> None:
         self._agent = agent
         self._proposals = proposals
         self._dispatcher = dispatcher
@@ -445,11 +448,14 @@ class MainAgentActionSurface:
         self._context_builder = context_builder
         self._creative_discussion = creative_discussion
         self._context_snapshots = context_snapshots
+        self._research_factory = research_factory
 
     async def handle(self, *, session_id: str, content: str,
                      current_job_id: str | None = None,
                      creative_task: CreativeTaskContext | None = None,
+                     research_tools: Sequence[str] = (),
                      event_sinks: Sequence[LlmEventSink] = ()) -> dict[str, Any]:
+        research_authorized = "web_search" in research_tools
         session = self._workspace.sessions.load_session(session_id)
         # 用户输入先持久化；即使意图模型暂时失败，也不会丢失这次会话事实。
         session = self._workspace.sessions.append_message(
@@ -513,6 +519,7 @@ class MainAgentActionSurface:
                 )
             decision = await self._agent.decide(
                 context=package.rendered_context, event_sinks=event_sinks,
+                research_authorized=research_authorized,
             )
         if decision.action:
             try:
@@ -553,9 +560,23 @@ class MainAgentActionSurface:
             if decision.action == "creative_discussion":
                 if self._creative_discussion is None:
                     raise RuntimeError("专业创作讨论能力尚未配置")
+                objective = str(decision.parameters["objective"])
+                # 只有本轮显式授权且装配了调研能力时才走检索；否则退回纯讨论。
+                if research_authorized and self._research_factory is not None:
+                    outcome = await self._research_factory(event_sinks).run(
+                        topic=objective,
+                        prompt=self._research_prompt(objective, rendered_context),
+                    )
+                    self._reply(
+                        session_id,
+                        outcome.markdown,
+                        user_message=user_message,
+                        research=outcome.to_metadata()["research"],
+                    )
+                    return {"kind": "reply", "reply": outcome.markdown}
                 discussion = await self._creative_discussion.discuss(
                     context=rendered_context,
-                    objective=str(decision.parameters["objective"]),
+                    objective=objective,
                     creative_task=creative_task,
                     event_sinks=event_sinks,
                 )
@@ -866,18 +887,34 @@ class MainAgentActionSurface:
         project = self._workspace.novels.store.load_project(book_id)
         return f"《{project.metadata.title}》；当前第 {project.state.last_committed_chapter} 章；地点：{project.state.current_location}；时间：{project.state.current_time}"
 
+    @staticmethod
+    def _research_prompt(objective: str, rendered_context: str) -> str:
+        """作品上下文只用于理解需求，避免被当成检索目标或写入资料。"""
+
+        context = rendered_context.strip()
+        if not context:
+            return objective
+        return (
+            f"{objective}\n\n## 创作背景（仅用于理解需求，不要写进资料）\n"
+            f"{context[:2000]}"
+        )
+
     def _reply(self, session_id: str, content: str, *,
-               user_message: Any | None = None, context_trace: dict[str, Any] | None = None) -> None:
+               user_message: Any | None = None, context_trace: dict[str, Any] | None = None,
+               research: dict[str, Any] | None = None) -> None:
         metadata: dict[str, Any] = {"main_agent": True}
         if context_trace is not None:
             metadata["context_trace"] = context_trace
+        if research is not None:
+            metadata["research"] = research
         session = self._workspace.sessions.append_message(
             session_id, role="assistant", content=content, action="chat",
             metadata=metadata,
         )
         # 只有真正经过 Main Agent 的自然语言回合才做后处理；明确查询、按钮和
         # Slash Command 不应为“记忆提取”额外消耗一次模型调用。
-        if user_message is not None and context_trace is not None:
+        # 调研轮次跳过：外部资料只服务本次回复，不得写入长期记忆（R07）。
+        if user_message is not None and context_trace is not None and research is None:
             assistant_message = session.messages[-1]
             asyncio.create_task(self._workspace.post_main_agent_turn(
                 session_id=session_id,

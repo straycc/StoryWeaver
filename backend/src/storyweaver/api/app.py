@@ -39,6 +39,8 @@ from .action_surface import ActionDispatcher, MainAgentActionSurface
 from .main_agent import MainAgent
 from .main_agent_context import MainAgentContextBuilder, WorkflowContextReader
 from .creative_discussion import CreativeDiscussionService
+from ..research.config import ResearchSettings
+from ..research.service import ResearchService
 from ..skills import (
     SkillInvocationResolver,
     SkillMaterializer,
@@ -49,6 +51,10 @@ from ..skills import (
     creative_task_to_data,
     load_configured_skills,
 )
+
+
+# 联网能力是独立开关：只能由前端显式选择，且不进入 Skill 快照或动作提案。
+ALLOWED_RESEARCH_TOOLS = frozenset({"web_search"})
 
 
 class _CreativeBody(BaseModel):
@@ -103,6 +109,22 @@ class SessionMessageBody(BaseModel):
     action: str = "chat"
     book_id: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("payload")
+    @classmethod
+    def validate_payload_tools(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """联网能力只接受白名单内的 id，且不改变其他 payload 字段。"""
+
+        raw = value.get("tools")
+        if raw is None:
+            return value
+        if not isinstance(raw, list):
+            raise ValueError("tools 必须是数组")
+        normalized = [str(item).strip() for item in raw]
+        unknown = [item for item in normalized if item not in ALLOWED_RESEARCH_TOOLS]
+        if unknown:
+            raise ValueError(f"不支持的联网能力：{'、'.join(unknown)}")
+        return {**value, "tools": list(dict.fromkeys(normalized))}
 
 
 class ProviderBody(ProviderConfig):
@@ -475,6 +497,28 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str, model_c
     workflow_reader = WorkflowContextReader(
         jobs=jobs, proposals=action_proposals, workspace=workspace,
     )
+    research_settings = ResearchSettings.from_env()
+    research_worker_settings = WorkerSettings(
+        worker_id="creative-research",
+        name="StoryWeaver 资料调研",
+        instructions=(
+            "你是小说创作领域的资料研究员。围绕用户问题检索公开资料，"
+            "只陈述能与来源对应的事实，区分事实与创作建议，不做未经证实的推断。"
+        ),
+        model=shared_model,
+        model_settings=ModelSettings(temperature=0.3),
+        timeout_seconds=research_settings.total_timeout_seconds,
+    )
+
+    def build_research_service(sinks: Any) -> ResearchService:
+        # 每次调用都新建：来源登记与执行记录不跨请求复用。
+        return ResearchService(
+            settings=research_settings,
+            worker_settings=research_worker_settings,
+            event_sinks=sinks,
+            tracing_enabled=True,
+        )
+
     action_surface = MainAgentActionSurface(
         agent=MainAgent(settings, model=shared_model), proposals=action_proposals, dispatcher=dispatcher, workspace=workspace,
         context_builder=MainAgentContextBuilder(
@@ -491,6 +535,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str, model_c
             materializer=roleplay_skill_materializer,
         ),
         context_snapshots=context_snapshots,
+        research_factory=build_research_service,
     )
     supervisor.configure_action_surface(action_surface, action_proposals)
 
@@ -608,7 +653,19 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str, model_c
         """旧工作台首次加载所需的完整索引，数据源为 SQLite。"""
 
         default_model = model_catalog.public()["default_model"] if model_catalog else settings.model
-        return {**workspace.bootstrap(), "model": default_model or "未配置模型", "skills": [
+        return {
+            **workspace.bootstrap(),
+            "model": default_model or "未配置模型",
+            "tools": [
+                {
+                    "id": "web_search",
+                    "name": "联网搜索",
+                    "description": "检索公开网页，为创作补充真实资料",
+                    # 未配置密钥时前端可据此禁用入口，避免用户点了才收到降级提示。
+                    "available": research_settings.configured,
+                },
+            ],
+            "skills": [
             {
                 "id": item.skill_id,
                 "name": item.name,
@@ -721,6 +778,14 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str, model_c
 
         session = sessions.load_session(session_id)
         bound_book_id = body.book_id or session.book_id
+        # 联网授权只对本条聊天消息有效：单独取出，并从参数里剔除，
+        # 避免随动作提案或 Skill 快照流向其他请求。
+        research_tools = tuple(
+            item for item in body.payload.get("tools", []) if item in ALLOWED_RESEARCH_TOOLS
+        )
+        message_payload = {
+            key: value for key, value in body.payload.items() if key != "tools"
+        }
         # 按钮已经表达了明确意图，直接经过 Dispatcher，不额外消耗一次 Main Agent 调用。
         shortcut_actions = {
             "write_next": "prepare_chapter_plan",
@@ -735,7 +800,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str, model_c
         }
         if body.action in shortcut_actions:
             content = body.content.strip() or workspace.bootstrap()["actions"].get(body.action, body.action)
-            parameters = dict(body.payload)
+            parameters = dict(message_payload)
             if body.action == "write_next":
                 parameters.setdefault("instruction", body.content.strip() or None)
             elif body.action == "revise_chapter_plan":
@@ -755,7 +820,7 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str, model_c
                 "label": workspace.bootstrap()["actions"].get(body.action, body.action),
             })
             return _accepted(job)
-        raw_skill_ids = body.payload.get("skill_ids", [])
+        raw_skill_ids = message_payload.get("skill_ids", [])
         if not isinstance(raw_skill_ids, list):
             raise HTTPException(status_code=422, detail="skill_ids 必须是数组")
         explicit_skill_ids = [str(item) for item in raw_skill_ids]
@@ -778,23 +843,24 @@ def create_app(*, settings: NovelApplicationSettings, database_url: str, model_c
                 "action": body.action,
                 "book_id": body.book_id,
                 "creative_task_context": creative_task_context,
+                "research_tools": list(research_tools),
                 "action_payload": (
                     {
-                        **body.payload,
+                        **message_payload,
                         "creative_task_context": activate_task(
                             json.dumps(
                                 {
                                     key: value
-                                    for key, value in body.payload.items()
+                                    for key, value in message_payload.items()
                                     if key != "skill_ids"
                                 },
                                 ensure_ascii=False,
                             ),
-                            [str(item) for item in body.payload.get("skill_ids", [])],
+                            [str(item) for item in message_payload.get("skill_ids", [])],
                         ),
                     }
                     if body.action == "create_novel"
-                    else body.payload
+                    else message_payload
                 ),
             },
         )
